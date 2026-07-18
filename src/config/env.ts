@@ -49,8 +49,10 @@ export const envSchema = z.object({
   GITHUB_OAUTH_BASE_URL: providerBaseUrl("https://github.com"),
   OPENROUTER_BASE_URL: providerBaseUrl("https://openrouter.ai"),
   GLOO_BASE_URL: providerBaseUrl("https://platform.ai.gloo.com"),
-  // Invented default — the YouVersion Data Exchange base URL is unspecified in
-  // the design docs; flagged for implementation-time verification (§9-Q10).
+  // Confirmed against https://developers.youversion.com/api-usage: base URL is
+  // https://api.youversion.com, versioned paths (e.g. /v1/bibles/{id}/passages/{ref}).
+  // Still unverified at implementation time (§9-Q10): the X-YVP-App-Key auth
+  // header convention, and which bible IDs map to KJV/BSB.
   YOUVERSION_BASE_URL: providerBaseUrl("https://api.youversion.com"),
 });
 
