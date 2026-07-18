@@ -1,0 +1,18 @@
+# Keep the build context small and reproducible: never copy host-built artifacts
+# or VCS metadata. The db-lib submodule SOURCE (src/prisma/package.json) is kept
+# so the image can build its dist/ itself; its node_modules/dist are excluded via
+# the wildcards below (the deps stage rebuilds them).
+node_modules
+**/node_modules
+dist
+**/dist
+.git
+**/.git
+*.log
+npm-debug.log*
+.env
+.env.*
+!.env.example
+coverage
+.vscode
+.idea
