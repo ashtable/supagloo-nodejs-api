@@ -44,4 +44,34 @@ describe("loadEnv", () => {
       loadEnv({ DATABASE_URL: VALID_DB_URL, PORT: "not-a-number" }),
     ).toThrow();
   });
+
+  describe("provider base URLs (Task #9 convention)", () => {
+    it("defaults to the real provider URLs when unset", () => {
+      const env = loadEnv({ DATABASE_URL: VALID_DB_URL });
+      expect(env.GITHUB_API_BASE_URL).toBe("https://api.github.com");
+      expect(env.GITHUB_OAUTH_BASE_URL).toBe("https://github.com");
+      expect(env.OPENROUTER_BASE_URL).toBe("https://openrouter.ai");
+      expect(env.GLOO_BASE_URL).toBe("https://platform.ai.gloo.com");
+      expect(env.YOUVERSION_BASE_URL).toBe("https://api.youversion.com");
+    });
+
+    it("accepts overrides that point at http:// stub servers", () => {
+      const env = loadEnv({
+        DATABASE_URL: VALID_DB_URL,
+        GITHUB_API_BASE_URL: "http://github-stub:8080",
+        GITHUB_OAUTH_BASE_URL: "http://github-stub:8080",
+        OPENROUTER_BASE_URL: "http://openrouter-stub:8080",
+        GLOO_BASE_URL: "http://gloo-stub:8080",
+        YOUVERSION_BASE_URL: "http://youversion-stub:8080",
+      });
+      expect(env.OPENROUTER_BASE_URL).toBe("http://openrouter-stub:8080");
+      expect(env.GITHUB_API_BASE_URL).toBe("http://github-stub:8080");
+    });
+
+    it("rejects a non-http(s) provider base URL", () => {
+      expect(() =>
+        loadEnv({ DATABASE_URL: VALID_DB_URL, OPENROUTER_BASE_URL: "ftp://nope" }),
+      ).toThrow(/OPENROUTER_BASE_URL/);
+    });
+  });
 });
