@@ -10,20 +10,35 @@ FROM node:22-slim AS deps
 WORKDIR /app
 
 # Prisma's engines need libssl present to select the correct openssl-3.0.x
-# binary (bookworm-slim omits it); install it before deps so @prisma/engines'
-# postinstall detects the right target.
+# binary (bookworm-slim omits it) so @prisma/engines' postinstall detects the
+# right target; git + ca-certificates are needed to clone database-lib below.
+# One apt layer.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends openssl \
+  && apt-get install -y --no-install-recommends openssl git ca-certificates \
   && rm -rf /var/lib/apt/lists/*
+
+# database-lib is a git submodule of this repo, but we do NOT copy it from the
+# build context. Railway (our deploy target) does not initialize git submodules
+# and does not copy the outer repo's .git into the Dockerfile build context, so
+# `COPY supagloo-database-lib/...` there resolves to an EMPTY directory and the
+# build fails on the missing package.json. Instead we clone database-lib from its
+# public GitHub URL at build time, pinned to an exact commit so the image is as
+# reproducible as the submodule pin (a moving branch like main would silently
+# pick up new commits at build time). Keep DATABASE_LIB_REF in lockstep with the
+# submodule: whenever a "Bump supagloo-database-lib submodule to <sha>" commit
+# lands, update this default to that same SHA in the same commit.
+# DO NOT "simplify" this back to a COPY of the submodule dir — it breaks Railway.
+ARG DATABASE_LIB_REF=a01557afde8175d1be3777d53ba8c90faaaa0fcf
+RUN git clone https://github.com/ashtable/supagloo-database-lib.git supagloo-database-lib \
+  && git -C supagloo-database-lib checkout "${DATABASE_LIB_REF}" \
+  && rm -rf supagloo-database-lib/.git
 
 # database-lib ships no dist/ in git (it is gitignored); build it here so the
 # file:./supagloo-database-lib dependency resolves to a real compiled client and
 # its prisma/ (schema + migrations). npm installs it as a symlink into
 # node_modules — the builder and runner stages copy the built submodule so that
 # relative symlink (../../supagloo-database-lib) resolves.
-COPY supagloo-database-lib/package.json supagloo-database-lib/package-lock.json ./supagloo-database-lib/
 RUN npm --prefix supagloo-database-lib ci --no-audit --no-fund
-COPY supagloo-database-lib/ ./supagloo-database-lib/
 RUN npm --prefix supagloo-database-lib run build
 
 # Install the API's own deps. Resolves the file: db-lib dependency and runs the

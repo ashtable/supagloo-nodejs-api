@@ -1,13 +1,16 @@
 # Keep the build context small and reproducible: never copy host-built artifacts
-# or VCS metadata. The db-lib submodule SOURCE (src/prisma/package.json) is kept
-# so the image can build its dist/ itself; its node_modules/dist are excluded via
-# the wildcards below (the deps stage rebuilds them).
+# or VCS metadata. The db-lib submodule is NOT copied from the context — the deps
+# stage git-clones it at a pinned commit (see Dockerfile), which is the only thing
+# that works on Railway (it doesn't init submodules or copy .git into the build
+# context). Excluding it here shrinks the context and makes a local `docker build`
+# reproduce Railway's empty-submodule condition.
 node_modules
 **/node_modules
 dist
 **/dist
 .git
 **/.git
+supagloo-database-lib
 *.log
 npm-debug.log*
 .env
