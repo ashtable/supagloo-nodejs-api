@@ -54,6 +54,11 @@ export const envSchema = z.object({
   // Still unverified at implementation time (§9-Q10): the X-YVP-App-Key auth
   // header convention, and which bible IDs map to KJV/BSB.
   YOUVERSION_BASE_URL: providerBaseUrl("https://api.youversion.com"),
+
+  // Task #10 seed gate (§9-Q9). A raw string flag, kept verbatim (not coerced to
+  // boolean) so the route can enforce the exact `=== '1'` contract. The seed
+  // endpoint additionally requires NODE_ENV !== 'production'; unset in prod.
+  SUPAGLOO_ENABLE_TEST_SEED: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

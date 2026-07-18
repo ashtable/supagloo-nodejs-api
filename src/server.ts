@@ -1,18 +1,45 @@
+import { createPrismaClient } from "@supagloo/database-lib";
 import { buildApp } from "./app";
 import { loadEnv } from "./config/env";
+import { AuthService } from "./auth/auth-service";
+import { makeYouVersionVerifier } from "./auth/youversion";
+import { SESSION_TTL_MS } from "./auth/tokens";
 
 /**
- * Process entry point: validate the environment (fail-fast), build the app, and
- * listen. The `api` Compose service runs this via `node dist/server.js`.
+ * Process entry point: validate the environment (fail-fast), build the app with
+ * the real Prisma-backed AuthService + YouVersion verifier, and listen. The `api`
+ * Compose service runs this via `node dist/server.js`.
  */
 async function main(): Promise<void> {
   const env = loadEnv();
-  const app = buildApp({ logger: true });
+
+  const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
+  const authService = new AuthService({
+    prisma,
+    verifyToken: makeYouVersionVerifier({ baseUrl: env.YOUVERSION_BASE_URL }),
+    sessionTtlMs: SESSION_TTL_MS,
+  });
+
+  const app = buildApp({
+    logger: true,
+    auth: {
+      authService,
+      env: {
+        NODE_ENV: env.NODE_ENV,
+        SUPAGLOO_ENABLE_TEST_SEED: env.SUPAGLOO_ENABLE_TEST_SEED,
+      },
+    },
+  });
+
+  app.addHook("onClose", async () => {
+    await prisma.$disconnect();
+  });
 
   try {
     await app.listen({ port: env.PORT, host: env.HOST });
   } catch (err) {
     app.log.error(err);
+    await prisma.$disconnect();
     process.exit(1);
   }
 }
