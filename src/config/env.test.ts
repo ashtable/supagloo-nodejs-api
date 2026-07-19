@@ -74,4 +74,19 @@ describe("loadEnv", () => {
       ).toThrow(/OPENROUTER_BASE_URL/);
     });
   });
+
+  describe("SUPAGLOO_ENABLE_TEST_SEED (Task #10 seed gate)", () => {
+    it("defaults to undefined when unset", () => {
+      const env = loadEnv({ DATABASE_URL: VALID_DB_URL });
+      expect(env.SUPAGLOO_ENABLE_TEST_SEED).toBeUndefined();
+    });
+
+    it("passes the raw '1' flag through verbatim", () => {
+      const env = loadEnv({
+        DATABASE_URL: VALID_DB_URL,
+        SUPAGLOO_ENABLE_TEST_SEED: "1",
+      });
+      expect(env.SUPAGLOO_ENABLE_TEST_SEED).toBe("1");
+    });
+  });
 });
