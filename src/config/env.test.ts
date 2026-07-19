@@ -3,9 +3,29 @@ import { loadEnv } from "./env";
 
 const VALID_DB_URL = "postgres://supagloo:supagloo@localhost:5432/supagloo";
 
+// The GitHub App is now a required app-level secret set (Task #11): the API
+// signs App JWTs (private key + app id) and builds the hosted install URL (slug).
+// A valid env therefore carries all three; helper keeps the success cases honest.
+const GITHUB_APP_ID = "123456";
+const GITHUB_APP_PRIVATE_KEY =
+  "-----BEGIN RSA PRIVATE KEY-----\nMIItest\n-----END RSA PRIVATE KEY-----";
+const GITHUB_APP_SLUG = "supagloo-test";
+
+function validEnv(
+  overrides: Record<string, string | undefined> = {},
+): Record<string, string | undefined> {
+  return {
+    DATABASE_URL: VALID_DB_URL,
+    GITHUB_APP_ID,
+    GITHUB_APP_PRIVATE_KEY,
+    GITHUB_APP_SLUG,
+    ...overrides,
+  };
+}
+
 describe("loadEnv", () => {
   it("accepts a valid postgres DATABASE_URL and applies server-bind defaults", () => {
-    const env = loadEnv({ DATABASE_URL: VALID_DB_URL });
+    const env = loadEnv(validEnv());
     expect(env.DATABASE_URL).toBe(VALID_DB_URL);
     expect(env.PORT).toBe(4000);
     expect(env.HOST).toBe("0.0.0.0");
@@ -13,12 +33,14 @@ describe("loadEnv", () => {
   });
 
   it("accepts the postgresql:// scheme and coerces overrides", () => {
-    const env = loadEnv({
-      DATABASE_URL: "postgresql://u:p@db:5432/app",
-      PORT: "8080",
-      HOST: "127.0.0.1",
-      NODE_ENV: "production",
-    });
+    const env = loadEnv(
+      validEnv({
+        DATABASE_URL: "postgresql://u:p@db:5432/app",
+        PORT: "8080",
+        HOST: "127.0.0.1",
+        NODE_ENV: "production",
+      }),
+    );
     expect(env.DATABASE_URL).toBe("postgresql://u:p@db:5432/app");
     expect(env.PORT).toBe(8080);
     expect(env.HOST).toBe("127.0.0.1");
@@ -26,28 +48,28 @@ describe("loadEnv", () => {
   });
 
   it("rejects a missing DATABASE_URL", () => {
-    expect(() => loadEnv({})).toThrow(/DATABASE_URL/);
-  });
-
-  it("rejects an empty DATABASE_URL", () => {
-    expect(() => loadEnv({ DATABASE_URL: "" })).toThrow(/DATABASE_URL/);
-  });
-
-  it("rejects a non-postgres DATABASE_URL scheme", () => {
-    expect(() => loadEnv({ DATABASE_URL: "http://example.com/db" })).toThrow(
-      /postgres/i,
+    expect(() => loadEnv(validEnv({ DATABASE_URL: undefined }))).toThrow(
+      /DATABASE_URL/,
     );
   });
 
-  it("rejects a non-numeric PORT", () => {
+  it("rejects an empty DATABASE_URL", () => {
+    expect(() => loadEnv(validEnv({ DATABASE_URL: "" }))).toThrow(/DATABASE_URL/);
+  });
+
+  it("rejects a non-postgres DATABASE_URL scheme", () => {
     expect(() =>
-      loadEnv({ DATABASE_URL: VALID_DB_URL, PORT: "not-a-number" }),
-    ).toThrow();
+      loadEnv(validEnv({ DATABASE_URL: "http://example.com/db" })),
+    ).toThrow(/postgres/i);
+  });
+
+  it("rejects a non-numeric PORT", () => {
+    expect(() => loadEnv(validEnv({ PORT: "not-a-number" }))).toThrow();
   });
 
   describe("provider base URLs (Task #9 convention)", () => {
     it("defaults to the real provider URLs when unset", () => {
-      const env = loadEnv({ DATABASE_URL: VALID_DB_URL });
+      const env = loadEnv(validEnv());
       expect(env.GITHUB_API_BASE_URL).toBe("https://api.github.com");
       expect(env.GITHUB_OAUTH_BASE_URL).toBe("https://github.com");
       expect(env.OPENROUTER_BASE_URL).toBe("https://openrouter.ai");
@@ -56,36 +78,61 @@ describe("loadEnv", () => {
     });
 
     it("accepts overrides that point at http:// stub servers", () => {
-      const env = loadEnv({
-        DATABASE_URL: VALID_DB_URL,
-        GITHUB_API_BASE_URL: "http://github-stub:8080",
-        GITHUB_OAUTH_BASE_URL: "http://github-stub:8080",
-        OPENROUTER_BASE_URL: "http://openrouter-stub:8080",
-        GLOO_BASE_URL: "http://gloo-stub:8080",
-        YOUVERSION_BASE_URL: "http://youversion-stub:8080",
-      });
+      const env = loadEnv(
+        validEnv({
+          GITHUB_API_BASE_URL: "http://github-stub:8080",
+          GITHUB_OAUTH_BASE_URL: "http://github-stub:8080",
+          OPENROUTER_BASE_URL: "http://openrouter-stub:8080",
+          GLOO_BASE_URL: "http://gloo-stub:8080",
+          YOUVERSION_BASE_URL: "http://youversion-stub:8080",
+        }),
+      );
       expect(env.OPENROUTER_BASE_URL).toBe("http://openrouter-stub:8080");
       expect(env.GITHUB_API_BASE_URL).toBe("http://github-stub:8080");
     });
 
     it("rejects a non-http(s) provider base URL", () => {
       expect(() =>
-        loadEnv({ DATABASE_URL: VALID_DB_URL, OPENROUTER_BASE_URL: "ftp://nope" }),
+        loadEnv(validEnv({ OPENROUTER_BASE_URL: "ftp://nope" })),
       ).toThrow(/OPENROUTER_BASE_URL/);
+    });
+  });
+
+  describe("GitHub App secrets (Task #11)", () => {
+    it("passes the app id, private key, and slug through", () => {
+      const env = loadEnv(validEnv());
+      expect(env.GITHUB_APP_ID).toBe(GITHUB_APP_ID);
+      expect(env.GITHUB_APP_PRIVATE_KEY).toBe(GITHUB_APP_PRIVATE_KEY);
+      expect(env.GITHUB_APP_SLUG).toBe(GITHUB_APP_SLUG);
+    });
+
+    it("rejects a missing GITHUB_APP_ID", () => {
+      expect(() => loadEnv(validEnv({ GITHUB_APP_ID: undefined }))).toThrow(
+        /GITHUB_APP_ID/,
+      );
+    });
+
+    it("rejects a missing GITHUB_APP_PRIVATE_KEY", () => {
+      expect(() =>
+        loadEnv(validEnv({ GITHUB_APP_PRIVATE_KEY: undefined })),
+      ).toThrow(/GITHUB_APP_PRIVATE_KEY/);
+    });
+
+    it("rejects a missing GITHUB_APP_SLUG", () => {
+      expect(() => loadEnv(validEnv({ GITHUB_APP_SLUG: undefined }))).toThrow(
+        /GITHUB_APP_SLUG/,
+      );
     });
   });
 
   describe("SUPAGLOO_ENABLE_TEST_SEED (Task #10 seed gate)", () => {
     it("defaults to undefined when unset", () => {
-      const env = loadEnv({ DATABASE_URL: VALID_DB_URL });
+      const env = loadEnv(validEnv());
       expect(env.SUPAGLOO_ENABLE_TEST_SEED).toBeUndefined();
     });
 
     it("passes the raw '1' flag through verbatim", () => {
-      const env = loadEnv({
-        DATABASE_URL: VALID_DB_URL,
-        SUPAGLOO_ENABLE_TEST_SEED: "1",
-      });
+      const env = loadEnv(validEnv({ SUPAGLOO_ENABLE_TEST_SEED: "1" }));
       expect(env.SUPAGLOO_ENABLE_TEST_SEED).toBe("1");
     });
   });

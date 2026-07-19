@@ -27,6 +27,7 @@ const APP_URL =
   "postgres://supagloo:supagloo@localhost:5432/supagloo";
 const YOUVERSION_BASE =
   process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
+const GITHUB_BASE = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -91,6 +92,24 @@ async function stubReady(): Promise<boolean> {
   }
 }
 
+async function githubStubReady(): Promise<boolean> {
+  try {
+    const health = await fetch(`${GITHUB_BASE}/__stub/health`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!health.ok) return false;
+    // A stale github-stub image (built before Task #11) lacks the repo-listing
+    // route and would 404; a current one 401s an unauthenticated request.
+    // Distinguish them so a reused-but-stale stack is rebuilt.
+    const probe = await fetch(`${GITHUB_BASE}/installation/repositories`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    return probe.status === 401;
+  } catch {
+    return false;
+  }
+}
+
 async function waitFor(
   fn: () => Promise<boolean>,
   timeoutMs: number,
@@ -113,21 +132,29 @@ function migrate(): void {
 }
 
 export default async function setup() {
-  if ((await dbReady()) && (await stubReady())) {
+  if ((await dbReady()) && (await stubReady()) && (await githubStubReady())) {
     // Reuse a healthy running stack — leave it exactly as-is.
     return;
   }
 
   if (!existsSync(resolve(ROOT_REPO, "docker-compose.yml"))) {
     throw new Error(
-      `Auth e2e needs Postgres + the YouVersion stub, but neither a running ` +
-        `stack nor the root Compose repo was found at ${ROOT_REPO}. Bring up the ` +
-        `stack (root repo: docker compose ... up) or set SUPAGLOO_ROOT_DIR.`,
+      `API e2e needs Postgres + the YouVersion + GitHub stubs, but neither a ` +
+        `running stack nor the root Compose repo was found at ${ROOT_REPO}. Bring ` +
+        `up the stack (root repo: docker compose ... up) or set SUPAGLOO_ROOT_DIR.`,
     );
   }
 
-  // `--build` so the stub image includes the Task #10 userinfo route.
-  compose(["up", "-d", "--build", "postgres", "youversion-stub"]);
+  // `--build` so the stub images include the Task #10 userinfo + Task #11 repo
+  // routes.
+  compose([
+    "up",
+    "-d",
+    "--build",
+    "postgres",
+    "youversion-stub",
+    "github-stub",
+  ]);
 
   if (!(await waitFor(pgConnectable, 90_000))) {
     compose(["down"]);
@@ -137,6 +164,10 @@ export default async function setup() {
   if (!(await waitFor(stubReady, 60_000))) {
     compose(["down"]);
     throw new Error("YouVersion stub (with userinfo route) not ready within 60s");
+  }
+  if (!(await waitFor(githubStubReady, 60_000))) {
+    compose(["down"]);
+    throw new Error("GitHub stub (with repo-listing route) not ready within 60s");
   }
 
   return async () => {
