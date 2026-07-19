@@ -13,12 +13,14 @@ import {
 } from "./routes/github";
 import { registerConnectionRoutes } from "./routes/connections";
 import { registerFileRoutes } from "./routes/files";
+import { registerProjectRoutes } from "./routes/projects";
 import type { AuthService } from "./auth/auth-service";
 import type { GithubConnectionService } from "./connections/github-connection-service";
 import type { OpenRouterConnectionService } from "./connections/openrouter-connection-service";
 import type { GlooConnectionService } from "./connections/gloo-connection-service";
 import type { ConnectionsService } from "./connections/connections-service";
 import type { FilesService } from "./files/files-service";
+import type { ProjectsService } from "./projects/projects-service";
 
 /** Dependencies needed to serve the `/v1` auth + session surface. Supplied by
  *  `server.ts` (real Prisma-backed service) and by the e2e harness. When omitted,
@@ -57,6 +59,13 @@ export interface FilesDeps {
   service: FilesService;
 }
 
+/** Dependencies for the projects/versions read+mutate surface (design-delta §2.6/§8).
+ *  Registered inside the same bearer-protected `/v1` scope as `auth`, so only wired
+ *  when `auth` is supplied (the routes need `requireAuth`). */
+export interface ProjectsDeps {
+  service: ProjectsService;
+}
+
 export interface BuildAppOptions {
   /** Enable Fastify's request logger (on for the running server, off in tests). */
   logger?: boolean;
@@ -68,6 +77,8 @@ export interface BuildAppOptions {
   connections?: ConnectionsDeps;
   /** Wire the `/v1` S3 presigned-download route. Requires `auth` (bearer). */
   files?: FilesDeps;
+  /** Wire the `/v1` projects/versions read+mutate routes. Requires `auth` (bearer). */
+  projects?: ProjectsDeps;
 }
 
 /**
@@ -88,6 +99,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const github = options.github;
   const connections = options.connections;
   const files = options.files;
+  const projects = options.projects;
   if (auth) {
     // Everything versioned lives under `/v1` (design-delta §8). The bearer plugin
     // is registered inside this scope so `requireAuth` is available to the routes.
@@ -114,6 +126,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         }
         if (files) {
           registerFileRoutes(v1, { service: files.service });
+        }
+        if (projects) {
+          registerProjectRoutes(v1, { service: projects.service });
         }
       },
       { prefix: "/v1" },

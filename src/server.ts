@@ -13,6 +13,7 @@ import { GlooConnectionService } from "./connections/gloo-connection-service";
 import { ConnectionsService } from "./connections/connections-service";
 import { makeS3Client } from "./files/s3-client";
 import { FilesService } from "./files/files-service";
+import { ProjectsService } from "./projects/projects-service";
 
 /**
  * Process entry point: validate the environment (fail-fast), build the app with
@@ -76,6 +77,8 @@ async function main(): Promise<void> {
   );
   const filesService = new FilesService({ prisma, s3, bucket: env.S3_BUCKET });
 
+  const projectsService = new ProjectsService({ prisma });
+
   const app = buildApp({
     logger: true,
     auth: {
@@ -92,6 +95,7 @@ async function main(): Promise<void> {
       reader: connectionsService,
     },
     files: { service: filesService },
+    projects: { service: projectsService },
   });
 
   app.addHook("onClose", async () => {
