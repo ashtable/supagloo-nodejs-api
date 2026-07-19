@@ -166,8 +166,13 @@ describe("makeGithubAppClient.listInstallationRepos", () => {
     expect(calls[0].auth?.startsWith("Bearer ")).toBe(true);
     expect(isJwt(calls[0].auth!.slice("Bearer ".length))).toBe(true);
 
-    expect(calls[1].url).toBe("https://api.github.com/installation/repositories");
+    // The listing now requests GitHub's max page size (per_page=100); with no
+    // `Link: rel="next"` on this single-page response the client stops here.
+    expect(calls[1].url).toBe(
+      "https://api.github.com/installation/repositories?per_page=100",
+    );
     expect(calls[1].auth).toContain("ghs_minted_1");
+    expect(calls).toHaveLength(2);
 
     expect(repos).toEqual([
       {
@@ -189,5 +194,87 @@ describe("makeGithubAppClient.listInstallationRepos", () => {
         empty: false,
       },
     ]);
+  });
+
+  it("follows Link rel=\"next\" pagination and returns the union of every page", async () => {
+    // GET /installation/repositories is paginated (default 30, max 100 per_page).
+    // A single unpaginated fetch silently truncates any installation with more
+    // repos than one page — a user's target repo vanishing from the picker. The
+    // client must request per_page=100 and follow `Link: rel="next"` to exhaustion.
+    const repo = (id: number, name: string, size: number, priv: boolean) => ({
+      id,
+      name,
+      full_name: `acme/${name}`,
+      owner: { login: "acme" },
+      private: priv,
+      default_branch: "main",
+      size,
+    });
+
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) {
+        return new Response(
+          JSON.stringify({
+            token: "ghs_minted_1",
+            expires_at: "2026-07-18T13:00:00.000Z",
+          }),
+          { status: 201 },
+        );
+      }
+      const page = new URL(url).searchParams.get("page") ?? "1";
+      if (page === "1") {
+        // A full first page + a `rel="next"` link to page 2 (and a `rel="last"`,
+        // which the client must ignore in favour of following `next`).
+        return new Response(
+          JSON.stringify({
+            total_count: 3,
+            repositories: [
+              repo(101, "empty-one", 0, true),
+              repo(102, "empty-two", 0, false),
+            ],
+          }),
+          {
+            status: 200,
+            headers: {
+              link:
+                '<https://api.github.com/installation/repositories?per_page=100&page=2>; rel="next", ' +
+                '<https://api.github.com/installation/repositories?per_page=100&page=2>; rel="last"',
+            },
+          },
+        );
+      }
+      // Last page: no `rel="next"` ⇒ the loop terminates here.
+      return new Response(
+        JSON.stringify({
+          total_count: 3,
+          repositories: [repo(103, "psalms-video", 512, false)],
+        }),
+        { status: 200 },
+      );
+    });
+
+    const client = makeGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+    });
+
+    const repos = await client.listInstallationRepos({ installationId: "42" });
+
+    // The UNION of both pages, in order — not just the first page.
+    expect(repos.map((r) => r.id)).toEqual([101, 102, 103]);
+
+    // The client actually issued multiple HTTP requests (didn't trust one page).
+    const repoCalls = calls.filter((c) =>
+      c.url.includes("/installation/repositories"),
+    );
+    expect(repoCalls).toHaveLength(2);
+    // It asked for the max page size on the first request.
+    expect(repoCalls[0].url).toContain("per_page=100");
+    // Exactly ONE token minted for the whole listing, reused across pages.
+    const mintCalls = calls.filter((c) => c.url.endsWith("/access_tokens"));
+    expect(mintCalls).toHaveLength(1);
+    for (const c of repoCalls) expect(c.auth).toContain("ghs_minted_1");
   });
 });

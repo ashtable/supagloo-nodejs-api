@@ -56,6 +56,18 @@ const reposResponseSchema = z.object({
   repositories: z.array(repoSchema),
 });
 
+/**
+ * GitHub paginates via an RFC 5988 `Link` header; the canonical way to walk a
+ * listing is to follow the `rel="next"` URL until the server stops emitting one
+ * (the same mechanism Octokit uses). Returns the absolute next-page URL, or
+ * `null` when this is the last page — which is what guarantees termination.
+ */
+function parseNextLink(link: string | null): string | null {
+  if (!link) return null;
+  const match = link.match(/<([^>]+)>\s*;\s*rel="next"/);
+  return match ? match[1] : null;
+}
+
 /** Restore a PEM whose newlines were escaped to the literal two-char `\n` (as
  *  env vars often carry multi-line secrets). A real multi-line PEM is unchanged. */
 function normalizePrivateKey(key: string): string {
@@ -96,6 +108,8 @@ export function makeGithubAppClient(
     },
 
     async listInstallationRepos({ installationId }) {
+      // Mint ONCE per listing (the "fresh-token-per-call, never store" invariant
+      // is per `listInstallationRepos` call) and reuse it across every page.
       const { token } = await mintInstallationToken({
         appId,
         privateKey,
@@ -103,17 +117,28 @@ export function makeGithubAppClient(
         apiBaseUrl,
         fetchImpl,
       });
-      const res = await fetchImpl(`${apiBaseUrl}/installation/repositories`, {
-        method: "GET",
-        headers: jsonHeaders(`token ${token}`),
-      });
-      if (!res.ok) {
-        throw new Error(
-          `GitHub installation repos list failed for ${installationId}: ${res.status}`,
-        );
+      const headers = jsonHeaders(`token ${token}`);
+
+      // Walk ALL pages. `per_page=100` is GitHub's max; then we follow the
+      // `Link: rel="next"` URL verbatim until the server omits it. A single
+      // unpaginated fetch would silently truncate any installation with more
+      // repos than fit on one page (their target repo simply vanishing from the
+      // picker with no error) — the bug this method guards against.
+      const collected: z.infer<typeof repoSchema>[] = [];
+      let nextUrl: string | null = `${apiBaseUrl}/installation/repositories?per_page=100`;
+      while (nextUrl) {
+        const res = await fetchImpl(nextUrl, { method: "GET", headers });
+        if (!res.ok) {
+          throw new Error(
+            `GitHub installation repos list failed for ${installationId}: ${res.status}`,
+          );
+        }
+        const raw = reposResponseSchema.parse(await res.json());
+        collected.push(...raw.repositories);
+        nextUrl = parseNextLink(res.headers.get("link"));
       }
-      const raw = reposResponseSchema.parse(await res.json());
-      return raw.repositories.map((r) => ({
+
+      return collected.map((r) => ({
         id: r.id,
         name: r.name,
         fullName: r.full_name,
