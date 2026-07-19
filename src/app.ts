@@ -7,7 +7,12 @@ import { registerHealthRoutes } from "./routes/health";
 import { bearerAuthPlugin } from "./auth/bearer-auth";
 import { registerAuthRoutes } from "./routes/auth";
 import { registerTestSeedRoute } from "./routes/test-seed";
+import {
+  registerGithubConnectionRoutes,
+  registerGithubRepoRoutes,
+} from "./routes/github";
 import type { AuthService } from "./auth/auth-service";
+import type { GithubConnectionService } from "./connections/github-connection-service";
 
 /** Dependencies needed to serve the `/v1` auth + session surface. Supplied by
  *  `server.ts` (real Prisma-backed service) and by the e2e harness. When omitted,
@@ -22,11 +27,20 @@ export interface AuthDeps {
   };
 }
 
+/** Dependencies for the GitHub App connection surface (design-delta §2.3/§8).
+ *  Registered inside the same bearer-protected `/v1` scope as `auth`, so it is
+ *  only wired when `auth` is also supplied (its routes need `requireAuth`). */
+export interface GithubDeps {
+  service: GithubConnectionService;
+}
+
 export interface BuildAppOptions {
   /** Enable Fastify's request logger (on for the running server, off in tests). */
   logger?: boolean;
   /** Wire the `/v1` auth/session routes. Omit for a health-only app. */
   auth?: AuthDeps;
+  /** Wire the `/v1` GitHub connection + repo routes. Requires `auth` (bearer). */
+  github?: GithubDeps;
 }
 
 /**
@@ -44,6 +58,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   registerHealthRoutes(app);
 
   const auth = options.auth;
+  const github = options.github;
   if (auth) {
     // Everything versioned lives under `/v1` (design-delta §8). The bearer plugin
     // is registered inside this scope so `requireAuth` is available to the routes.
@@ -57,6 +72,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           authService: auth.authService,
           env: auth.env,
         });
+        if (github) {
+          registerGithubConnectionRoutes(v1, { service: github.service });
+          registerGithubRepoRoutes(v1, { service: github.service });
+        }
       },
       { prefix: "/v1" },
     );

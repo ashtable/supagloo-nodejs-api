@@ -4,6 +4,8 @@ import { loadEnv } from "./config/env";
 import { AuthService } from "./auth/auth-service";
 import { makeYouVersionVerifier } from "./auth/youversion";
 import { SESSION_TTL_MS } from "./auth/tokens";
+import { makeGithubAppClient } from "./connections/github-app-client";
+import { GithubConnectionService } from "./connections/github-connection-service";
 
 /**
  * Process entry point: validate the environment (fail-fast), build the app with
@@ -20,6 +22,19 @@ async function main(): Promise<void> {
     sessionTtlMs: SESSION_TTL_MS,
   });
 
+  const githubAppClient = makeGithubAppClient({
+    apiBaseUrl: env.GITHUB_API_BASE_URL,
+    appId: env.GITHUB_APP_ID,
+    privateKey: env.GITHUB_APP_PRIVATE_KEY,
+  });
+  const githubService = new GithubConnectionService({
+    prisma,
+    verifyInstallation: githubAppClient.verifyInstallation,
+    listInstallationRepos: githubAppClient.listInstallationRepos,
+    oauthBaseUrl: env.GITHUB_OAUTH_BASE_URL,
+    appSlug: env.GITHUB_APP_SLUG,
+  });
+
   const app = buildApp({
     logger: true,
     auth: {
@@ -29,6 +44,7 @@ async function main(): Promise<void> {
         SUPAGLOO_ENABLE_TEST_SEED: env.SUPAGLOO_ENABLE_TEST_SEED,
       },
     },
+    github: { service: githubService },
   });
 
   app.addHook("onClose", async () => {

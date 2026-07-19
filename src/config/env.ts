@@ -59,6 +59,19 @@ export const envSchema = z.object({
   // boolean) so the route can enforce the exact `=== '1'` contract. The seed
   // endpoint additionally requires NODE_ENV !== 'production'; unset in prod.
   SUPAGLOO_ENABLE_TEST_SEED: z.string().optional(),
+
+  // Task #11 GitHub App (design-delta §2.3/§9-Q1). App-LEVEL secrets/config — one
+  // pair per app registration, shared by the API and DBOS, NOT per-user data — so
+  // they live in env config and bypass §2.10's per-user AES-256-GCM scheme. The
+  // API signs ~10-min App JWTs (`GITHUB_APP_ID` issuer + `GITHUB_APP_PRIVATE_KEY`)
+  // to verify installations and mint installation tokens, and builds the hosted
+  // install-picker URL `{GITHUB_OAUTH_BASE_URL}/apps/{GITHUB_APP_SLUG}/installations/new`
+  // (the slug cannot be derived from the numeric app id). Required — fail-fast at
+  // boot. The private key is PKCS#1/PKCS#8 PEM; escaped `\n` is normalized at the
+  // client boundary, so the raw string is carried through here unparsed.
+  GITHUB_APP_ID: z.string().min(1),
+  GITHUB_APP_PRIVATE_KEY: z.string().min(1),
+  GITHUB_APP_SLUG: z.string().min(1),
 });
 
 export type Env = z.infer<typeof envSchema>;
