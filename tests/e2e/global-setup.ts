@@ -28,6 +28,9 @@ const APP_URL =
 const YOUVERSION_BASE =
   process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
 const GITHUB_BASE = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
+const OPENROUTER_BASE =
+  process.env.OPENROUTER_STUB_URL ?? "http://localhost:4802";
+const GLOO_BASE = process.env.GLOO_STUB_URL ?? "http://localhost:4803";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -110,6 +113,44 @@ async function githubStubReady(): Promise<boolean> {
   }
 }
 
+async function openrouterStubReady(): Promise<boolean> {
+  try {
+    // The credits route (Task #9) exists in every image version, so a plain health
+    // check suffices — no staleness probe needed for the OpenRouter stub.
+    const health = await fetch(`${OPENROUTER_BASE}/__stub/health`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    return health.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function glooStubReady(): Promise<boolean> {
+  try {
+    const health = await fetch(`${GLOO_BASE}/__stub/health`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!health.ok) return false;
+    // A stale gloo-stub image (built before Task #12) accepts ANY Basic creds and
+    // 200s; a current one rejects the reserved sentinel clientId `gloo-invalid`
+    // with 401. Distinguish them so a reused-but-stale stack is rebuilt.
+    const basic = Buffer.from("gloo-invalid:x").toString("base64");
+    const probe = await fetch(`${GLOO_BASE}/oauth2/token`, {
+      method: "POST",
+      headers: {
+        authorization: `Basic ${basic}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: "grant_type=client_credentials",
+      signal: AbortSignal.timeout(3000),
+    });
+    return probe.status === 401;
+  } catch {
+    return false;
+  }
+}
+
 async function waitFor(
   fn: () => Promise<boolean>,
   timeoutMs: number,
@@ -132,21 +173,28 @@ function migrate(): void {
 }
 
 export default async function setup() {
-  if ((await dbReady()) && (await stubReady()) && (await githubStubReady())) {
+  if (
+    (await dbReady()) &&
+    (await stubReady()) &&
+    (await githubStubReady()) &&
+    (await openrouterStubReady()) &&
+    (await glooStubReady())
+  ) {
     // Reuse a healthy running stack — leave it exactly as-is.
     return;
   }
 
   if (!existsSync(resolve(ROOT_REPO, "docker-compose.yml"))) {
     throw new Error(
-      `API e2e needs Postgres + the YouVersion + GitHub stubs, but neither a ` +
-        `running stack nor the root Compose repo was found at ${ROOT_REPO}. Bring ` +
-        `up the stack (root repo: docker compose ... up) or set SUPAGLOO_ROOT_DIR.`,
+      `API e2e needs Postgres + the YouVersion + GitHub + OpenRouter + Gloo ` +
+        `stubs, but neither a running stack nor the root Compose repo was found at ` +
+        `${ROOT_REPO}. Bring up the stack (root repo: docker compose ... up) or ` +
+        `set SUPAGLOO_ROOT_DIR.`,
     );
   }
 
-  // `--build` so the stub images include the Task #10 userinfo + Task #11 repo
-  // routes.
+  // `--build` so the stub images include the Task #10 userinfo + Task #11 repo +
+  // Task #12 Gloo verify-failure sentinel routes.
   compose([
     "up",
     "-d",
@@ -154,6 +202,8 @@ export default async function setup() {
     "postgres",
     "youversion-stub",
     "github-stub",
+    "openrouter-stub",
+    "gloo-stub",
   ]);
 
   if (!(await waitFor(pgConnectable, 90_000))) {
@@ -168,6 +218,14 @@ export default async function setup() {
   if (!(await waitFor(githubStubReady, 60_000))) {
     compose(["down"]);
     throw new Error("GitHub stub (with repo-listing route) not ready within 60s");
+  }
+  if (!(await waitFor(openrouterStubReady, 60_000))) {
+    compose(["down"]);
+    throw new Error("OpenRouter stub not ready within 60s");
+  }
+  if (!(await waitFor(glooStubReady, 60_000))) {
+    compose(["down"]);
+    throw new Error("Gloo stub (with verify-failure sentinel) not ready within 60s");
   }
 
   return async () => {

@@ -6,6 +6,11 @@ import { makeYouVersionVerifier } from "./auth/youversion";
 import { SESSION_TTL_MS } from "./auth/tokens";
 import { makeGithubAppClient } from "./connections/github-app-client";
 import { GithubConnectionService } from "./connections/github-connection-service";
+import { makeOpenRouterClient } from "./connections/openrouter-client";
+import { makeGlooClient } from "./connections/gloo-client";
+import { OpenRouterConnectionService } from "./connections/openrouter-connection-service";
+import { GlooConnectionService } from "./connections/gloo-connection-service";
+import { ConnectionsService } from "./connections/connections-service";
 
 /**
  * Process entry point: validate the environment (fail-fast), build the app with
@@ -35,6 +40,24 @@ async function main(): Promise<void> {
     appSlug: env.GITHUB_APP_SLUG,
   });
 
+  const openrouterClient = makeOpenRouterClient({
+    apiBaseUrl: env.OPENROUTER_BASE_URL,
+  });
+  const openrouterService = new OpenRouterConnectionService({
+    prisma,
+    getCredits: openrouterClient.getCredits,
+    encryptionKey: env.SECRETS_ENCRYPTION_KEY,
+  });
+
+  const glooClient = makeGlooClient({ apiBaseUrl: env.GLOO_BASE_URL });
+  const glooService = new GlooConnectionService({
+    prisma,
+    verifyClientCredentials: glooClient.verifyClientCredentials,
+    encryptionKey: env.SECRETS_ENCRYPTION_KEY,
+  });
+
+  const connectionsService = new ConnectionsService({ prisma });
+
   const app = buildApp({
     logger: true,
     auth: {
@@ -45,6 +68,11 @@ async function main(): Promise<void> {
       },
     },
     github: { service: githubService },
+    connections: {
+      openrouter: openrouterService,
+      gloo: glooService,
+      reader: connectionsService,
+    },
   });
 
   app.addHook("onClose", async () => {

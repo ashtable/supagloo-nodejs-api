@@ -12,6 +12,10 @@ import { z } from "zod";
  */
 const POSTGRES_URL = /^postgres(?:ql)?:\/\/.+/;
 const HTTP_URL = /^https?:\/\/.+/;
+// A 32-byte AES-256-GCM key, supplied as 64 hex chars (`openssl rand -hex 32`).
+// Matches database-lib `secrets.ts`'s `KEY_HEX`; validated here so a misconfigured
+// key fails fast at boot rather than on the first encrypt/decrypt.
+const SECRETS_KEY_HEX = /^[0-9a-fA-F]{64}$/;
 
 /**
  * A provider base URL: http(s), with the REAL provider URL as the default so
@@ -72,6 +76,20 @@ export const envSchema = z.object({
   GITHUB_APP_ID: z.string().min(1),
   GITHUB_APP_PRIVATE_KEY: z.string().min(1),
   GITHUB_APP_SLUG: z.string().min(1),
+
+  // Task #12 application-secrets key (design-delta §2.10). The single AES-256-GCM
+  // key the API uses to encrypt/decrypt per-user provider secrets (the OpenRouter
+  // API key, the Gloo client secret) via database-lib's `encryptSecret`/
+  // `decryptSecret`. A 64-hex-char (32-byte) value, distinct per environment
+  // (`openssl rand -hex 32`). Required — fail-fast at boot. NOT per-user data; one
+  // key per deployment, shared by the API and DBOS.
+  SECRETS_ENCRYPTION_KEY: z
+    .string()
+    .refine((value) => SECRETS_KEY_HEX.test(value), {
+      message:
+        "SECRETS_ENCRYPTION_KEY must be a 64-character hex string (32 bytes); " +
+        "generate one with `openssl rand -hex 32`",
+    }),
 });
 
 export type Env = z.infer<typeof envSchema>;
