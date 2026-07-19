@@ -1,6 +1,10 @@
 import type {
   GithubConnection,
   GithubConnectionStatus,
+  GlooConnection,
+  GlooConnectionStatus,
+  OpenRouterConnection,
+  OpenRouterConnectionStatus,
 } from "@supagloo/database-lib";
 
 /**
@@ -18,5 +22,36 @@ export function toGithubConnectionDto(
     repositorySelection: row.repositorySelection,
     status: row.status,
     connectedAt: row.connectedAt.toISOString(),
+  };
+}
+
+/**
+ * Map a persisted `OpenRouterConnection` row to its wire DTO (design-delta §2.5).
+ * Carries ONLY the masked `keyLast4` — never `apiKeyCiphertext`. `connectedAt`
+ * becomes an ISO-8601 string.
+ */
+export function toOpenRouterConnectionDto(
+  row: OpenRouterConnection,
+): OpenRouterConnectionStatus {
+  return {
+    keyLast4: row.keyLast4,
+    status: row.status,
+    connectedAt: row.connectedAt.toISOString(),
+  };
+}
+
+/**
+ * Map a persisted `GlooConnection` row to its wire DTO (design-delta §2.5). Carries
+ * the plaintext `clientId` and the timestamps — never `clientSecretCiphertext`.
+ * Date columns become ISO-8601 strings.
+ */
+export function toGlooConnectionDto(
+  row: GlooConnection,
+): GlooConnectionStatus {
+  return {
+    clientId: row.clientId,
+    status: row.status,
+    connectedAt: row.connectedAt.toISOString(),
+    lastVerifiedAt: row.lastVerifiedAt.toISOString(),
   };
 }

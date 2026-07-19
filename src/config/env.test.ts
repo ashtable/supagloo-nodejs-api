@@ -11,6 +11,10 @@ const GITHUB_APP_PRIVATE_KEY =
   "-----BEGIN RSA PRIVATE KEY-----\nMIItest\n-----END RSA PRIVATE KEY-----";
 const GITHUB_APP_SLUG = "supagloo-test";
 
+// Task #12: the secrets encryption key is now a required app-level secret — a
+// 64-char hex string (32 bytes; `openssl rand -hex 32`). A valid env carries one.
+const SECRETS_ENCRYPTION_KEY = "a".repeat(64);
+
 function validEnv(
   overrides: Record<string, string | undefined> = {},
 ): Record<string, string | undefined> {
@@ -19,6 +23,7 @@ function validEnv(
     GITHUB_APP_ID,
     GITHUB_APP_PRIVATE_KEY,
     GITHUB_APP_SLUG,
+    SECRETS_ENCRYPTION_KEY,
     ...overrides,
   };
 }
@@ -122,6 +127,38 @@ describe("loadEnv", () => {
       expect(() => loadEnv(validEnv({ GITHUB_APP_SLUG: undefined }))).toThrow(
         /GITHUB_APP_SLUG/,
       );
+    });
+  });
+
+  describe("SECRETS_ENCRYPTION_KEY (Task #12)", () => {
+    it("passes a valid 64-char hex key through", () => {
+      const env = loadEnv(validEnv());
+      expect(env.SECRETS_ENCRYPTION_KEY).toBe(SECRETS_ENCRYPTION_KEY);
+    });
+
+    it("accepts an uppercase hex key", () => {
+      const key = "AB".repeat(32);
+      const env = loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: key }));
+      expect(env.SECRETS_ENCRYPTION_KEY).toBe(key);
+    });
+
+    it("rejects a missing SECRETS_ENCRYPTION_KEY", () => {
+      expect(() =>
+        loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: undefined })),
+      ).toThrow(/SECRETS_ENCRYPTION_KEY/);
+    });
+
+    it("rejects a key that is not 64 hex chars (too short / non-hex / base64)", () => {
+      for (const bad of [
+        "a".repeat(63),
+        "a".repeat(65),
+        "z".repeat(64),
+        Buffer.alloc(32).toString("base64"),
+      ]) {
+        expect(() =>
+          loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: bad })),
+        ).toThrow(/SECRETS_ENCRYPTION_KEY/);
+      }
     });
   });
 

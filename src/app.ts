@@ -11,8 +11,12 @@ import {
   registerGithubConnectionRoutes,
   registerGithubRepoRoutes,
 } from "./routes/github";
+import { registerConnectionRoutes } from "./routes/connections";
 import type { AuthService } from "./auth/auth-service";
 import type { GithubConnectionService } from "./connections/github-connection-service";
+import type { OpenRouterConnectionService } from "./connections/openrouter-connection-service";
+import type { GlooConnectionService } from "./connections/gloo-connection-service";
+import type { ConnectionsService } from "./connections/connections-service";
 
 /** Dependencies needed to serve the `/v1` auth + session surface. Supplied by
  *  `server.ts` (real Prisma-backed service) and by the e2e harness. When omitted,
@@ -34,6 +38,16 @@ export interface GithubDeps {
   service: GithubConnectionService;
 }
 
+/** Dependencies for the OpenRouter + Gloo connection surface + the merged
+ *  `GET /v1/connections` (design-delta §2.5/§8). Registered inside the same
+ *  bearer-protected `/v1` scope as `auth`, so only wired when `auth` is supplied. */
+export interface ConnectionsDeps {
+  openrouter: OpenRouterConnectionService;
+  gloo: GlooConnectionService;
+  /** Merged reader across all three connection tables (backs `GET /v1/connections`). */
+  reader: ConnectionsService;
+}
+
 export interface BuildAppOptions {
   /** Enable Fastify's request logger (on for the running server, off in tests). */
   logger?: boolean;
@@ -41,6 +55,8 @@ export interface BuildAppOptions {
   auth?: AuthDeps;
   /** Wire the `/v1` GitHub connection + repo routes. Requires `auth` (bearer). */
   github?: GithubDeps;
+  /** Wire the `/v1` OpenRouter + Gloo + merged connection routes. Requires `auth`. */
+  connections?: ConnectionsDeps;
 }
 
 /**
@@ -59,6 +75,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
 
   const auth = options.auth;
   const github = options.github;
+  const connections = options.connections;
   if (auth) {
     // Everything versioned lives under `/v1` (design-delta §8). The bearer plugin
     // is registered inside this scope so `requireAuth` is available to the routes.
@@ -75,6 +92,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         if (github) {
           registerGithubConnectionRoutes(v1, { service: github.service });
           registerGithubRepoRoutes(v1, { service: github.service });
+        }
+        if (connections) {
+          registerConnectionRoutes(v1, {
+            openrouter: connections.openrouter,
+            gloo: connections.gloo,
+            reader: connections.reader,
+          });
         }
       },
       { prefix: "/v1" },
