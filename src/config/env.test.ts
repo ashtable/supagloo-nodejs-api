@@ -15,6 +15,17 @@ const GITHUB_APP_SLUG = "supagloo-test";
 // 64-char hex string (32 bytes; `openssl rand -hex 32`). A valid env carries one.
 const SECRETS_ENCRYPTION_KEY = "a".repeat(64);
 
+// Task #13: the S3 object-storage config is now required (except S3_REGION, which
+// defaults). A valid env carries the internal + public endpoints, bucket, and
+// access/secret keys.
+const S3_ENV = {
+  S3_ENDPOINT: "http://minio:9000",
+  S3_PUBLIC_ENDPOINT: "http://localhost:9000",
+  S3_BUCKET: "supagloo-dev",
+  S3_ACCESS_KEY: "supagloo",
+  S3_SECRET_KEY: "supagloo-dev",
+};
+
 function validEnv(
   overrides: Record<string, string | undefined> = {},
 ): Record<string, string | undefined> {
@@ -24,6 +35,7 @@ function validEnv(
     GITHUB_APP_PRIVATE_KEY,
     GITHUB_APP_SLUG,
     SECRETS_ENCRYPTION_KEY,
+    ...S3_ENV,
     ...overrides,
   };
 }
@@ -159,6 +171,46 @@ describe("loadEnv", () => {
           loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: bad })),
         ).toThrow(/SECRETS_ENCRYPTION_KEY/);
       }
+    });
+  });
+
+  describe("S3 object storage (Task #13)", () => {
+    it("passes the endpoints/bucket/keys through and defaults the region", () => {
+      const env = loadEnv(validEnv());
+      expect(env.S3_ENDPOINT).toBe("http://minio:9000");
+      expect(env.S3_PUBLIC_ENDPOINT).toBe("http://localhost:9000");
+      expect(env.S3_BUCKET).toBe("supagloo-dev");
+      expect(env.S3_ACCESS_KEY).toBe("supagloo");
+      expect(env.S3_SECRET_KEY).toBe("supagloo-dev");
+      expect(env.S3_REGION).toBe("us-east-1");
+    });
+
+    it("accepts an S3_REGION override", () => {
+      const env = loadEnv(validEnv({ S3_REGION: "eu-west-1" }));
+      expect(env.S3_REGION).toBe("eu-west-1");
+    });
+
+    it("rejects a missing required S3 var", () => {
+      for (const key of [
+        "S3_ENDPOINT",
+        "S3_PUBLIC_ENDPOINT",
+        "S3_BUCKET",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+      ]) {
+        expect(() => loadEnv(validEnv({ [key]: undefined })), key).toThrow(
+          new RegExp(key),
+        );
+      }
+    });
+
+    it("rejects a non-http(s) endpoint (internal or public)", () => {
+      expect(() =>
+        loadEnv(validEnv({ S3_ENDPOINT: "minio:9000" })),
+      ).toThrow(/S3_ENDPOINT/);
+      expect(() =>
+        loadEnv(validEnv({ S3_PUBLIC_ENDPOINT: "ftp://nope" })),
+      ).toThrow(/S3_PUBLIC_ENDPOINT/);
     });
   });
 

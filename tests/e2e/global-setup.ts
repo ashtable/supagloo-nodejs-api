@@ -31,6 +31,9 @@ const GITHUB_BASE = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
 const OPENROUTER_BASE =
   process.env.OPENROUTER_STUB_URL ?? "http://localhost:4802";
 const GLOO_BASE = process.env.GLOO_STUB_URL ?? "http://localhost:4803";
+// MinIO (Task #13): the files e2e presigns + round-trips against the Compose MinIO.
+// Probe the host-reachable (public) endpoint's health route.
+const MINIO_BASE = process.env.S3_PUBLIC_ENDPOINT ?? "http://localhost:9000";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -151,6 +154,20 @@ async function glooStubReady(): Promise<boolean> {
   }
 }
 
+async function minioReady(): Promise<boolean> {
+  try {
+    // MinIO's liveness endpoint; 200 once the server is accepting requests. The
+    // bucket itself is created by the one-shot `minio-init` service; the files e2e
+    // additionally CreateBucket (idempotent) so it never races that init.
+    const health = await fetch(`${MINIO_BASE}/minio/health/live`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    return health.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function waitFor(
   fn: () => Promise<boolean>,
   timeoutMs: number,
@@ -178,7 +195,8 @@ export default async function setup() {
     (await stubReady()) &&
     (await githubStubReady()) &&
     (await openrouterStubReady()) &&
-    (await glooStubReady())
+    (await glooStubReady()) &&
+    (await minioReady())
   ) {
     // Reuse a healthy running stack — leave it exactly as-is.
     return;
@@ -187,14 +205,15 @@ export default async function setup() {
   if (!existsSync(resolve(ROOT_REPO, "docker-compose.yml"))) {
     throw new Error(
       `API e2e needs Postgres + the YouVersion + GitHub + OpenRouter + Gloo ` +
-        `stubs, but neither a running stack nor the root Compose repo was found at ` +
-        `${ROOT_REPO}. Bring up the stack (root repo: docker compose ... up) or ` +
-        `set SUPAGLOO_ROOT_DIR.`,
+        `stubs + MinIO, but neither a running stack nor the root Compose repo was ` +
+        `found at ${ROOT_REPO}. Bring up the stack (root repo: docker compose ... ` +
+        `up) or set SUPAGLOO_ROOT_DIR.`,
     );
   }
 
   // `--build` so the stub images include the Task #10 userinfo + Task #11 repo +
-  // Task #12 Gloo verify-failure sentinel routes.
+  // Task #12 Gloo verify-failure sentinel routes. `minio` + `minio-init` provide
+  // the Task #13 S3 store + `supagloo-dev` bucket.
   compose([
     "up",
     "-d",
@@ -204,6 +223,8 @@ export default async function setup() {
     "github-stub",
     "openrouter-stub",
     "gloo-stub",
+    "minio",
+    "minio-init",
   ]);
 
   if (!(await waitFor(pgConnectable, 90_000))) {
@@ -226,6 +247,10 @@ export default async function setup() {
   if (!(await waitFor(glooStubReady, 60_000))) {
     compose(["down"]);
     throw new Error("Gloo stub (with verify-failure sentinel) not ready within 60s");
+  }
+  if (!(await waitFor(minioReady, 60_000))) {
+    compose(["down"]);
+    throw new Error("MinIO not ready within 60s");
   }
 
   return async () => {

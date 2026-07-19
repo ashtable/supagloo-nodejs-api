@@ -11,6 +11,8 @@ import { makeGlooClient } from "./connections/gloo-client";
 import { OpenRouterConnectionService } from "./connections/openrouter-connection-service";
 import { GlooConnectionService } from "./connections/gloo-connection-service";
 import { ConnectionsService } from "./connections/connections-service";
+import { makeS3Client } from "./files/s3-client";
+import { FilesService } from "./files/files-service";
 
 /**
  * Process entry point: validate the environment (fail-fast), build the app with
@@ -58,6 +60,22 @@ async function main(): Promise<void> {
 
   const connectionsService = new ConnectionsService({ prisma });
 
+  // Presign against the PUBLIC endpoint (browser-reachable). forcePathStyle is
+  // applied inside the factory. The API only ever builds the `presign` client;
+  // server-to-server ops (the internal endpoint) are reserved for the workers.
+  const s3 = makeS3Client(
+    {
+      internalEndpoint: env.S3_ENDPOINT,
+      publicEndpoint: env.S3_PUBLIC_ENDPOINT,
+      region: env.S3_REGION,
+      bucket: env.S3_BUCKET,
+      accessKey: env.S3_ACCESS_KEY,
+      secretKey: env.S3_SECRET_KEY,
+    },
+    "presign",
+  );
+  const filesService = new FilesService({ prisma, s3, bucket: env.S3_BUCKET });
+
   const app = buildApp({
     logger: true,
     auth: {
@@ -73,6 +91,7 @@ async function main(): Promise<void> {
       gloo: glooService,
       reader: connectionsService,
     },
+    files: { service: filesService },
   });
 
   app.addHook("onClose", async () => {

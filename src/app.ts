@@ -12,11 +12,13 @@ import {
   registerGithubRepoRoutes,
 } from "./routes/github";
 import { registerConnectionRoutes } from "./routes/connections";
+import { registerFileRoutes } from "./routes/files";
 import type { AuthService } from "./auth/auth-service";
 import type { GithubConnectionService } from "./connections/github-connection-service";
 import type { OpenRouterConnectionService } from "./connections/openrouter-connection-service";
 import type { GlooConnectionService } from "./connections/gloo-connection-service";
 import type { ConnectionsService } from "./connections/connections-service";
+import type { FilesService } from "./files/files-service";
 
 /** Dependencies needed to serve the `/v1` auth + session surface. Supplied by
  *  `server.ts` (real Prisma-backed service) and by the e2e harness. When omitted,
@@ -48,6 +50,13 @@ export interface ConnectionsDeps {
   reader: ConnectionsService;
 }
 
+/** Dependencies for the S3 presigned-download surface (design-delta §4/§8).
+ *  Registered inside the same bearer-protected `/v1` scope as `auth`, so only wired
+ *  when `auth` is supplied (the route needs `requireAuth`). */
+export interface FilesDeps {
+  service: FilesService;
+}
+
 export interface BuildAppOptions {
   /** Enable Fastify's request logger (on for the running server, off in tests). */
   logger?: boolean;
@@ -57,6 +66,8 @@ export interface BuildAppOptions {
   github?: GithubDeps;
   /** Wire the `/v1` OpenRouter + Gloo + merged connection routes. Requires `auth`. */
   connections?: ConnectionsDeps;
+  /** Wire the `/v1` S3 presigned-download route. Requires `auth` (bearer). */
+  files?: FilesDeps;
 }
 
 /**
@@ -76,6 +87,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const auth = options.auth;
   const github = options.github;
   const connections = options.connections;
+  const files = options.files;
   if (auth) {
     // Everything versioned lives under `/v1` (design-delta §8). The bearer plugin
     // is registered inside this scope so `requireAuth` is available to the routes.
@@ -99,6 +111,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
             gloo: connections.gloo,
             reader: connections.reader,
           });
+        }
+        if (files) {
+          registerFileRoutes(v1, { service: files.service });
         }
       },
       { prefix: "/v1" },
