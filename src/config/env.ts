@@ -90,6 +90,32 @@ export const envSchema = z.object({
         "SECRETS_ENCRYPTION_KEY must be a 64-character hex string (32 bytes); " +
         "generate one with `openssl rand -hex 32`",
     }),
+
+  // Task #13 S3 object storage (design-delta §4/§8). The API presigns DOWNLOAD URLs
+  // only (uploads are server-side worker ops; deletes are the cleanup workflow's).
+  // TWO endpoints: S3_ENDPOINT is the internal Docker-network address (worker ops);
+  // S3_PUBLIC_ENDPOINT is the browser-reachable address that presigned URLs MUST be
+  // signed against (a URL signed against minio:9000 is unreachable from a browser).
+  // forcePathStyle is applied in the client factory (MinIO has no vhost-style bucket
+  // DNS). Required (fail-fast) — there is no correct default endpoint/bucket/
+  // credential, and a wrong one silently signs broken URLs. Only S3_REGION defaults.
+  // Dev values point at the Compose MinIO; prod uses the Railway bucket.
+  S3_ENDPOINT: z
+    .string()
+    .min(1)
+    .refine((value) => HTTP_URL.test(value), {
+      message: "S3_ENDPOINT must be an http:// or https:// URL",
+    }),
+  S3_PUBLIC_ENDPOINT: z
+    .string()
+    .min(1)
+    .refine((value) => HTTP_URL.test(value), {
+      message: "S3_PUBLIC_ENDPOINT must be an http:// or https:// URL",
+    }),
+  S3_BUCKET: z.string().min(1),
+  S3_ACCESS_KEY: z.string().min(1),
+  S3_SECRET_KEY: z.string().min(1),
+  S3_REGION: z.string().min(1).default("us-east-1"),
 });
 
 export type Env = z.infer<typeof envSchema>;
