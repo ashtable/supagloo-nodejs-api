@@ -3,6 +3,7 @@ import {
   COMMIT_VERSION_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
+  PUBLISH_VERSION_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
   type PrismaClient,
 } from "@supagloo/database-lib";
@@ -128,6 +129,10 @@ const COMMIT_MANIFEST = {
 const COMMIT_REQ = {
   manifest: COMMIT_MANIFEST,
   message: "Tighten the shelter scene pacing",
+};
+
+const PUBLISH_REQ = {
+  message: "Publish the shelter cut",
 };
 
 // The project the commit endpoint resolves for `:id` (owner-scoped, on its working branch).
@@ -510,6 +515,110 @@ describe("ProjectJobsService.createCommitJob — rejections (Task #21)", () => {
     const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
     await expect(
       makeService(prisma, enqueued).createCommitJob("u1", "cprj1", COMMIT_REQ),
+    ).rejects.toBeInstanceOf(GitOpsInFlightError);
+    expect(has(calls, "projectJob.create")).toBe(false);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+});
+
+describe("ProjectJobsService.createPublishJob — happy path (Task #22)", () => {
+  it("creates a publish ProjectJob and enqueues publishVersion with the exact payload (no manifest)", async () => {
+    const { prisma, calls } = makeFake({
+      project: COMMIT_PROJECT,
+      connection: { installationId: "42" },
+      workingVersion: { semver: "0.0.1" },
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const svc = makeService(prisma, enqueued);
+
+    const res = await svc.createPublishJob("u1", "cprj1", PUBLISH_REQ);
+
+    expect(res).toEqual({ jobId: "job-fixed" });
+
+    // The project is resolved owner-scoped + soft-delete aware.
+    expect(find(calls, "project.findFirst").args.where).toEqual({
+      id: "cprj1",
+      ownerId: "u1",
+      deletedAt: null,
+    });
+
+    // Job created queued, kind publish, with the 7 publish stages seeded pending.
+    const job = find(calls, "projectJob.create").args.data;
+    expect(job.id).toBe("job-fixed");
+    expect(job.projectId).toBe("cprj1");
+    expect(job.userId).toBe("u1");
+    expect(job.kind).toBe("publish");
+    expect(job.status).toBe("queued");
+    expect(Array.isArray(job.stages)).toBe(true);
+    expect(job.stages).toHaveLength(7);
+    expect(job.stages.every((s: any) => s.state === "pending")).toBe(true);
+
+    // Enqueued AFTER the write, on the publish workflow, with the exact payload — carrying
+    // the working branch + the working version semver + the message, and NO manifest.
+    expect(enqueued.calls).toHaveLength(1);
+    expect(enqueued.calls[0].opts).toEqual({
+      workflowName: PUBLISH_VERSION_WORKFLOW_NAME,
+      queueName: GIT_OPS_QUEUE_NAME,
+      workflowID: "job-fixed",
+    });
+    const payload = enqueued.calls[0].payload;
+    expect(payload.projectId).toBe("cprj1");
+    expect(payload.userId).toBe("u1");
+    expect(payload.installationId).toBe("42");
+    expect(payload.repoOwner).toBe("ashtable");
+    expect(payload.repoName).toBe("psalm-121");
+    expect(payload.branchName).toBe("v0.0.1");
+    expect(payload.semver).toBe("0.0.1");
+    expect(payload.message).toBe("Publish the shelter cut");
+    expect("manifest" in payload).toBe(false);
+  });
+});
+
+describe("ProjectJobsService.createPublishJob — rejections (Task #22)", () => {
+  it("404s (ProjectNotFoundError) an unknown / foreign / deleted project", async () => {
+    const { prisma, calls } = makeFake({ project: null });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createPublishJob("u1", "nope", PUBLISH_REQ),
+    ).rejects.toBeInstanceOf(ProjectNotFoundError);
+    expect(has(calls, "projectJob.create")).toBe(false);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+
+  it("409s (GithubNotConnectedError) when the owner has no GitHub connection", async () => {
+    const { prisma, calls } = makeFake({ project: COMMIT_PROJECT, connection: null });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createPublishJob("u1", "cprj1", PUBLISH_REQ),
+    ).rejects.toBeInstanceOf(GithubNotConnectedError);
+    expect(has(calls, "projectJob.create")).toBe(false);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+
+  it("409s (NoWorkingVersionError) when the project has no working version on its branch", async () => {
+    const { prisma, calls } = makeFake({
+      project: COMMIT_PROJECT,
+      connection: { installationId: "42" },
+      workingVersion: null,
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createPublishJob("u1", "cprj1", PUBLISH_REQ),
+    ).rejects.toBeInstanceOf(NoWorkingVersionError);
+    expect(has(calls, "projectJob.create")).toBe(false);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+
+  it("409s (GitOpsInFlightError) when a git-ops job is already in flight", async () => {
+    const { prisma, calls } = makeFake({
+      project: COMMIT_PROJECT,
+      connection: { installationId: "42" },
+      workingVersion: { semver: "0.0.1" },
+      inFlightJobs: [{ id: "job-old", status: "running" }],
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createPublishJob("u1", "cprj1", PUBLISH_REQ),
     ).rejects.toBeInstanceOf(GitOpsInFlightError);
     expect(has(calls, "projectJob.create")).toBe(false);
     expect(enqueued.calls).toHaveLength(0);

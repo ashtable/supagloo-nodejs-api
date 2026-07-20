@@ -4,6 +4,7 @@ import {
   IMPORT_STAGES,
   Prisma,
   ProjectManifestSchema,
+  PUBLISH_STAGES,
   SCAFFOLD_STAGES,
   buildBlankManifest,
   buildInitialStages,
@@ -14,6 +15,8 @@ import {
   type ImportProjectRequest,
   type PrismaClient,
   type ProjectJob,
+  type PublishVersionPayload,
+  type PublishVersionRequest,
   type ScaffoldProjectPayload,
 } from "@supagloo/database-lib";
 import { GithubNotConnectedError } from "../connections/errors";
@@ -361,10 +364,81 @@ export class ProjectJobsService {
   }
 
   /**
+   * Create a `publish` ProjectJob for an EXISTING project's working branch and enqueue the
+   * `publishVersion` workflow (design-delta §7 workflow 4 / §8). A sibling of
+   * {@link createCommitJob} — same owner-scoped 404, GitHub-connection 409, working-version
+   * 409, and reusable in-flight 409 guard — but publish carries NO manifest (the request is
+   * `{ message }` only; the working manifest was already committed via prior commit calls),
+   * so there is no boundary manifest validation. The workflow merges the working branch to
+   * `main`, tags the release, and cuts the next working branch.
+   *
+   * @throws {ProjectNotFoundError} (404) project missing / foreign / soft-deleted.
+   * @throws {GithubNotConnectedError} (409) the owner has no GitHub connection.
+   * @throws {NoWorkingVersionError} (409) the project has no working version to publish.
+   * @throws {GitOpsInFlightError} (409) another git-ops job is already in flight.
+   */
+  async createPublishJob(
+    userId: string,
+    projectId: string,
+    req: PublishVersionRequest,
+  ): Promise<{ jobId: string }> {
+    // Owner + soft-delete scoping (404). Also proves the caller is the owner.
+    const project = await this.prisma.project.findFirst({
+      where: { id: projectId, ownerId: userId, deletedAt: null },
+    });
+    if (!project) throw new ProjectNotFoundError();
+
+    // The publish workflow mints an installation token from the user's connection.
+    const connection = await this.prisma.githubConnection.findUnique({
+      where: { userId },
+    });
+    if (!connection) throw new GithubNotConnectedError();
+
+    // The working version on the project's current branch — its semver is the version being
+    // published (it names the release tag + keys the finalize published-version upsert).
+    const workingVersion = await this.prisma.projectVersion.findFirst({
+      where: { projectId: project.id, branchName: project.currentBranch },
+    });
+    if (!workingVersion) throw new NoWorkingVersionError();
+
+    // Serialize per project: reject if a git-ops job is already in flight (409).
+    await this.assertNoInFlightGitOps(project.id);
+
+    const jobId = this.generateJobId();
+    const stages = buildInitialStages(PUBLISH_STAGES);
+    await this.prisma.projectJob.create({
+      data: {
+        id: jobId,
+        projectId: project.id,
+        userId,
+        kind: "publish",
+        status: "queued",
+        stages: stages as unknown as Prisma.InputJsonValue,
+      },
+    });
+
+    const { workflowName, queueName } = resolveGitOpsWorkflow("publish");
+    const payload: PublishVersionPayload = {
+      projectId: project.id,
+      userId,
+      installationId: connection.installationId,
+      repoOwner: project.repoOwner,
+      repoName: project.repoName,
+      branchName: project.currentBranch,
+      semver: workingVersion.semver,
+      message: req.message,
+    };
+    // Enqueue AFTER the write (same idempotent-re-enqueue story: workflowID = jobId).
+    await this.enqueue({ workflowName, queueName, workflowID: jobId }, payload);
+
+    return { jobId };
+  }
+
+  /**
    * The reusable git-ops concurrency guard (design-delta §7): throw
    * {@link GitOpsInFlightError} when the project has a `queued`/`running` ProjectJob
-   * (any kind). Terminal states never block. Reused by the later git-ops-enqueuing
-   * endpoints (tasks 19/21/22).
+   * (any kind). Terminal states never block. Reused across all four git-ops-enqueuing
+   * endpoints (scaffold/import/commit/publish).
    */
   async assertNoInFlightGitOps(projectId: string): Promise<void> {
     const inFlight = await this.prisma.projectJob.findMany({
