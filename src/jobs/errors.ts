@@ -66,7 +66,8 @@ export class UnsupportedCreatedFromError extends Error {
 
 /**
  * Thrown by the static enqueue lookup when a `ProjectJobKind` has no registered
- * workflow yet (publish until task 22 wires it). An internal/never-reached condition on
+ * workflow. All four real git-ops kinds (scaffold/import_verify/commit/publish) are wired,
+ * so this is a defensive guard for an unknown kind — an internal/never-reached condition on
  * the wired create paths → **500**.
  */
 export class UnsupportedJobKindError extends Error {

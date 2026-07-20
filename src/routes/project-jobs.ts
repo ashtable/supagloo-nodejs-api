@@ -10,6 +10,8 @@ import {
   ProjectIdParamSchema,
   ProjectJobParamsSchema,
   ProjectJobResponseSchema,
+  PublishVersionRequestSchema,
+  PublishVersionResponseSchema,
 } from "@supagloo/database-lib";
 import type { ProjectJobsService } from "../jobs/project-jobs-service";
 import {
@@ -192,6 +194,55 @@ export function registerProjectJobRoutes(
           return reply
             .code(422)
             .send({ error: "manifest_invalid", message: err.message });
+        }
+        throw err;
+      }
+    },
+  );
+
+  // ------------------------------------------------- publish (merge + tag + cut next)
+  r.post(
+    "/projects/:id/publish",
+    {
+      preHandler: app.requireAuth,
+      schema: {
+        params: ProjectIdParamSchema,
+        body: PublishVersionRequestSchema,
+        response: {
+          201: PublishVersionResponseSchema,
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+        },
+      },
+    },
+    async (req, reply) => {
+      try {
+        const result = await service.createPublishJob(
+          req.authUser!.id,
+          req.params.id,
+          req.body,
+        );
+        return reply.code(201).send(result);
+      } catch (err) {
+        if (err instanceof ProjectNotFoundError) {
+          return reply.code(404).send({ error: "not_found", message: err.message });
+        }
+        if (err instanceof GithubNotConnectedError) {
+          return reply
+            .code(409)
+            .send({ error: "github_not_connected", message: err.message });
+        }
+        if (err instanceof GitOpsInFlightError) {
+          return reply
+            .code(409)
+            .send({ error: "git_ops_in_flight", message: err.message });
+        }
+        if (err instanceof NoWorkingVersionError) {
+          return reply
+            .code(409)
+            .send({ error: "no_working_version", message: err.message });
         }
         throw err;
       }

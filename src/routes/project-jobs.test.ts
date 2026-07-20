@@ -31,6 +31,7 @@ function makeService(overrides: Record<string, any> = {}) {
     createProjectWithScaffold: async () => ({ projectId: "p", jobId: "j" }),
     createProjectFromImport: async () => ({ projectId: "imp-p", jobId: "imp-j" }),
     createCommitJob: async () => ({ jobId: "commit-j" }),
+    createPublishJob: async () => ({ jobId: "publish-j" }),
     getJob: async () => ({}),
     ...overrides,
   } as any;
@@ -374,6 +375,149 @@ describe("POST /projects/:id/commit (Task #21)", () => {
       method: "POST",
       url: "/projects/cprj1/commit",
       payload: COMMIT_BODY,
+    });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+describe("POST /projects/:id/publish (Task #22)", () => {
+  const PUBLISH_BODY = { message: "Publish the shelter cut" };
+
+  it("201s with { jobId } on success", async () => {
+    app = await buildTestApp(makeService());
+    const res = await app.inject({
+      method: "POST",
+      url: "/projects/pprj1/publish",
+      headers: BEARER,
+      payload: PUBLISH_BODY,
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toEqual({ jobId: "publish-j" });
+  });
+
+  it("passes the owner id, project id, and message through to the service", async () => {
+    let seen: any;
+    app = await buildTestApp(
+      makeService({
+        createPublishJob: async (userId: string, projectId: string, req: unknown) => {
+          seen = { userId, projectId, req };
+          return { jobId: "publish-j" };
+        },
+      }),
+    );
+    await app.inject({
+      method: "POST",
+      url: "/projects/pprj1/publish",
+      headers: BEARER,
+      payload: PUBLISH_BODY,
+    });
+    expect(seen.userId).toBe("u1");
+    expect(seen.projectId).toBe("pprj1");
+    expect(seen.req.message).toBe("Publish the shelter cut");
+  });
+
+  it("maps ProjectNotFoundError → 404 not_found", async () => {
+    app = await buildTestApp(
+      makeService({
+        createPublishJob: async () => {
+          throw new ProjectNotFoundError();
+        },
+      }),
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: "/projects/pprj1/publish",
+      headers: BEARER,
+      payload: PUBLISH_BODY,
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toBe("not_found");
+  });
+
+  it("maps GithubNotConnectedError → 409 github_not_connected", async () => {
+    app = await buildTestApp(
+      makeService({
+        createPublishJob: async () => {
+          throw new GithubNotConnectedError();
+        },
+      }),
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: "/projects/pprj1/publish",
+      headers: BEARER,
+      payload: PUBLISH_BODY,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe("github_not_connected");
+  });
+
+  it("maps GitOpsInFlightError → 409 git_ops_in_flight", async () => {
+    app = await buildTestApp(
+      makeService({
+        createPublishJob: async () => {
+          throw new GitOpsInFlightError();
+        },
+      }),
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: "/projects/pprj1/publish",
+      headers: BEARER,
+      payload: PUBLISH_BODY,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe("git_ops_in_flight");
+  });
+
+  it("maps NoWorkingVersionError → 409 no_working_version", async () => {
+    app = await buildTestApp(
+      makeService({
+        createPublishJob: async () => {
+          throw new NoWorkingVersionError();
+        },
+      }),
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: "/projects/pprj1/publish",
+      headers: BEARER,
+      payload: PUBLISH_BODY,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe("no_working_version");
+  });
+
+  it("400s an empty or missing message (Zod)", async () => {
+    app = await buildTestApp(makeService());
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/projects/pprj1/publish",
+          headers: BEARER,
+          payload: { message: "" },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/projects/pprj1/publish",
+          headers: BEARER,
+          payload: {},
+        })
+      ).statusCode,
+    ).toBe(400);
+  });
+
+  it("401s without a bearer token", async () => {
+    app = await buildTestApp(makeService());
+    const res = await app.inject({
+      method: "POST",
+      url: "/projects/pprj1/publish",
+      payload: PUBLISH_BODY,
     });
     expect(res.statusCode).toBe(401);
   });
