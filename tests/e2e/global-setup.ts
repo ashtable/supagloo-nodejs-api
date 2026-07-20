@@ -104,12 +104,15 @@ async function githubStubReady(): Promise<boolean> {
       signal: AbortSignal.timeout(3000),
     });
     if (!health.ok) return false;
-    // A stale github-stub image (built before Task #11) lacks the repo-listing
-    // route and would 404; a current one 401s an unauthenticated request.
-    // Distinguish them so a reused-but-stale stack is rebuilt.
-    const probe = await fetch(`${GITHUB_BASE}/installation/repositories`, {
-      signal: AbortSignal.timeout(3000),
-    });
+    // Probe the NEWEST route (Task #20 Contents API). A stale github-stub image
+    // (built before Task #20) lacks it and would 404 (unmatched); a current one
+    // 401s an unauthenticated request (it requires an installation token). Any stub
+    // with this route also has the earlier install/repos routes, so probing the
+    // newest one is sufficient — a reused-but-stale stack is rebuilt.
+    const probe = await fetch(
+      `${GITHUB_BASE}/repos/acme/probe/contents/supagloo.project.json?ref=main`,
+      { signal: AbortSignal.timeout(3000) },
+    );
     return probe.status === 401;
   } catch {
     return false;

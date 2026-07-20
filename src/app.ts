@@ -14,6 +14,7 @@ import {
 import { registerConnectionRoutes } from "./routes/connections";
 import { registerFileRoutes } from "./routes/files";
 import { registerProjectRoutes } from "./routes/projects";
+import { registerManifestRoutes } from "./routes/manifests";
 import { registerProjectJobRoutes } from "./routes/project-jobs";
 import type { AuthService } from "./auth/auth-service";
 import type { GithubConnectionService } from "./connections/github-connection-service";
@@ -22,6 +23,7 @@ import type { GlooConnectionService } from "./connections/gloo-connection-servic
 import type { ConnectionsService } from "./connections/connections-service";
 import type { FilesService } from "./files/files-service";
 import type { ProjectsService } from "./projects/projects-service";
+import type { ManifestService } from "./manifests/manifest-service";
 import type { ProjectJobsService } from "./jobs/project-jobs-service";
 
 /** Dependencies needed to serve the `/v1` auth + session surface. Supplied by
@@ -68,6 +70,13 @@ export interface ProjectsDeps {
   service: ProjectsService;
 }
 
+/** Dependencies for the manifest-read surface (design-delta §5.3/§8). Registered inside
+ *  the same bearer-protected `/v1` scope as `auth`, so only wired when `auth` is supplied
+ *  (the route needs `requireAuth`). */
+export interface ManifestsDeps {
+  service: ManifestService;
+}
+
 /** Dependencies for the project create + job-polling surface (design-delta
  *  §5.1/§6b/§8). Registered inside the same bearer-protected `/v1` scope as `auth`, so
  *  only wired when `auth` is supplied (the routes need `requireAuth`). */
@@ -88,6 +97,8 @@ export interface BuildAppOptions {
   files?: FilesDeps;
   /** Wire the `/v1` projects/versions read+mutate routes. Requires `auth` (bearer). */
   projects?: ProjectsDeps;
+  /** Wire the `/v1` manifest-read route. Requires `auth` (bearer). */
+  manifests?: ManifestsDeps;
   /** Wire the `/v1` project create + job-polling routes. Requires `auth` (bearer). */
   projectJobs?: ProjectJobsDeps;
 }
@@ -111,6 +122,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const connections = options.connections;
   const files = options.files;
   const projects = options.projects;
+  const manifests = options.manifests;
   const projectJobs = options.projectJobs;
   if (auth) {
     // Everything versioned lives under `/v1` (design-delta §8). The bearer plugin
@@ -141,6 +153,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         }
         if (projects) {
           registerProjectRoutes(v1, { service: projects.service });
+        }
+        if (manifests) {
+          registerManifestRoutes(v1, { service: manifests.service });
         }
         if (projectJobs) {
           registerProjectJobRoutes(v1, { service: projectJobs.service });

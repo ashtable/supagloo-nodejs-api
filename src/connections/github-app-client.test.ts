@@ -278,3 +278,127 @@ describe("makeGithubAppClient.listInstallationRepos", () => {
     for (const c of repoCalls) expect(c.auth).toContain("ghs_minted_1");
   });
 });
+
+describe("makeGithubAppClient.getRepositoryFileContents", () => {
+  const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
+
+  it("mints an installation token then reads the contents API with it, decoding base64→utf8", async () => {
+    const raw = JSON.stringify({ manifestVersion: 1, hello: "world" });
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) {
+        return new Response(
+          JSON.stringify({
+            token: "ghs_minted_1",
+            expires_at: "2026-07-19T13:00:00.000Z",
+          }),
+          { status: 201 },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          type: "file",
+          encoding: "base64",
+          // GitHub wraps base64 content with newlines — the client must tolerate it.
+          content: b64(raw).replace(/(.{4})/g, "$1\n"),
+          sha: "abc123",
+          path: "supagloo.project.json",
+          name: "supagloo.project.json",
+          size: raw.length,
+        }),
+        { status: 200 },
+      );
+    });
+    const client = makeGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+    });
+
+    const file = await client.getRepositoryFileContents({
+      installationId: "42",
+      owner: "acme",
+      repo: "psalms-video",
+      path: "supagloo.project.json",
+      ref: "v0.0.1",
+    });
+
+    // First mint (App JWT), then read (minted installation token).
+    expect(calls[0].url).toBe(
+      "https://api.github.com/app/installations/42/access_tokens",
+    );
+    expect(calls[0].auth?.startsWith("Bearer ")).toBe(true);
+    expect(isJwt(calls[0].auth!.slice("Bearer ".length))).toBe(true);
+
+    expect(calls[1].url).toBe(
+      "https://api.github.com/repos/acme/psalms-video/contents/supagloo.project.json?ref=v0.0.1",
+    );
+    expect(calls[1].auth).toContain("ghs_minted_1");
+    expect(calls).toHaveLength(2);
+
+    // Content is decoded to the exact UTF-8 bytes (whitespace in the base64 ignored).
+    expect(file).toEqual({
+      content: raw,
+      sha: "abc123",
+      path: "supagloo.project.json",
+    });
+  });
+
+  it("returns null when the contents API 404s (missing file/branch/repo)", async () => {
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) {
+        return new Response(
+          JSON.stringify({ token: "ghs_x", expires_at: "2026-07-19T13:00:00.000Z" }),
+          { status: 201 },
+        );
+      }
+      return new Response(JSON.stringify({ message: "Not Found" }), {
+        status: 404,
+      });
+    });
+    const client = makeGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+    });
+
+    expect(
+      await client.getRepositoryFileContents({
+        installationId: "42",
+        owner: "acme",
+        repo: "psalms-video",
+        path: "supagloo.project.json",
+        ref: "v0.0.9",
+      }),
+    ).toBeNull();
+  });
+
+  it("throws on an unexpected upstream error (5xx)", async () => {
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) {
+        return new Response(
+          JSON.stringify({ token: "ghs_x", expires_at: "2026-07-19T13:00:00.000Z" }),
+          { status: 201 },
+        );
+      }
+      return new Response("boom", { status: 500 });
+    });
+    const client = makeGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+    });
+
+    await expect(
+      client.getRepositoryFileContents({
+        installationId: "42",
+        owner: "acme",
+        repo: "psalms-video",
+        path: "supagloo.project.json",
+        ref: "v0.0.1",
+      }),
+    ).rejects.toThrow();
+  });
+});

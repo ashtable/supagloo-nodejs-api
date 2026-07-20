@@ -14,6 +14,7 @@ import { ConnectionsService } from "./connections/connections-service";
 import { makeS3Client } from "./files/s3-client";
 import { FilesService } from "./files/files-service";
 import { ProjectsService } from "./projects/projects-service";
+import { ManifestService } from "./manifests/manifest-service";
 import { makeDbosEnqueuer } from "./jobs/enqueuer";
 import { ProjectJobsService } from "./jobs/project-jobs-service";
 
@@ -81,6 +82,15 @@ async function main(): Promise<void> {
 
   const projectsService = new ProjectsService({ prisma });
 
+  // Manifest read (design-delta §5.3): resolve the project (owner-scoped), mint a
+  // fresh installation token, and read `supagloo.project.json` via the GitHub Contents
+  // API. Reuses the already-wired github App client + projects resolver.
+  const manifestService = new ManifestService({
+    getProject: (userId, id) => projectsService.getProject(userId, id),
+    prisma,
+    getFileContents: githubAppClient.getRepositoryFileContents,
+  });
+
   // Enqueue-only DBOS client against the system DB (`supagloo_dbos`); the API never
   // runs the DBOS runtime. Closed on shutdown alongside Prisma.
   const jobEnqueuer = makeDbosEnqueuer({
@@ -108,6 +118,7 @@ async function main(): Promise<void> {
     },
     files: { service: filesService },
     projects: { service: projectsService },
+    manifests: { service: manifestService },
     projectJobs: { service: projectJobsService },
   });
 
