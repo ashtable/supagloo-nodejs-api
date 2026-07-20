@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   GIT_OPS_QUEUE_NAME,
+  IMPORT_PROJECT_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
   type PrismaClient,
 } from "@supagloo/database-lib";
@@ -85,6 +86,13 @@ const CREATE_REQ = {
   repoName: "psalm-121",
   visibility: "private" as const,
   createdFrom: "blank" as const,
+};
+
+const IMPORT_REQ = {
+  name: "Imported Psalm",
+  repoOwner: "ashtable",
+  repoName: "psalm-121",
+  visibility: "private" as const,
 };
 
 function makeService(
@@ -221,6 +229,119 @@ describe("ProjectJobsService.createProjectWithScaffold — rejections", () => {
         createdFrom: "import",
       }),
     ).rejects.toBeInstanceOf(UnsupportedCreatedFromError);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+});
+
+describe("ProjectJobsService.createProjectFromImport — happy path (Task #19)", () => {
+  it("creates Project(createdFrom=import) + import_verify ProjectJob and enqueues importProject", async () => {
+    const { prisma, calls } = makeFake({ connection: { installationId: "42" } });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const svc = makeService(prisma, enqueued);
+
+    const res = await svc.createProjectFromImport("u1", IMPORT_REQ);
+
+    expect(res).toEqual({ projectId: "cprj-new", jobId: "job-fixed" });
+
+    // Project created for import (branch left as the repo default until the workflow
+    // resolves the imported version branch).
+    const proj = find(calls, "project.create").args.data;
+    expect(proj.slug).toBe("psalm-121");
+    expect(proj.ownerId).toBe("u1");
+    expect(proj.name).toBe("Imported Psalm");
+    expect(proj.repoOwner).toBe("ashtable");
+    expect(proj.repoName).toBe("psalm-121");
+    expect(proj.repoVisibility).toBe("private");
+    expect(proj.createdFrom).toBe("import");
+    expect(proj.currentBranch).toBe("main");
+
+    // Job created queued, kind import_verify, with the 6 import stages seeded pending.
+    const job = find(calls, "projectJob.create").args.data;
+    expect(job.id).toBe("job-fixed");
+    expect(job.projectId).toBe("cprj-new");
+    expect(job.userId).toBe("u1");
+    expect(job.kind).toBe("import_verify");
+    expect(job.status).toBe("queued");
+    expect(Array.isArray(job.stages)).toBe(true);
+    expect(job.stages).toHaveLength(6);
+    expect(job.stages.every((s: any) => s.state === "pending")).toBe(true);
+
+    // Enqueued AFTER the writes, on the import workflow, with the exact payload — and
+    // NO manifest / createdFrom (import discovers those from the cloned repo).
+    expect(enqueued.calls).toHaveLength(1);
+    expect(enqueued.calls[0].opts).toEqual({
+      workflowName: IMPORT_PROJECT_WORKFLOW_NAME,
+      queueName: GIT_OPS_QUEUE_NAME,
+      workflowID: "job-fixed",
+    });
+    const payload = enqueued.calls[0].payload;
+    expect(payload.projectId).toBe("cprj-new");
+    expect(payload.userId).toBe("u1");
+    expect(payload.ownerId).toBe("u1");
+    expect(payload.installationId).toBe("42");
+    expect(payload.repoOwner).toBe("ashtable");
+    expect(payload.repoName).toBe("psalm-121");
+    expect(payload.repoVisibility).toBe("private");
+    expect(payload.slug).toBe("psalm-121");
+    expect(payload.name).toBe("Imported Psalm");
+    expect("manifest" in payload).toBe(false);
+    expect("createdFrom" in payload).toBe(false);
+  });
+
+  it("defaults the project name to the repo name when omitted, and suffixes a taken slug", async () => {
+    const { prisma, calls } = makeFake({
+      connection: { installationId: "42" },
+      ownerSlugs: ["psalm-121"],
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const svc = makeService(prisma, enqueued);
+
+    const { name, ...noName } = IMPORT_REQ;
+    void name;
+    await svc.createProjectFromImport("u1", noName);
+
+    const proj = find(calls, "project.create").args.data;
+    expect(proj.name).toBe("psalm-121");
+    expect(proj.slug).toBe("psalm-121-2");
+  });
+});
+
+describe("ProjectJobsService.createProjectFromImport — rejections (Task #19)", () => {
+  it("rejects when the user has no GitHub connection (409, distinct from git-ops)", async () => {
+    const { prisma, calls } = makeFake({ connection: null });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createProjectFromImport("u1", IMPORT_REQ),
+    ).rejects.toBeInstanceOf(GithubNotConnectedError);
+    expect(has(calls, "project.create")).toBe(false);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+
+  it("rejects an in-flight git-ops job for the same repo with 409 git_ops_in_flight", async () => {
+    const { prisma, calls } = makeFake({
+      connection: { installationId: "42" },
+      existingProject: { id: "cprj-existing" },
+      inFlightJobs: [{ id: "job-old", status: "running" }],
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createProjectFromImport("u1", IMPORT_REQ),
+    ).rejects.toBeInstanceOf(GitOpsInFlightError);
+    expect(has(calls, "project.create")).toBe(false);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+
+  it("rejects a duplicate import for an already-imported repo with 409 project_exists", async () => {
+    const { prisma, calls } = makeFake({
+      connection: { installationId: "42" },
+      existingProject: { id: "cprj-existing" },
+      inFlightJobs: [],
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createProjectFromImport("u1", IMPORT_REQ),
+    ).rejects.toBeInstanceOf(ProjectAlreadyExistsError);
+    expect(has(calls, "project.create")).toBe(false);
     expect(enqueued.calls).toHaveLength(0);
   });
 });

@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
 import {
+  IMPORT_STAGES,
   Prisma,
   SCAFFOLD_STAGES,
   buildBlankManifest,
   buildInitialStages,
   type CreateProjectRequest,
+  type ImportProjectPayload,
+  type ImportProjectRequest,
   type PrismaClient,
   type ProjectJob,
   type ScaffoldProjectPayload,
@@ -172,6 +175,100 @@ export class ProjectJobsService {
     // Enqueue AFTER the transaction commits. If this throws, the ProjectJob is left
     // `queued` with no running workflow; a re-enqueue with the same workflowID (=
     // jobId) is idempotent (DBOS attaches to the id) — an acceptable, documented gap.
+    await this.enqueue({ workflowName, queueName, workflowID: jobId }, payload);
+
+    return { projectId, jobId };
+  }
+
+  /**
+   * Create a Project + `import_verify` ProjectJob for an EXISTING repo and enqueue the
+   * `importProject` workflow (design-delta §7 workflow 2 / §8). A sibling of
+   * {@link createProjectWithScaffold}: it reuses the SAME connection check, one-repo-one-
+   * project dedup + reusable 409 guard, per-owner slug, transaction, and enqueue-after-
+   * commit shape — but there is NO `createdFrom` rejection (import IS the import path),
+   * NO manifest build (the workflow reads the manifest from the cloned repo), and the
+   * job kind is `import_verify` with the `IMPORT_STAGES` catalogue. `createdFrom` is
+   * fixed to `import`; the working branch is discovered by the workflow, so the Project
+   * is created on the repo default branch (`main`) until it finalizes.
+   */
+  async createProjectFromImport(
+    userId: string,
+    req: ImportProjectRequest,
+  ): Promise<{ projectId: string; jobId: string }> {
+    // The import workflow mints an installation token from the user's connection.
+    const connection = await this.prisma.githubConnection.findUnique({
+      where: { userId },
+    });
+    if (!connection) throw new GithubNotConnectedError();
+
+    // One repo ↔ one project — same dedup as scaffold (in-flight → 409 git_ops_in_flight;
+    // terminal-only → 409 project_exists), so a duplicate import never double-enqueues.
+    const existing = await this.prisma.project.findFirst({
+      where: {
+        ownerId: userId,
+        repoOwner: req.repoOwner,
+        repoName: req.repoName,
+        deletedAt: null,
+      },
+    });
+    if (existing) {
+      await this.assertNoInFlightGitOps(existing.id);
+      throw new ProjectAlreadyExistsError();
+    }
+
+    const owned = await this.prisma.project.findMany({
+      where: { ownerId: userId },
+      select: { slug: true },
+    });
+    const slug = nextFreeSlug(
+      new Set(owned.map((p) => p.slug)),
+      slugify(req.repoName),
+    );
+
+    const name = req.name ?? req.repoName;
+    const jobId = this.generateJobId();
+    const stages = buildInitialStages(IMPORT_STAGES);
+
+    const { projectId } = await this.prisma.$transaction(async (tx) => {
+      const project = await tx.project.create({
+        data: {
+          slug,
+          ownerId: userId,
+          name,
+          repoOwner: req.repoOwner,
+          repoName: req.repoName,
+          repoVisibility: req.visibility,
+          createdFrom: "import",
+          currentBranch: "main", // the workflow advances it to the resolved version branch
+        },
+      });
+      await tx.projectJob.create({
+        data: {
+          id: jobId,
+          projectId: project.id,
+          userId,
+          kind: "import_verify",
+          status: "queued",
+          stages: stages as unknown as Prisma.InputJsonValue,
+        },
+      });
+      return { projectId: project.id };
+    });
+
+    const { workflowName, queueName } = resolveGitOpsWorkflow("import_verify");
+    const payload: ImportProjectPayload = {
+      projectId,
+      userId,
+      ownerId: userId,
+      installationId: connection.installationId,
+      repoOwner: req.repoOwner,
+      repoName: req.repoName,
+      repoVisibility: req.visibility,
+      slug,
+      name,
+    };
+    // Enqueue AFTER commit (same idempotent-re-enqueue story as scaffold: workflowID =
+    // jobId, so a re-enqueue attaches to the existing workflow, never double-runs).
     await this.enqueue({ workflowName, queueName, workflowID: jobId }, payload);
 
     return { projectId, jobId };
