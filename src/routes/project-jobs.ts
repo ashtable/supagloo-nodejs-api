@@ -3,6 +3,8 @@ import type { ZodTypeProvider } from "fastify-type-provider-zod";
 import {
   CreateProjectRequestSchema,
   CreateProjectResponseSchema,
+  ImportProjectRequestSchema,
+  ImportProjectResponseSchema,
   ProjectJobParamsSchema,
   ProjectJobResponseSchema,
 } from "@supagloo/database-lib";
@@ -28,9 +30,11 @@ export interface ProjectJobRoutesDeps {
  * owner-scoped by the service.
  *
  * `POST /projects` creates the Project + scaffold ProjectJob and enqueues the
- * scaffoldProject workflow. Its THREE distinct 409s carry distinct `error` codes
- * (`github_not_connected` / `git_ops_in_flight` / `project_exists`) so consumers can
- * tell them apart. `GET /projects/:id/jobs/:jobId` returns the job's status + stage log
+ * scaffoldProject workflow; `POST /projects/import` (Task #19) is its import sibling —
+ * create Project(createdFrom=import) + import_verify ProjectJob and enqueue
+ * importProject. Both share the THREE distinct 409 codes (`github_not_connected` /
+ * `git_ops_in_flight` / `project_exists`) so consumers can tell them apart.
+ * `GET /projects/:id/jobs/:jobId` (kind-agnostic) returns any job's status + stage log
  * (a foreign/deleted project or unknown job → a uniform 404).
  *
  * Registered alongside the task-14 read/mutate `projects` routes (different methods /
@@ -85,6 +89,49 @@ export function registerProjectJobRoutes(
           return reply
             .code(400)
             .send({ error: "unsupported_created_from", message: err.message });
+        }
+        throw err;
+      }
+    },
+  );
+
+  // ------------------------------------------------- create + enqueue import
+  r.post(
+    "/projects/import",
+    {
+      preHandler: app.requireAuth,
+      schema: {
+        body: ImportProjectRequestSchema,
+        response: {
+          201: ImportProjectResponseSchema,
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          409: errorResponseSchema,
+        },
+      },
+    },
+    async (req, reply) => {
+      try {
+        const result = await service.createProjectFromImport(
+          req.authUser!.id,
+          req.body,
+        );
+        return reply.code(201).send(result);
+      } catch (err) {
+        if (err instanceof GithubNotConnectedError) {
+          return reply
+            .code(409)
+            .send({ error: "github_not_connected", message: err.message });
+        }
+        if (err instanceof GitOpsInFlightError) {
+          return reply
+            .code(409)
+            .send({ error: "git_ops_in_flight", message: err.message });
+        }
+        if (err instanceof ProjectAlreadyExistsError) {
+          return reply
+            .code(409)
+            .send({ error: "project_exists", message: err.message });
         }
         throw err;
       }
