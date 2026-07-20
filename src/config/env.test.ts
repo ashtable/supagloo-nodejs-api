@@ -31,6 +31,9 @@ function validEnv(
 ): Record<string, string | undefined> {
   return {
     DATABASE_URL: VALID_DB_URL,
+    // Task #18: the DBOS system DB URL is now a required app-level var (the API
+    // enqueues scaffold/git-ops jobs against it). A valid env carries one.
+    DBOS_DATABASE_URL: "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos",
     GITHUB_APP_ID,
     GITHUB_APP_PRIVATE_KEY,
     GITHUB_APP_SLUG,

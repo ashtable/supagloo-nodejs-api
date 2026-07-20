@@ -14,6 +14,8 @@ import { ConnectionsService } from "./connections/connections-service";
 import { makeS3Client } from "./files/s3-client";
 import { FilesService } from "./files/files-service";
 import { ProjectsService } from "./projects/projects-service";
+import { makeDbosEnqueuer } from "./jobs/enqueuer";
+import { ProjectJobsService } from "./jobs/project-jobs-service";
 
 /**
  * Process entry point: validate the environment (fail-fast), build the app with
@@ -79,6 +81,16 @@ async function main(): Promise<void> {
 
   const projectsService = new ProjectsService({ prisma });
 
+  // Enqueue-only DBOS client against the system DB (`supagloo_dbos`); the API never
+  // runs the DBOS runtime. Closed on shutdown alongside Prisma.
+  const jobEnqueuer = makeDbosEnqueuer({
+    systemDatabaseUrl: env.DBOS_DATABASE_URL,
+  });
+  const projectJobsService = new ProjectJobsService({
+    prisma,
+    enqueue: jobEnqueuer.enqueue,
+  });
+
   const app = buildApp({
     logger: true,
     auth: {
@@ -96,9 +108,11 @@ async function main(): Promise<void> {
     },
     files: { service: filesService },
     projects: { service: projectsService },
+    projectJobs: { service: projectJobsService },
   });
 
   app.addHook("onClose", async () => {
+    await jobEnqueuer.close().catch(() => {});
     await prisma.$disconnect();
   });
 
