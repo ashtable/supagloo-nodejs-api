@@ -19,6 +19,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.717.0",
     "@aws-sdk/s3-request-presigner": "^3.717.0",
+    "@dbos-inc/dbos-sdk": "^4.23.6",
     "@prisma/client": "7.8.0",
     "@supagloo/database-lib": "file:./supagloo-database-lib",
     "fastify": "^5.10.0",

@@ -41,6 +41,17 @@ export const envSchema = z.object({
       message:
         "DATABASE_URL must be a postgres:// or postgresql:// connection string",
     }),
+  // Task #18 (design-delta §5.1): the DBOS SYSTEM database (`supagloo_dbos`). The API
+  // enqueues scaffold/git-ops jobs with `DBOSClient` against this DB (it never runs the
+  // DBOS runtime). A DIFFERENT database from DATABASE_URL (the app db). Required —
+  // fail-fast at boot, since the create-project endpoint cannot enqueue without it.
+  DBOS_DATABASE_URL: z
+    .string()
+    .min(1)
+    .refine((value) => POSTGRES_URL.test(value), {
+      message:
+        "DBOS_DATABASE_URL must be a postgres:// or postgresql:// connection string",
+    }),
   PORT: z.coerce.number().int().positive().default(4000),
   HOST: z.string().min(1).default("0.0.0.0"),
   NODE_ENV: z
