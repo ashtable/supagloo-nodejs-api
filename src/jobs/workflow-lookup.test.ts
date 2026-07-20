@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  COMMIT_VERSION_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
@@ -28,8 +29,14 @@ describe("resolveGitOpsWorkflow", () => {
     });
   });
 
+  it("maps commit to the shared commit workflow on the git-ops queue (Task #21)", () => {
+    expect(resolveGitOpsWorkflow("commit")).toEqual({
+      workflowName: COMMIT_VERSION_WORKFLOW_NAME,
+      queueName: GIT_OPS_QUEUE_NAME,
+    });
+  });
+
   it("throws for a kind whose workflow does not exist yet", () => {
-    expect(() => resolveGitOpsWorkflow("commit")).toThrow(UnsupportedJobKindError);
     expect(() => resolveGitOpsWorkflow("publish")).toThrow(UnsupportedJobKindError);
   });
 });

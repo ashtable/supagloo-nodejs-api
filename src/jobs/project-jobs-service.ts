@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
 import {
+  COMMIT_STAGES,
   IMPORT_STAGES,
   Prisma,
+  ProjectManifestSchema,
   SCAFFOLD_STAGES,
   buildBlankManifest,
   buildInitialStages,
+  type CommitVersionPayload,
+  type CommitVersionRequest,
   type CreateProjectRequest,
   type ImportProjectPayload,
   type ImportProjectRequest,
@@ -15,7 +19,9 @@ import {
 import { GithubNotConnectedError } from "../connections/errors";
 import { ProjectNotFoundError } from "../projects/errors";
 import {
+  CommitManifestInvalidError,
   GitOpsInFlightError,
+  NoWorkingVersionError,
   ProjectAlreadyExistsError,
   ProjectJobNotFoundError,
   UnsupportedCreatedFromError,
@@ -272,6 +278,86 @@ export class ProjectJobsService {
     await this.enqueue({ workflowName, queueName, workflowID: jobId }, payload);
 
     return { projectId, jobId };
+  }
+
+  /**
+   * Create a `commit` ProjectJob for an EXISTING project's working branch and enqueue the
+   * `commitVersion` workflow (design-delta §7 workflow 3 / §8). Unlike scaffold/import
+   * (which CREATE a project), commit resolves the existing owner-scoped project + its
+   * working `ProjectVersion`, validates the edited manifest at the boundary, and enqueues
+   * everything the workflow needs (branch + working semver + manifest + message) so it
+   * updates that working version in place. No transaction — only ONE row (the job) is
+   * created.
+   *
+   * @throws {ProjectNotFoundError} (404) project missing / foreign / soft-deleted.
+   * @throws {CommitManifestInvalidError} (422) the manifest is not a valid
+   *   `ProjectManifestSchema` value (e.g. a non-KJV/BSB translation).
+   * @throws {GithubNotConnectedError} (409) the owner has no GitHub connection.
+   * @throws {NoWorkingVersionError} (409) the project has no working version to commit to.
+   * @throws {GitOpsInFlightError} (409) another git-ops job is already in flight.
+   */
+  async createCommitJob(
+    userId: string,
+    projectId: string,
+    req: CommitVersionRequest,
+  ): Promise<{ jobId: string }> {
+    // Owner + soft-delete scoping (404). Also proves the caller is the owner, so the
+    // connection lookup below can key off the caller's userId.
+    const project = await this.prisma.project.findFirst({
+      where: { id: projectId, ownerId: userId, deletedAt: null },
+    });
+    if (!project) throw new ProjectNotFoundError();
+
+    // Boundary manifest validation (defensive; the route's Zod body schema 400s the same
+    // case for HTTP callers). A non-KJV/BSB manifest fails here → 422, no writes.
+    const parsedManifest = ProjectManifestSchema.safeParse(req.manifest);
+    if (!parsedManifest.success) throw new CommitManifestInvalidError();
+
+    // The commit workflow mints an installation token from the user's connection.
+    const connection = await this.prisma.githubConnection.findUnique({
+      where: { userId },
+    });
+    if (!connection) throw new GithubNotConnectedError();
+
+    // The working version on the project's current branch — its semver keys the
+    // workflow's `updateVersionRecord` upsert (commit updates it in place).
+    const workingVersion = await this.prisma.projectVersion.findFirst({
+      where: { projectId: project.id, branchName: project.currentBranch },
+    });
+    if (!workingVersion) throw new NoWorkingVersionError();
+
+    // Serialize per project: reject if a git-ops job is already in flight (409).
+    await this.assertNoInFlightGitOps(project.id);
+
+    const jobId = this.generateJobId();
+    const stages = buildInitialStages(COMMIT_STAGES);
+    await this.prisma.projectJob.create({
+      data: {
+        id: jobId,
+        projectId: project.id,
+        userId,
+        kind: "commit",
+        status: "queued",
+        stages: stages as unknown as Prisma.InputJsonValue,
+      },
+    });
+
+    const { workflowName, queueName } = resolveGitOpsWorkflow("commit");
+    const payload: CommitVersionPayload = {
+      projectId: project.id,
+      userId,
+      installationId: connection.installationId,
+      repoOwner: project.repoOwner,
+      repoName: project.repoName,
+      branchName: project.currentBranch,
+      semver: workingVersion.semver,
+      manifest: parsedManifest.data,
+      message: req.message,
+    };
+    // Enqueue AFTER the write (same idempotent-re-enqueue story: workflowID = jobId).
+    await this.enqueue({ workflowName, queueName, workflowID: jobId }, payload);
+
+    return { jobId };
   }
 
   /**

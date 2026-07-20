@@ -66,13 +66,43 @@ export class UnsupportedCreatedFromError extends Error {
 
 /**
  * Thrown by the static enqueue lookup when a `ProjectJobKind` has no registered
- * workflow yet (import_verify/commit/publish until tasks 19/21/22 wire them). An
- * internal/never-reached condition on the task-18 scaffold-only create path → **500**.
+ * workflow yet (publish until task 22 wires it). An internal/never-reached condition on
+ * the wired create paths → **500**.
  */
 export class UnsupportedJobKindError extends Error {
   readonly statusCode = 500;
   constructor(message = "no workflow is registered for this job kind") {
     super(message);
     this.name = "UnsupportedJobKindError";
+  }
+}
+
+/**
+ * Thrown by `POST /v1/projects/:id/commit` when the request body's `manifest` is present
+ * but does not satisfy `ProjectManifestSchema` (e.g. a non-KJV/BSB translation). The
+ * API-boundary defensive gate (the route's Zod body schema 400s the same case for HTTP
+ * callers; this typed error is the service's own guard for non-HTTP callers). Maps to
+ * **422** — the manifest is unprocessable — mirroring the manifest-read
+ * {@link import("../manifests/errors").ManifestInvalidError}.
+ */
+export class CommitManifestInvalidError extends Error {
+  readonly statusCode = 422;
+  constructor(message = "manifest is not a valid supagloo.project.json") {
+    super(message);
+    this.name = "CommitManifestInvalidError";
+  }
+}
+
+/**
+ * Thrown by `POST /v1/projects/:id/commit` when the project has no working
+ * `ProjectVersion` on its current branch — it is not in a committable state (a scaffolded
+ * or imported project always has one, so this is a precondition/consistency guard). Maps
+ * to **409** (`no_working_version`).
+ */
+export class NoWorkingVersionError extends Error {
+  readonly statusCode = 409;
+  constructor(message = "project has no working version to commit to") {
+    super(message);
+    this.name = "NoWorkingVersionError";
   }
 }

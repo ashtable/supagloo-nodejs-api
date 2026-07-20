@@ -1,16 +1,21 @@
 import type { FastifyInstance } from "fastify";
 import type { ZodTypeProvider } from "fastify-type-provider-zod";
 import {
+  CommitVersionRequestSchema,
+  CommitVersionResponseSchema,
   CreateProjectRequestSchema,
   CreateProjectResponseSchema,
   ImportProjectRequestSchema,
   ImportProjectResponseSchema,
+  ProjectIdParamSchema,
   ProjectJobParamsSchema,
   ProjectJobResponseSchema,
 } from "@supagloo/database-lib";
 import type { ProjectJobsService } from "../jobs/project-jobs-service";
 import {
+  CommitManifestInvalidError,
   GitOpsInFlightError,
+  NoWorkingVersionError,
   ProjectAlreadyExistsError,
   ProjectJobNotFoundError,
   UnsupportedCreatedFromError,
@@ -132,6 +137,61 @@ export function registerProjectJobRoutes(
           return reply
             .code(409)
             .send({ error: "project_exists", message: err.message });
+        }
+        throw err;
+      }
+    },
+  );
+
+  // ------------------------------------------------- commit an edited manifest
+  r.post(
+    "/projects/:id/commit",
+    {
+      preHandler: app.requireAuth,
+      schema: {
+        params: ProjectIdParamSchema,
+        body: CommitVersionRequestSchema,
+        response: {
+          201: CommitVersionResponseSchema,
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          422: errorResponseSchema,
+        },
+      },
+    },
+    async (req, reply) => {
+      try {
+        const result = await service.createCommitJob(
+          req.authUser!.id,
+          req.params.id,
+          req.body,
+        );
+        return reply.code(201).send(result);
+      } catch (err) {
+        if (err instanceof ProjectNotFoundError) {
+          return reply.code(404).send({ error: "not_found", message: err.message });
+        }
+        if (err instanceof GithubNotConnectedError) {
+          return reply
+            .code(409)
+            .send({ error: "github_not_connected", message: err.message });
+        }
+        if (err instanceof GitOpsInFlightError) {
+          return reply
+            .code(409)
+            .send({ error: "git_ops_in_flight", message: err.message });
+        }
+        if (err instanceof NoWorkingVersionError) {
+          return reply
+            .code(409)
+            .send({ error: "no_working_version", message: err.message });
+        }
+        if (err instanceof CommitManifestInvalidError) {
+          return reply
+            .code(422)
+            .send({ error: "manifest_invalid", message: err.message });
         }
         throw err;
       }
