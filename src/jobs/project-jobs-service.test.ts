@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  COMMIT_VERSION_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
@@ -7,7 +8,9 @@ import {
 } from "@supagloo/database-lib";
 import { ProjectJobsService, type EnqueueOptions } from "./project-jobs-service";
 import {
+  CommitManifestInvalidError,
   GitOpsInFlightError,
+  NoWorkingVersionError,
   ProjectAlreadyExistsError,
   ProjectJobNotFoundError,
   UnsupportedCreatedFromError,
@@ -31,8 +34,9 @@ interface FakeConfig {
   existingProject?: { id: string } | null;
   ownerSlugs?: string[];
   inFlightJobs?: unknown[];
-  project?: unknown; // getJob: project.findFirst result
+  project?: unknown; // getJob / commit: project.findFirst result
   job?: unknown; // getJob: projectJob.findFirst result
+  workingVersion?: { semver: string } | null; // commit: projectVersion.findFirst result
   createdProjectId?: string;
 }
 
@@ -68,9 +72,17 @@ function makeFake(config: FakeConfig) {
         (config.ownerSlugs ?? []).map((slug) => ({ slug })),
       ),
     },
+    projectVersion: {
+      findFirst: rec("projectVersion.findFirst", config.workingVersion ?? null),
+    },
     projectJob: {
       findMany: rec("projectJob.findMany", config.inFlightJobs ?? []),
       findFirst: rec("projectJob.findFirst", config.job ?? null),
+      // Commit creates the ProjectJob directly (no transaction — only one row).
+      create: (args: any) => {
+        calls.push({ op: "projectJob.create", args });
+        return Promise.resolve({ ...args.data });
+      },
     },
     $transaction: (fn: any) => Promise.resolve(fn(tx)),
   };
@@ -93,6 +105,38 @@ const IMPORT_REQ = {
   repoOwner: "ashtable",
   repoName: "psalm-121",
   visibility: "private" as const,
+};
+
+const COMMIT_MANIFEST = {
+  manifestVersion: 1 as const,
+  composition: { width: 1080, height: 1920, fps: 30, aspectRatio: "9:16" },
+  scenes: [
+    {
+      id: "s1",
+      name: "Shelter",
+      scriptText: "He who dwells in the shelter of the Most High.",
+      reference: "Psalm 91:1",
+      translation: "BSB" as const,
+      visualPrompt: "A traveler resting under a vast starlit desert sky",
+      durationSeconds: 5,
+      captions: true,
+    },
+  ],
+  narratorVoice: { description: "Warm, reverent male narrator" },
+};
+
+const COMMIT_REQ = {
+  manifest: COMMIT_MANIFEST,
+  message: "Tighten the shelter scene pacing",
+};
+
+// The project the commit endpoint resolves for `:id` (owner-scoped, on its working branch).
+const COMMIT_PROJECT = {
+  id: "cprj1",
+  ownerId: "u1",
+  repoOwner: "ashtable",
+  repoName: "psalm-121",
+  currentBranch: "v0.0.1",
 };
 
 function makeService(
@@ -342,6 +386,132 @@ describe("ProjectJobsService.createProjectFromImport — rejections (Task #19)",
       makeService(prisma, enqueued).createProjectFromImport("u1", IMPORT_REQ),
     ).rejects.toBeInstanceOf(ProjectAlreadyExistsError);
     expect(has(calls, "project.create")).toBe(false);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+});
+
+describe("ProjectJobsService.createCommitJob — happy path (Task #21)", () => {
+  it("creates a commit ProjectJob and enqueues commitVersion with the exact payload", async () => {
+    const { prisma, calls } = makeFake({
+      project: COMMIT_PROJECT,
+      connection: { installationId: "42" },
+      workingVersion: { semver: "0.0.1" },
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const svc = makeService(prisma, enqueued);
+
+    const res = await svc.createCommitJob("u1", "cprj1", COMMIT_REQ);
+
+    expect(res).toEqual({ jobId: "job-fixed" });
+
+    // The project is resolved owner-scoped + soft-delete aware.
+    expect(find(calls, "project.findFirst").args.where).toEqual({
+      id: "cprj1",
+      ownerId: "u1",
+      deletedAt: null,
+    });
+
+    // Job created queued, kind commit, with the 5 commit stages seeded pending.
+    const job = find(calls, "projectJob.create").args.data;
+    expect(job.id).toBe("job-fixed");
+    expect(job.projectId).toBe("cprj1");
+    expect(job.userId).toBe("u1");
+    expect(job.kind).toBe("commit");
+    expect(job.status).toBe("queued");
+    expect(Array.isArray(job.stages)).toBe(true);
+    expect(job.stages).toHaveLength(5);
+    expect(job.stages.every((s: any) => s.state === "pending")).toBe(true);
+
+    // Enqueued AFTER the write, on the commit workflow, with the exact payload — carrying
+    // the edited manifest, the message, the working branch, and the working version semver.
+    expect(enqueued.calls).toHaveLength(1);
+    expect(enqueued.calls[0].opts).toEqual({
+      workflowName: COMMIT_VERSION_WORKFLOW_NAME,
+      queueName: GIT_OPS_QUEUE_NAME,
+      workflowID: "job-fixed",
+    });
+    const payload = enqueued.calls[0].payload;
+    expect(payload.projectId).toBe("cprj1");
+    expect(payload.userId).toBe("u1");
+    expect(payload.installationId).toBe("42");
+    expect(payload.repoOwner).toBe("ashtable");
+    expect(payload.repoName).toBe("psalm-121");
+    expect(payload.branchName).toBe("v0.0.1");
+    expect(payload.semver).toBe("0.0.1");
+    expect(payload.message).toBe("Tighten the shelter scene pacing");
+    expect(payload.manifest.manifestVersion).toBe(1);
+    expect(payload.manifest.scenes[0].name).toBe("Shelter");
+  });
+});
+
+describe("ProjectJobsService.createCommitJob — rejections (Task #21)", () => {
+  it("REJECTS a non-KJV/BSB manifest at the boundary (CommitManifestInvalidError, no writes)", async () => {
+    const { prisma, calls } = makeFake({
+      project: COMMIT_PROJECT,
+      connection: { installationId: "42" },
+      workingVersion: { semver: "0.0.1" },
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const nivReq = {
+      ...COMMIT_REQ,
+      manifest: {
+        ...COMMIT_MANIFEST,
+        scenes: [{ ...COMMIT_MANIFEST.scenes[0], translation: "NIV" }],
+      },
+    };
+    await expect(
+      makeService(prisma, enqueued).createCommitJob("u1", "cprj1", nivReq as any),
+    ).rejects.toBeInstanceOf(CommitManifestInvalidError);
+    expect(has(calls, "projectJob.create")).toBe(false);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+
+  it("404s (ProjectNotFoundError) an unknown / foreign / deleted project", async () => {
+    const { prisma, calls } = makeFake({ project: null });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createCommitJob("u1", "nope", COMMIT_REQ),
+    ).rejects.toBeInstanceOf(ProjectNotFoundError);
+    expect(has(calls, "projectJob.create")).toBe(false);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+
+  it("409s (GithubNotConnectedError) when the owner has no GitHub connection", async () => {
+    const { prisma, calls } = makeFake({ project: COMMIT_PROJECT, connection: null });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createCommitJob("u1", "cprj1", COMMIT_REQ),
+    ).rejects.toBeInstanceOf(GithubNotConnectedError);
+    expect(has(calls, "projectJob.create")).toBe(false);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+
+  it("409s (NoWorkingVersionError) when the project has no working version on its branch", async () => {
+    const { prisma, calls } = makeFake({
+      project: COMMIT_PROJECT,
+      connection: { installationId: "42" },
+      workingVersion: null,
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createCommitJob("u1", "cprj1", COMMIT_REQ),
+    ).rejects.toBeInstanceOf(NoWorkingVersionError);
+    expect(has(calls, "projectJob.create")).toBe(false);
+    expect(enqueued.calls).toHaveLength(0);
+  });
+
+  it("409s (GitOpsInFlightError) when a git-ops job is already in flight", async () => {
+    const { prisma, calls } = makeFake({
+      project: COMMIT_PROJECT,
+      connection: { installationId: "42" },
+      workingVersion: { semver: "0.0.1" },
+      inFlightJobs: [{ id: "job-old", status: "running" }],
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createCommitJob("u1", "cprj1", COMMIT_REQ),
+    ).rejects.toBeInstanceOf(GitOpsInFlightError);
+    expect(has(calls, "projectJob.create")).toBe(false);
     expect(enqueued.calls).toHaveLength(0);
   });
 });
