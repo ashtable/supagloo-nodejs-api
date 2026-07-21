@@ -17,6 +17,8 @@ import { ProjectsService } from "./projects/projects-service";
 import { ManifestService } from "./manifests/manifest-service";
 import { makeDbosEnqueuer } from "./jobs/enqueuer";
 import { ProjectJobsService } from "./jobs/project-jobs-service";
+import { makeGithubUserAuthClient } from "./connections/github-user-auth-client";
+import { RepoProvisioningService } from "./projects/repo-provisioning-service";
 
 /**
  * Process entry point: validate the environment (fail-fast), build the app with
@@ -101,6 +103,21 @@ async function main(): Promise<void> {
     enqueue: jobEnqueuer.enqueue,
   });
 
+  // Create-new-repo JIT hop (design-delta §2.3/§6b): the zero-storage user-token
+  // dance that creates the repo before delegating to the scaffold create path.
+  const githubUserAuthClient = makeGithubUserAuthClient({
+    oauthBaseUrl: env.GITHUB_OAUTH_BASE_URL,
+    apiBaseUrl: env.GITHUB_API_BASE_URL,
+    clientId: env.GITHUB_APP_CLIENT_ID,
+    clientSecret: env.GITHUB_APP_CLIENT_SECRET,
+  });
+  const repoProvisioningService = new RepoProvisioningService({
+    prisma,
+    userAuthClient: githubUserAuthClient,
+    createProject: (userId, req) =>
+      projectJobsService.createProjectWithScaffold(userId, req),
+  });
+
   const app = buildApp({
     logger: true,
     auth: {
@@ -120,6 +137,7 @@ async function main(): Promise<void> {
     projects: { service: projectsService },
     manifests: { service: manifestService },
     projectJobs: { service: projectJobsService },
+    repoProvisioning: { service: repoProvisioningService },
   });
 
   app.addHook("onClose", async () => {

@@ -11,6 +11,12 @@ const GITHUB_APP_PRIVATE_KEY =
   "-----BEGIN RSA PRIVATE KEY-----\nMIItest\n-----END RSA PRIVATE KEY-----";
 const GITHUB_APP_SLUG = "supagloo-test";
 
+// Task #26 create-new-repo JIT hop: the GitHub App's OAuth client credentials
+// (distinct from the App's private key) — used to exchange a user-authorization
+// `code` for a short-lived user token. Now required; a valid env carries both.
+const GITHUB_APP_CLIENT_ID = "Iv1.stubclient";
+const GITHUB_APP_CLIENT_SECRET = "stubsecret";
+
 // Task #12: the secrets encryption key is now a required app-level secret — a
 // 64-char hex string (32 bytes; `openssl rand -hex 32`). A valid env carries one.
 const SECRETS_ENCRYPTION_KEY = "a".repeat(64);
@@ -37,6 +43,8 @@ function validEnv(
     GITHUB_APP_ID,
     GITHUB_APP_PRIVATE_KEY,
     GITHUB_APP_SLUG,
+    GITHUB_APP_CLIENT_ID,
+    GITHUB_APP_CLIENT_SECRET,
     SECRETS_ENCRYPTION_KEY,
     ...S3_ENV,
     ...overrides,
@@ -142,6 +150,26 @@ describe("loadEnv", () => {
       expect(() => loadEnv(validEnv({ GITHUB_APP_SLUG: undefined }))).toThrow(
         /GITHUB_APP_SLUG/,
       );
+    });
+  });
+
+  describe("GitHub App OAuth client credentials (Task #26 create-new-repo hop)", () => {
+    it("passes the client id + secret through", () => {
+      const env = loadEnv(validEnv());
+      expect(env.GITHUB_APP_CLIENT_ID).toBe(GITHUB_APP_CLIENT_ID);
+      expect(env.GITHUB_APP_CLIENT_SECRET).toBe(GITHUB_APP_CLIENT_SECRET);
+    });
+
+    it("rejects a missing GITHUB_APP_CLIENT_ID", () => {
+      expect(() =>
+        loadEnv(validEnv({ GITHUB_APP_CLIENT_ID: undefined })),
+      ).toThrow(/GITHUB_APP_CLIENT_ID/);
+    });
+
+    it("rejects a missing GITHUB_APP_CLIENT_SECRET", () => {
+      expect(() =>
+        loadEnv(validEnv({ GITHUB_APP_CLIENT_SECRET: undefined })),
+      ).toThrow(/GITHUB_APP_CLIENT_SECRET/);
     });
   });
 
