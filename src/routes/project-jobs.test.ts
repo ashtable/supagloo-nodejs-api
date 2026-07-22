@@ -335,7 +335,7 @@ describe("POST /projects/:id/commit (Task #21)", () => {
     expect(res.json().error).toBe("manifest_invalid");
   });
 
-  it("400s a structurally-invalid manifest body (missing message / non-KJV-BSB translation) via Zod", async () => {
+  it("400s a structurally-invalid manifest body (missing message / empty translation) via Zod", async () => {
     app = await buildTestApp(makeService());
     const { message, ...noMessage } = COMMIT_BODY;
     void message;
@@ -350,11 +350,13 @@ describe("POST /projects/:id/commit (Task #21)", () => {
       ).statusCode,
     ).toBe(400);
 
-    const nivBody = {
+    // TranslationSchema was broadened at task #30 (§9-Q10) to any non-empty string, so
+    // "NIV" is now accepted; an EMPTY translation is still a Zod 400.
+    const emptyTranslationBody = {
       ...COMMIT_BODY,
       manifest: {
         ...COMMIT_BODY.manifest,
-        scenes: [{ ...COMMIT_BODY.manifest.scenes[0], translation: "NIV" }],
+        scenes: [{ ...COMMIT_BODY.manifest.scenes[0], translation: "" }],
       },
     };
     expect(
@@ -363,7 +365,7 @@ describe("POST /projects/:id/commit (Task #21)", () => {
           method: "POST",
           url: "/projects/cprj1/commit",
           headers: BEARER,
-          payload: nivBody,
+          payload: emptyTranslationBody,
         })
       ).statusCode,
     ).toBe(400);

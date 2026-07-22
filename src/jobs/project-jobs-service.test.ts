@@ -450,22 +450,26 @@ describe("ProjectJobsService.createCommitJob — happy path (Task #21)", () => {
 });
 
 describe("ProjectJobsService.createCommitJob — rejections (Task #21)", () => {
-  it("REJECTS a non-KJV/BSB manifest at the boundary (CommitManifestInvalidError, no writes)", async () => {
+  it("REJECTS a structurally-invalid manifest at the boundary (CommitManifestInvalidError, no writes)", async () => {
+    // NOTE: TranslationSchema was broadened at task #30 (§9-Q10) from the KJV/BSB enum to
+    // any non-empty string, so a translation like "NIV" is now VALID at this boundary. The
+    // boundary rejection still fires on a genuinely-invalid manifest — here an EMPTY
+    // translation (fails z.string().min(1)).
     const { prisma, calls } = makeFake({
       project: COMMIT_PROJECT,
       connection: { installationId: "42" },
       workingVersion: { semver: "0.0.1" },
     });
     const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
-    const nivReq = {
+    const invalidReq = {
       ...COMMIT_REQ,
       manifest: {
         ...COMMIT_MANIFEST,
-        scenes: [{ ...COMMIT_MANIFEST.scenes[0], translation: "NIV" }],
+        scenes: [{ ...COMMIT_MANIFEST.scenes[0], translation: "" }],
       },
     };
     await expect(
-      makeService(prisma, enqueued).createCommitJob("u1", "cprj1", nivReq as any),
+      makeService(prisma, enqueued).createCommitJob("u1", "cprj1", invalidReq as any),
     ).rejects.toBeInstanceOf(CommitManifestInvalidError);
     expect(has(calls, "projectJob.create")).toBe(false);
     expect(enqueued.calls).toHaveLength(0);
