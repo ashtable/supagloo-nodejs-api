@@ -139,7 +139,12 @@ describe("POST /ai/generations", () => {
       method: "POST",
       url: "/ai/generations",
       headers: BEARER,
-      payload: { ...CREATE_BODY, kind: "image", provider: "gloo", input: {} },
+      payload: {
+        ...CREATE_BODY,
+        kind: "image",
+        provider: "gloo",
+        input: { prompt: "x" },
+      },
     });
     expect(res.statusCode).toBe(422);
     expect(res.json().error).toBe("kind_provider_incompatible");
@@ -157,7 +162,12 @@ describe("POST /ai/generations", () => {
       method: "POST",
       url: "/ai/generations",
       headers: BEARER,
-      payload: { ...CREATE_BODY, kind: "image", provider: "openrouter", input: {} },
+      payload: {
+        ...CREATE_BODY,
+        kind: "narration",
+        provider: "openrouter",
+        input: {},
+      },
     });
     expect(res.statusCode).toBe(501);
     expect(res.json().error).toBe("generation_kind_unsupported");
