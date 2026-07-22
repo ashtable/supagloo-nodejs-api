@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   AI_GENERATION_QUEUE_NAME,
+  GENERATE_AUDIO_WORKFLOW_NAME,
   GENERATE_IMAGE_WORKFLOW_NAME,
   GENERATE_SCRIPT_WORKFLOW_NAME,
   type PrismaClient,
@@ -189,7 +190,7 @@ describe("AiGenerationsService.createGeneration", () => {
     expect(enq.enqueued).toHaveLength(0);
   });
 
-  it("501s a matrix-valid but still-unwired kind (narration+openrouter) BEFORE any row or enqueue", async () => {
+  it("501s a matrix-valid but still-unwired kind (video+openrouter) BEFORE any row or enqueue", async () => {
     const fake = makeFake({ project: { id: "proj-1", ownerId: "u1" } });
     const enq = makeEnqueueRecorder();
     const service = makeService(fake, {
@@ -198,7 +199,7 @@ describe("AiGenerationsService.createGeneration", () => {
     });
     await expect(
       service.createGeneration("u1", {
-        kind: "narration",
+        kind: "video",
         provider: "openrouter",
         model: "m",
         input: {},
@@ -207,6 +208,62 @@ describe("AiGenerationsService.createGeneration", () => {
     ).rejects.toBeInstanceOf(UnsupportedGenerationKindError);
     expect(has(fake.calls, "aiGeneration.create")).toBe(false);
     expect(enq.enqueued).toHaveLength(0);
+  });
+
+  it("wires narration (Task #33): creates the row + enqueues generateAudio on the ai-generation queue", async () => {
+    const fake = makeFake({ project: { id: "proj-1", ownerId: "u1" } });
+    const enq = makeEnqueueRecorder();
+    const service = makeService(fake, {
+      enqueue: enq.enqueue,
+      cancel: makeCancelRecorder().cancel,
+    });
+    const result = await service.createGeneration("u1", {
+      kind: "narration",
+      provider: "openrouter",
+      model: "some/speech-model",
+      input: {
+        voice: { description: "warm baritone" },
+        scenes: [{ sceneId: "s1", scriptText: "I lift up my eyes" }],
+      },
+      projectId: "proj-1",
+    });
+    expect(result).toEqual({ generationId: "gen-fixed" });
+
+    const create = find(fake.calls, "aiGeneration.create");
+    expect(create.args.data).toMatchObject({
+      id: "gen-fixed",
+      kind: "narration",
+      provider: "openrouter",
+      projectId: "proj-1",
+      status: "queued",
+    });
+    expect(enq.enqueued).toHaveLength(1);
+    expect(enq.enqueued[0].opts).toEqual({
+      workflowName: GENERATE_AUDIO_WORKFLOW_NAME,
+      queueName: AI_GENERATION_QUEUE_NAME,
+      workflowID: "gen-fixed",
+    });
+    expect(enq.enqueued[0].payload).toEqual({ generationId: "gen-fixed" });
+  });
+
+  it("wires music (Task #33): enqueues generateAudio (same workflow as narration)", async () => {
+    const fake = makeFake({ project: { id: "proj-1", ownerId: "u1" } });
+    const enq = makeEnqueueRecorder();
+    const service = makeService(fake, {
+      enqueue: enq.enqueue,
+      cancel: makeCancelRecorder().cancel,
+    });
+    await service.createGeneration("u1", {
+      kind: "music",
+      provider: "openrouter",
+      model: "some/music-model",
+      input: { style: "Swelling strings", durationSeconds: 30 },
+      projectId: "proj-1",
+    });
+    expect(enq.enqueued[0].opts).toMatchObject({
+      workflowName: GENERATE_AUDIO_WORKFLOW_NAME,
+      queueName: AI_GENERATION_QUEUE_NAME,
+    });
   });
 
   it("wires image (Task #32): creates the row + enqueues generateImage on the ai-generation queue", async () => {
