@@ -80,7 +80,7 @@ export class UnsupportedJobKindError extends Error {
 
 /**
  * Thrown by `POST /v1/projects/:id/commit` when the request body's `manifest` is present
- * but does not satisfy `ProjectManifestSchema` (e.g. a non-KJV/BSB translation). The
+ * but does not satisfy `ProjectManifestSchema` (e.g. an empty translation). The
  * API-boundary defensive gate (the route's Zod body schema 400s the same case for HTTP
  * callers; this typed error is the service's own guard for non-HTTP callers). Maps to
  * **422** — the manifest is unprocessable — mirroring the manifest-read

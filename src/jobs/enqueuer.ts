@@ -13,6 +13,10 @@ import type { EnqueueOptions, JobEnqueue } from "./project-jobs-service";
  */
 export interface JobEnqueuer {
   enqueue: JobEnqueue;
+  /** Cancel a running/queued workflow by id (`DBOSClient.cancelWorkflow`). Backs the AI
+   *  generation cancel endpoint (Task #31); structurally the AiGenerationsService's
+   *  injected cancel seam. */
+  cancel: (workflowID: string) => Promise<void>;
   close: () => Promise<void>;
 }
 
@@ -40,6 +44,10 @@ export function makeDbosEnqueuer(config: {
         },
         payload,
       );
+    },
+    cancel: async (workflowID: string) => {
+      const client = await getClient();
+      await client.cancelWorkflow(workflowID);
     },
     close: async () => {
       if (!clientPromise) return;

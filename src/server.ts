@@ -17,6 +17,7 @@ import { ProjectsService } from "./projects/projects-service";
 import { ManifestService } from "./manifests/manifest-service";
 import { makeDbosEnqueuer } from "./jobs/enqueuer";
 import { ProjectJobsService } from "./jobs/project-jobs-service";
+import { AiGenerationsService } from "./ai/ai-generations-service";
 import { makeGithubUserAuthClient } from "./connections/github-user-auth-client";
 import { RepoProvisioningService } from "./projects/repo-provisioning-service";
 
@@ -103,6 +104,15 @@ async function main(): Promise<void> {
     enqueue: jobEnqueuer.enqueue,
   });
 
+  // AI generations (design-delta §2.8/§7/§8): create + enqueue on the ai-generation
+  // queue, poll, and cancel. Reuses the same enqueue-only DBOS client (its `cancel` seam
+  // backs POST /:id/cancel → DBOSClient.cancelWorkflow).
+  const aiGenerationsService = new AiGenerationsService({
+    prisma,
+    enqueue: jobEnqueuer.enqueue,
+    cancel: jobEnqueuer.cancel,
+  });
+
   // Create-new-repo JIT hop (design-delta §2.3/§6b): the zero-storage user-token
   // dance that creates the repo before delegating to the scaffold create path.
   const githubUserAuthClient = makeGithubUserAuthClient({
@@ -137,6 +147,7 @@ async function main(): Promise<void> {
     projects: { service: projectsService },
     manifests: { service: manifestService },
     projectJobs: { service: projectJobsService },
+    aiGenerations: { service: aiGenerationsService },
     repoProvisioning: { service: repoProvisioningService },
   });
 
