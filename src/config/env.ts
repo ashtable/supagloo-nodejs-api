@@ -88,6 +88,17 @@ export const envSchema = z.object({
   GITHUB_APP_PRIVATE_KEY: z.string().min(1),
   GITHUB_APP_SLUG: z.string().min(1),
 
+  // Task #26 create-new-repo JIT hop (design-delta §2.3/§6b). The GitHub App's
+  // OAuth client credentials — DISTINCT from the App's private key above. Used to
+  // exchange a user-authorization `code` for a short-lived USER token
+  // (`POST {GITHUB_OAUTH_BASE_URL}/login/oauth/access_token`), which creates the new
+  // repo in the user's account and adds it to a `selected`-mode installation, then
+  // is discarded. App-level (one pair per app registration), so like the App
+  // id/key/slug they live in env config and bypass §2.10's per-user encryption.
+  // Required — fail-fast at boot, since create-new-repo cannot proceed without them.
+  GITHUB_APP_CLIENT_ID: z.string().min(1),
+  GITHUB_APP_CLIENT_SECRET: z.string().min(1),
+
   // Task #12 application-secrets key (design-delta §2.10). The single AES-256-GCM
   // key the API uses to encrypt/decrypt per-user provider secrets (the OpenRouter
   // API key, the Gloo client secret) via database-lib's `encryptSecret`/

@@ -16,6 +16,7 @@ import { registerFileRoutes } from "./routes/files";
 import { registerProjectRoutes } from "./routes/projects";
 import { registerManifestRoutes } from "./routes/manifests";
 import { registerProjectJobRoutes } from "./routes/project-jobs";
+import { registerRepoProvisioningRoutes } from "./routes/repo-provisioning";
 import type { AuthService } from "./auth/auth-service";
 import type { GithubConnectionService } from "./connections/github-connection-service";
 import type { OpenRouterConnectionService } from "./connections/openrouter-connection-service";
@@ -25,6 +26,7 @@ import type { FilesService } from "./files/files-service";
 import type { ProjectsService } from "./projects/projects-service";
 import type { ManifestService } from "./manifests/manifest-service";
 import type { ProjectJobsService } from "./jobs/project-jobs-service";
+import type { RepoProvisioningService } from "./projects/repo-provisioning-service";
 
 /** Dependencies needed to serve the `/v1` auth + session surface. Supplied by
  *  `server.ts` (real Prisma-backed service) and by the e2e harness. When omitted,
@@ -84,6 +86,13 @@ export interface ProjectJobsDeps {
   service: ProjectJobsService;
 }
 
+/** Dependencies for the create-new-repo JIT hop (design-delta §2.3/§6b/§8).
+ *  Registered inside the same bearer-protected `/v1` scope as `auth`, so only wired
+ *  when `auth` is supplied (the routes need `requireAuth`). */
+export interface RepoProvisioningDeps {
+  service: RepoProvisioningService;
+}
+
 export interface BuildAppOptions {
   /** Enable Fastify's request logger (on for the running server, off in tests). */
   logger?: boolean;
@@ -101,6 +110,8 @@ export interface BuildAppOptions {
   manifests?: ManifestsDeps;
   /** Wire the `/v1` project create + job-polling routes. Requires `auth` (bearer). */
   projectJobs?: ProjectJobsDeps;
+  /** Wire the `/v1` create-new-repo JIT hop routes. Requires `auth` (bearer). */
+  repoProvisioning?: RepoProvisioningDeps;
 }
 
 /**
@@ -124,6 +135,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const projects = options.projects;
   const manifests = options.manifests;
   const projectJobs = options.projectJobs;
+  const repoProvisioning = options.repoProvisioning;
   if (auth) {
     // Everything versioned lives under `/v1` (design-delta §8). The bearer plugin
     // is registered inside this scope so `requireAuth` is available to the routes.
@@ -159,6 +171,11 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         }
         if (projectJobs) {
           registerProjectJobRoutes(v1, { service: projectJobs.service });
+        }
+        if (repoProvisioning) {
+          registerRepoProvisioningRoutes(v1, {
+            service: repoProvisioning.service,
+          });
         }
       },
       { prefix: "/v1" },
