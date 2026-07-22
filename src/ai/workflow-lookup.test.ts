@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   AI_GENERATION_QUEUE_NAME,
+  GENERATE_AUDIO_WORKFLOW_NAME,
   GENERATE_IMAGE_WORKFLOW_NAME,
   GENERATE_SCRIPT_WORKFLOW_NAME,
 } from "@supagloo/database-lib";
@@ -37,8 +38,17 @@ describe("resolveAiGenerationWorkflow", () => {
     });
   });
 
-  it("throws UnsupportedGenerationKindError (501) for the still-unbuilt media kinds", () => {
-    for (const kind of ["narration", "music", "video"] as const) {
+  it("maps BOTH audio kinds to generateAudio on the ai-generation queue (Task #33 — now wired)", () => {
+    for (const kind of ["narration", "music"] as const) {
+      expect(resolveAiGenerationWorkflow(kind)).toEqual({
+        workflowName: GENERATE_AUDIO_WORKFLOW_NAME,
+        queueName: AI_GENERATION_QUEUE_NAME,
+      });
+    }
+  });
+
+  it("throws UnsupportedGenerationKindError (501) for the still-unbuilt video kind", () => {
+    for (const kind of ["video"] as const) {
       expect(() => resolveAiGenerationWorkflow(kind)).toThrow(
         UnsupportedGenerationKindError,
       );
@@ -47,7 +57,7 @@ describe("resolveAiGenerationWorkflow", () => {
 
   it("the thrown error carries a 501 statusCode", () => {
     try {
-      resolveAiGenerationWorkflow("narration");
+      resolveAiGenerationWorkflow("video");
       throw new Error("expected throw");
     } catch (err) {
       expect((err as UnsupportedGenerationKindError).statusCode).toBe(501);

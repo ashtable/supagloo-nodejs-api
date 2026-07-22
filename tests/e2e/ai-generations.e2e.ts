@@ -5,6 +5,7 @@ import {
   createPrismaClient,
   type PrismaClient,
   buildAssetKey,
+  GENERATE_AUDIO_WORKFLOW_NAME,
   GENERATE_IMAGE_WORKFLOW_NAME,
   GENERATE_SCRIPT_WORKFLOW_NAME,
   AI_GENERATION_QUEUE_NAME,
@@ -125,6 +126,35 @@ async function standInGenerateImageFn(_payload: unknown): Promise<{ ok: true }> 
 }
 DBOS.registerWorkflow(standInGenerateImageFn, {
   name: GENERATE_IMAGE_WORKFLOW_NAME,
+});
+
+// Task #33: a STAND-IN generateAudio — drives the SAME AiGeneration row transitions the real
+// audio workflow drives (running → succeeded + resultAssetKey), keyed by workflowID =
+// generationId, for BOTH audio kinds. The REAL workflow's speech/S3 behaviour is proven by the
+// dbos repo's generate-audio.e2e.ts; here we only prove the API wires narration+music (POST no
+// longer 501s) and surfaces resultAssetKey on the DTO.
+async function standInGenerateAudioFn(_payload: unknown): Promise<{ ok: true }> {
+  const genId = DBOS.workflowID!;
+  await DBOS.runStep(
+    async () => {
+      const row = await prisma.aiGeneration.findUnique({ where: { id: genId } });
+      const assetKey = row?.projectId ? buildAssetKey(row.projectId, genId) : null;
+      await prisma.aiGeneration.updateMany({
+        where: { id: genId },
+        data: {
+          status: "succeeded",
+          completedAt: new Date(),
+          resultAssetKey: assetKey,
+          resultJson: { kind: row?.kind, providerGenerationId: "gen_stub_1" } as any,
+        },
+      });
+    },
+    { name: "standInAudioFinalize" },
+  );
+  return { ok: true };
+}
+DBOS.registerWorkflow(standInGenerateAudioFn, {
+  name: GENERATE_AUDIO_WORKFLOW_NAME,
 });
 
 let app: FastifyInstance;
@@ -268,6 +298,32 @@ function storyboardBody(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function narrationBody(overrides: Record<string, unknown> = {}) {
+  return {
+    kind: "narration",
+    provider: "openrouter",
+    model: "stub/speech-model",
+    input: {
+      voice: { description: "warm, weathered baritone", label: "JEJ-STYLE" },
+      scenes: [
+        { sceneId: "s1", scriptText: "I lift up my eyes to the hills." },
+        { sceneId: "s2", scriptText: "From whence cometh my help?" },
+      ],
+    },
+    ...overrides,
+  };
+}
+
+function musicBody(overrides: Record<string, unknown> = {}) {
+  return {
+    kind: "music",
+    provider: "openrouter",
+    model: "stub/music-model",
+    input: { style: "Swelling cinematic strings", durationSeconds: 30 },
+    ...overrides,
+  };
+}
+
 describe("e2e: POST /v1/ai/generations + poll — full round trip", () => {
   it("creates + enqueues, polls queued→running→succeeded, surfaces resultJson", async () => {
     armGates();
@@ -323,16 +379,29 @@ describe("e2e: POST validation gates (before any row is created)", () => {
     expect(after).toBe(before);
   });
 
-  it("501s a matrix-valid but still-unwired kind (narration+openrouter) and creates no row", async () => {
+  it("501s a matrix-valid but still-unwired kind (video+openrouter) and creates no row", async () => {
     disarmGates();
     const owner = await seedUser("unwired");
     const before = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
     const res = await api("/ai/generations", owner.token, {
       method: "POST",
-      body: { kind: "narration", provider: "openrouter", model: "m", input: {} },
+      body: { kind: "video", provider: "openrouter", model: "m", input: {} },
     });
     expect(res.status).toBe(501);
     expect((await res.json()).error).toBe("generation_kind_unsupported");
+    const after = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
+    expect(after).toBe(before);
+  });
+
+  it("400s a narration POST whose input is not a real narration spec (Task #33)", async () => {
+    disarmGates();
+    const owner = await seedUser("narr-badinput");
+    const before = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
+    const res = await api("/ai/generations", owner.token, {
+      method: "POST",
+      body: { kind: "narration", provider: "openrouter", model: "m", input: {} },
+    });
+    expect(res.status).toBe(400);
     const after = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
     expect(after).toBe(before);
   });
@@ -400,6 +469,43 @@ describe("e2e: image is wired (Task #32)", () => {
     expect(done.kind).toBe("image");
     expect(done.resultAssetKey).toBe(buildAssetKey(projectId, generationId));
     expect(done.resultJson).toBeNull();
+  }, 60_000);
+});
+
+describe("e2e: audio is wired (Task #33)", () => {
+  it("creates + enqueues generateAudio for narration, reaches succeeded, surfaces resultAssetKey", async () => {
+    disarmGates();
+    const owner = await seedUser("narr-wired");
+    const projectId = await seedProject(owner.userId, "narr");
+
+    const created = await api("/ai/generations", owner.token, {
+      method: "POST",
+      body: narrationBody({ projectId }),
+    });
+    expect(created.status).toBe(201);
+    const { generationId } = await created.json();
+    expect(generationId).toBeTruthy();
+
+    const done = await pollUntilStatus(owner.token, generationId, "succeeded");
+    expect(done.kind).toBe("narration");
+    expect(done.resultAssetKey).toBe(buildAssetKey(projectId, generationId));
+  }, 60_000);
+
+  it("creates + enqueues generateAudio for music (same workflow), reaches succeeded", async () => {
+    disarmGates();
+    const owner = await seedUser("music-wired");
+    const projectId = await seedProject(owner.userId, "music");
+
+    const created = await api("/ai/generations", owner.token, {
+      method: "POST",
+      body: musicBody({ projectId }),
+    });
+    expect(created.status).toBe(201);
+    const { generationId } = await created.json();
+
+    const done = await pollUntilStatus(owner.token, generationId, "succeeded");
+    expect(done.kind).toBe("music");
+    expect(done.resultAssetKey).toBe(buildAssetKey(projectId, generationId));
   }, 60_000);
 });
 
