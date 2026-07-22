@@ -4,6 +4,8 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import {
   createPrismaClient,
   type PrismaClient,
+  buildAssetKey,
+  GENERATE_IMAGE_WORKFLOW_NAME,
   GENERATE_SCRIPT_WORKFLOW_NAME,
   AI_GENERATION_QUEUE_NAME,
 } from "@supagloo/database-lib";
@@ -95,6 +97,34 @@ async function standInGenerateScriptFn(_payload: unknown): Promise<{ ok: true }>
 }
 DBOS.registerWorkflow(standInGenerateScriptFn, {
   name: GENERATE_SCRIPT_WORKFLOW_NAME,
+});
+
+// Task #32: a STAND-IN generateImage — drives the SAME AiGeneration row transitions the
+// real image workflow drives (running → succeeded + resultAssetKey), keyed by
+// workflowID = generationId. The REAL workflow's provider/S3 behaviour is proven by the
+// dbos repo's generate-image.e2e.ts; here we only prove the API wires image (POST no
+// longer 501s) and surfaces resultAssetKey on the DTO.
+async function standInGenerateImageFn(_payload: unknown): Promise<{ ok: true }> {
+  const genId = DBOS.workflowID!;
+  await DBOS.runStep(
+    async () => {
+      const row = await prisma.aiGeneration.findUnique({ where: { id: genId } });
+      const assetKey = row?.projectId ? buildAssetKey(row.projectId, genId) : null;
+      await prisma.aiGeneration.updateMany({
+        where: { id: genId },
+        data: {
+          status: "succeeded",
+          completedAt: new Date(),
+          resultAssetKey: assetKey,
+        },
+      });
+    },
+    { name: "standInImageFinalize" },
+  );
+  return { ok: true };
+}
+DBOS.registerWorkflow(standInGenerateImageFn, {
+  name: GENERATE_IMAGE_WORKFLOW_NAME,
 });
 
 let app: FastifyInstance;
@@ -285,7 +315,7 @@ describe("e2e: POST validation gates (before any row is created)", () => {
     const before = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
     const res = await api("/ai/generations", owner.token, {
       method: "POST",
-      body: { kind: "image", provider: "gloo", model: "m", input: {} },
+      body: { kind: "image", provider: "gloo", model: "m", input: { prompt: "x" } },
     });
     expect(res.status).toBe(422);
     expect((await res.json()).error).toBe("kind_provider_incompatible");
@@ -293,16 +323,29 @@ describe("e2e: POST validation gates (before any row is created)", () => {
     expect(after).toBe(before);
   });
 
-  it("501s a matrix-valid but unwired kind (image+openrouter) and creates no row", async () => {
+  it("501s a matrix-valid but still-unwired kind (narration+openrouter) and creates no row", async () => {
     disarmGates();
     const owner = await seedUser("unwired");
     const before = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
     const res = await api("/ai/generations", owner.token, {
       method: "POST",
-      body: { kind: "image", provider: "openrouter", model: "m", input: {} },
+      body: { kind: "narration", provider: "openrouter", model: "m", input: {} },
     });
     expect(res.status).toBe(501);
     expect((await res.json()).error).toBe("generation_kind_unsupported");
+    const after = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
+    expect(after).toBe(before);
+  });
+
+  it("400s an image POST with no prompt (the real GenerateImageInputSchema, Task #32)", async () => {
+    disarmGates();
+    const owner = await seedUser("img-noprompt");
+    const before = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
+    const res = await api("/ai/generations", owner.token, {
+      method: "POST",
+      body: { kind: "image", provider: "openrouter", model: "m", input: {} },
+    });
+    expect(res.status).toBe(400);
     const after = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
     expect(after).toBe(before);
   });
@@ -331,6 +374,33 @@ describe("e2e: POST validation gates (before any row is created)", () => {
     });
     expect(res.status).toBe(400);
   });
+});
+
+describe("e2e: image is wired (Task #32)", () => {
+  it("creates + enqueues generateImage, reaches succeeded, and surfaces resultAssetKey", async () => {
+    disarmGates();
+    const owner = await seedUser("img-wired");
+    const projectId = await seedProject(owner.userId, "img");
+
+    const created = await api("/ai/generations", owner.token, {
+      method: "POST",
+      body: {
+        kind: "image",
+        provider: "openrouter",
+        model: "stub/image-model",
+        projectId,
+        input: { prompt: "a serene sunrise over hills" },
+      },
+    });
+    expect(created.status).toBe(201);
+    const { generationId } = await created.json();
+    expect(generationId).toBeTruthy();
+
+    const done = await pollUntilStatus(owner.token, generationId, "succeeded");
+    expect(done.kind).toBe("image");
+    expect(done.resultAssetKey).toBe(buildAssetKey(projectId, generationId));
+    expect(done.resultJson).toBeNull();
+  }, 60_000);
 });
 
 describe("e2e: POST /v1/ai/generations/:id/cancel", () => {
