@@ -17,14 +17,28 @@ import { makeGlooClient } from "../../src/connections/gloo-client";
 import { OpenRouterConnectionService } from "../../src/connections/openrouter-connection-service";
 import { GlooConnectionService } from "../../src/connections/gloo-connection-service";
 import { ConnectionsService } from "../../src/connections/connections-service";
+import {
+  resolveConnectionSeedCreds,
+  seedGlooConnection,
+  seedOpenRouterConnection,
+  type ConnectionSeedCreds,
+} from "../../src/testing/seed-connections";
 
-// Non-UI e2e for the OpenRouter + Gloo connection surface (Task #12). Boots the
-// REAL Fastify app in-process (real listen + real fetch) wired to REAL Postgres
-// (Compose `supagloo` DB) and the REAL containerized OpenRouter (:4802) + Gloo
-// (:4803) stubs. No mocking — the stubs are real HTTP servers; the DB is real
-// Postgres; the crypto key is a real 64-hex key generated here. Infra ensured by
-// tests/e2e/global-setup.ts (reuse-or-spawn: postgres + youversion + github +
-// openrouter + gloo stubs).
+// Real-provider e2e for the OpenRouter + Gloo connection surface (Task #12, reworked
+// for real providers in Task 34-E3 / design-delta §10.2/§10.3). Boots the REAL Fastify
+// app in-process (real listen + real fetch) wired to REAL Postgres (Compose `supagloo`
+// DB) and the app's OpenRouter/Gloo clients pointed at the LIVE hosts. There is NO
+// stub middle ground: a connection is seeded through the app's OWN real connect routes
+// with real credentials from the environment (`OPENROUTER_E2E_TEST_API_KEY`,
+// `GLOO_CLIENT_ID`, `GLOO_CLIENT_SECRET`), so every stored ciphertext is live-valid
+// (decrypts to the real key AND is usable against the live provider) — no fabricated
+// ciphertexts or dummy keys survive here (§10.3). The Gloo verify-then-store mints a
+// live client-credentials token on every run (a real-API assertion), and the credits
+// proxy returns real OpenRouter account data.
+//
+// Infra (Postgres + the still-present-but-unused-by-this-spec stubs + MinIO) is ensured
+// by tests/e2e/global-setup.ts. The stub containers linger until Task 34-E8 tears down
+// the compose overrides; this spec no longer touches them.
 
 const APP_URL =
   process.env.DATABASE_URL ??
@@ -32,20 +46,30 @@ const APP_URL =
 const YOUVERSION_BASE =
   process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
 const GITHUB_BASE = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
+// Real-provider e2e (design-delta §10.2/§10.3): the OpenRouter + Gloo clients the
+// app-under-test uses point at the LIVE hosts — the same app-boot base-URL vars the
+// service reads, defaulting to the real host, with NO stub-port fallback (§10.2: a
+// provider is exercised for real or not at all).
 const OPENROUTER_BASE =
-  process.env.OPENROUTER_STUB_URL ?? "http://localhost:4802";
-const GLOO_BASE = process.env.GLOO_STUB_URL ?? "http://localhost:4803";
+  process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai";
+const GLOO_BASE = process.env.GLOO_BASE_URL ?? "https://platform.ai.gloo.com";
 
 // A real 32-byte key as 64 hex chars — the same value the services encrypt AND the
-// test decrypts with, to prove ciphertext-at-rest round-trips.
+// test decrypts with, to prove ciphertext-at-rest round-trips (the app's per-run
+// encryption key; distinct from the provider credentials themselves).
 const ENCRYPTION_KEY = randomBytes(32).toString("hex");
 
-describe("e2e: OpenRouter + Gloo connections", () => {
+describe("e2e: OpenRouter + Gloo connections (real providers)", () => {
   let app: FastifyInstance;
   let prisma: PrismaClient;
   let baseUrl: string;
+  let creds: ConnectionSeedCreds;
 
   beforeAll(async () => {
+    // Fail FAST + LOUD if a required real credential is missing — a real-provider
+    // suite that silently skips is a green lie (§10.8). Names the missing var.
+    creds = resolveConnectionSeedCreds();
+
     prisma = createPrismaClient({ connectionString: APP_URL });
 
     const { privateKey } = generateKeyPairSync("rsa", {
@@ -143,58 +167,67 @@ describe("e2e: OpenRouter + Gloo connections", () => {
 
   // ---------------------------------------------------------------- OpenRouter
 
-  it("connects OpenRouter: stores CIPHERTEXT (not the key) + keyLast4", async () => {
+  it("seeds OpenRouter through the real route: stored ciphertext is LIVE-valid (decrypts to the real key, no plaintext at rest)", async () => {
     const { token, userId } = await seedUser();
-    const key = "sk-or-v1-e2e-supersecret-abcd";
 
-    const res = await authed("POST", "/v1/connections/openrouter", token, { key });
-    expect(res.status).toBe(200);
-    const { connection } = await res.json();
-    expect(connection.keyLast4).toBe("abcd");
+    // Seed via the app's OWN connect route with the REAL key (helper wraps
+    // POST /v1/connections/openrouter). No provider-side verify (§9-Q5).
+    const connection = await seedOpenRouterConnection({
+      baseUrl,
+      token,
+      key: creds.openrouterKey,
+    });
+    expect(connection.keyLast4).toBe(creds.openrouterKey.slice(-4));
     expect(connection.status).toBe("connected");
-    // No ciphertext on the wire.
+    // The wire body carries the masked last4 only — never the key or its ciphertext.
     expect(JSON.stringify(connection)).not.toMatch(/ciphertext/i);
+    expect(JSON.stringify(connection)).not.toContain(creds.openrouterKey);
 
-    // Read the row from Postgres: the key at rest is ciphertext ≠ plaintext.
+    // Read the row from Postgres: the key at rest is ciphertext ≠ plaintext...
     const row = (await prisma.openRouterConnection.findUnique({
       where: { userId },
     })) as Record<string, any> | null;
     expect(row).not.toBeNull();
-    expect(row!.apiKeyCiphertext).not.toBe(key);
-    expect(String(row!.apiKeyCiphertext).includes(key)).toBe(false);
-    expect(row!.keyLast4).toBe("abcd");
-    // ...but it round-trips with the encryption key.
-    expect(decryptSecret(row!.apiKeyCiphertext, ENCRYPTION_KEY)).toBe(key);
+    expect(row!.apiKeyCiphertext).not.toBe(creds.openrouterKey);
+    expect(String(row!.apiKeyCiphertext).includes(creds.openrouterKey)).toBe(false);
+    expect(row!.keyLast4).toBe(creds.openrouterKey.slice(-4));
+    // ...and it round-trips to the REAL, live-valid key (proven "usable" by the
+    // credits test, which decrypts this same ciphertext and calls live OpenRouter).
+    expect(decryptSecret(row!.apiKeyCiphertext, ENCRYPTION_KEY)).toBe(
+      creds.openrouterKey,
+    );
     // Column set carries no plaintext key.
     expect(new Set(Object.keys(row!))).toEqual(
       new Set(["userId", "apiKeyCiphertext", "keyLast4", "status", "connectedAt"]),
     );
   });
 
-  it("proxies live credits to the OpenRouter stub and reshapes with remaining", async () => {
+  it("proxies LIVE OpenRouter credits: real account balance with the reshaped `remaining`", async () => {
     const { token } = await seedUser();
-    await authed("POST", "/v1/connections/openrouter", token, {
-      key: "sk-or-v1-credits-key-0000",
-    });
+    await seedOpenRouterConnection({ baseUrl, token, key: creds.openrouterKey });
 
-    await fetch(`${OPENROUTER_BASE}/__stub/reset`, { method: "POST" });
     const res = await authed(
       "GET",
       "/v1/connections/openrouter/credits",
       token,
     );
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({
-      totalCredits: 100,
-      totalUsage: 12.5,
-      remaining: 87.5,
-    });
 
-    // The proxy actually hit the stub's credits endpoint.
-    const calls = await (
-      await fetch(`${OPENROUTER_BASE}/__stub/calls`)
-    ).json();
-    expect(calls.byRoute["GET /api/v1/credits"]).toBe(1);
+    // Structural assertion on the REAL payload (balances vary run-to-run, so we assert
+    // shape + the service's `remaining = totalCredits − totalUsage` invariant, never
+    // fixed values).
+    const body = (await res.json()) as {
+      totalCredits: number;
+      totalUsage: number;
+      remaining: number;
+    };
+    expect(typeof body.totalCredits).toBe("number");
+    expect(typeof body.totalUsage).toBe("number");
+    expect(typeof body.remaining).toBe("number");
+    expect(Number.isFinite(body.totalCredits)).toBe(true);
+    expect(Number.isFinite(body.totalUsage)).toBe(true);
+    expect(Number.isFinite(body.remaining)).toBe(true);
+    expect(body.remaining).toBeCloseTo(body.totalCredits - body.totalUsage, 6);
   });
 
   it("credits before connecting OpenRouter returns 409", async () => {
@@ -209,9 +242,7 @@ describe("e2e: OpenRouter + Gloo connections", () => {
 
   it("disconnects OpenRouter and is idempotent", async () => {
     const { token, userId } = await seedUser();
-    await authed("POST", "/v1/connections/openrouter", token, {
-      key: "sk-or-v1-del-key-1111",
-    });
+    await seedOpenRouterConnection({ baseUrl, token, key: creds.openrouterKey });
 
     const del = await authed("DELETE", "/v1/connections/openrouter", token);
     expect(del.status).toBe(200);
@@ -226,49 +257,56 @@ describe("e2e: OpenRouter + Gloo connections", () => {
 
   // ---------------------------------------------------------------------- Gloo
 
-  it("connects Gloo via verify-then-store: mints a token, stores clientId + secret ciphertext", async () => {
+  it("connects Gloo via LIVE verify-then-store: mints a real token, stores clientId + secret ciphertext", async () => {
     const { token, userId } = await seedUser();
-    await fetch(`${GLOO_BASE}/__stub/reset`, { method: "POST" });
 
-    const res = await authed("PUT", "/v1/connections/gloo", token, {
-      clientId: "gloo-e2e-client",
-      clientSecret: "gloo-e2e-secret-xyz",
+    // Seed via the app's OWN connect route with the REAL client credentials. The
+    // route's verify-then-store mints a live Gloo token BEFORE writing — a 2xx here is
+    // a real-API assertion that the mint succeeded this run.
+    const connection = await seedGlooConnection({
+      baseUrl,
+      token,
+      clientId: creds.glooClientId,
+      clientSecret: creds.glooClientSecret,
     });
-    expect(res.status).toBe(200);
-    const { connection } = await res.json();
-    expect(connection.clientId).toBe("gloo-e2e-client");
+    expect(connection.clientId).toBe(creds.glooClientId);
     expect(connection.status).toBe("connected");
+    // A real timestamp recorded at the successful live mint.
     expect(connection.lastVerifiedAt).toBeTypeOf("string");
+    expect(Number.isNaN(Date.parse(connection.lastVerifiedAt))).toBe(false);
     // No secret / ciphertext on the wire.
     expect(JSON.stringify(connection)).not.toMatch(/secret|ciphertext/i);
-
-    // The client-credentials mint actually hit the stub.
-    const calls = await (await fetch(`${GLOO_BASE}/__stub/calls`)).json();
-    expect(calls.byRoute["POST /oauth2/token"]).toBe(1);
 
     // Row at rest: the secret is ciphertext ≠ plaintext, and round-trips.
     const row = (await prisma.glooConnection.findUnique({
       where: { userId },
     })) as Record<string, any> | null;
     expect(row).not.toBeNull();
-    expect(row!.clientId).toBe("gloo-e2e-client");
-    expect(row!.clientSecretCiphertext).not.toBe("gloo-e2e-secret-xyz");
+    expect(row!.clientId).toBe(creds.glooClientId);
+    expect(row!.clientSecretCiphertext).not.toBe(creds.glooClientSecret);
     expect(decryptSecret(row!.clientSecretCiphertext, ENCRYPTION_KEY)).toBe(
-      "gloo-e2e-secret-xyz",
+      creds.glooClientSecret,
     );
   });
 
-  it("Gloo verify failure leaves NO row (400, nothing persisted)", async () => {
+  it("Gloo verify failure (statically-wrong secret against LIVE Gloo) → 400, NOTHING persisted", async () => {
     const { token, userId } = await seedUser();
 
+    // A real, registered clientId paired with a deliberately-wrong secret (the real
+    // secret with its last character flipped). Live Gloo rejects the client-credentials
+    // mint with a 4xx, which the route maps to 400 — a real-API verify failure, not a
+    // stub sentinel.
+    const wrongSecret =
+      creds.glooClientSecret.slice(0, -1) +
+      (creds.glooClientSecret.endsWith("a") ? "b" : "a");
+
     const res = await authed("PUT", "/v1/connections/gloo", token, {
-      // The stub's reserved sentinel clientId → 401 invalid_client → verify fails.
-      clientId: "gloo-invalid",
-      clientSecret: "whatever",
+      clientId: creds.glooClientId,
+      clientSecret: wrongSecret,
     });
     expect(res.status).toBe(400);
 
-    // Nothing was written.
+    // Verify-then-store wrote nothing (the invariant this test exists to prove).
     expect(
       await prisma.glooConnection.findUnique({ where: { userId } }),
     ).toBeNull();
@@ -276,9 +314,11 @@ describe("e2e: OpenRouter + Gloo connections", () => {
 
   it("disconnects Gloo and is idempotent", async () => {
     const { token, userId } = await seedUser();
-    await authed("PUT", "/v1/connections/gloo", token, {
-      clientId: "gloo-del-client",
-      clientSecret: "gloo-del-secret",
+    await seedGlooConnection({
+      baseUrl,
+      token,
+      clientId: creds.glooClientId,
+      clientSecret: creds.glooClientSecret,
     });
 
     const del = await authed("DELETE", "/v1/connections/gloo", token);
@@ -302,21 +342,22 @@ describe("e2e: OpenRouter + Gloo connections", () => {
     ).json();
     expect(before).toEqual({ github: null, openrouter: null, gloo: null });
 
-    await authed("POST", "/v1/connections/openrouter", token, {
-      key: "sk-or-v1-merged-key-9999",
-    });
-    await authed("PUT", "/v1/connections/gloo", token, {
-      clientId: "gloo-merged-client",
-      clientSecret: "gloo-merged-secret",
+    // Seed both through the real routes with real credentials.
+    await seedOpenRouterConnection({ baseUrl, token, key: creds.openrouterKey });
+    await seedGlooConnection({
+      baseUrl,
+      token,
+      clientId: creds.glooClientId,
+      clientSecret: creds.glooClientSecret,
     });
 
     const after = await (
       await authed("GET", "/v1/connections", token)
     ).json();
     expect(after.github).toBeNull();
-    expect(after.openrouter.keyLast4).toBe("9999");
+    expect(after.openrouter.keyLast4).toBe(creds.openrouterKey.slice(-4));
     expect(after.openrouter.apiKeyCiphertext).toBeUndefined();
-    expect(after.gloo.clientId).toBe("gloo-merged-client");
+    expect(after.gloo.clientId).toBe(creds.glooClientId);
     expect(after.gloo.clientSecretCiphertext).toBeUndefined();
     expect(JSON.stringify(after)).not.toMatch(/ciphertext/i);
   });
