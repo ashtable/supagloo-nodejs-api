@@ -8,6 +8,7 @@ import {
   GENERATE_AUDIO_WORKFLOW_NAME,
   GENERATE_IMAGE_WORKFLOW_NAME,
   GENERATE_SCRIPT_WORKFLOW_NAME,
+  GENERATE_VIDEO_WORKFLOW_NAME,
   AI_GENERATION_QUEUE_NAME,
 } from "@supagloo/database-lib";
 import { buildApp } from "../../src/app";
@@ -155,6 +156,36 @@ async function standInGenerateAudioFn(_payload: unknown): Promise<{ ok: true }> 
 }
 DBOS.registerWorkflow(standInGenerateAudioFn, {
   name: GENERATE_AUDIO_WORKFLOW_NAME,
+});
+
+// Task #34: a STAND-IN generateVideo — drives the SAME AiGeneration row transitions the real
+// video workflow drives (running → succeeded + resultAssetKey), keyed by workflowID =
+// generationId. The REAL workflow's async submit/poll/download/upload + crash-replay behaviour is
+// proven by the dbos repo's generate-video.e2e.ts; here we only prove the API wires video (POST no
+// longer 501s) and surfaces resultAssetKey on the DTO.
+async function standInGenerateVideoFn(_payload: unknown): Promise<{ ok: true }> {
+  const genId = DBOS.workflowID!;
+  await DBOS.runStep(
+    async () => {
+      const row = await prisma.aiGeneration.findUnique({ where: { id: genId } });
+      const assetKey = row?.projectId ? buildAssetKey(row.projectId, genId) : null;
+      await prisma.aiGeneration.updateMany({
+        where: { id: genId },
+        data: {
+          status: "succeeded",
+          completedAt: new Date(),
+          providerJobId: "vid_stub_1",
+          resultAssetKey: assetKey,
+          resultJson: { kind: "video", providerJobId: "vid_stub_1" } as any,
+        },
+      });
+    },
+    { name: "standInVideoFinalize" },
+  );
+  return { ok: true };
+}
+DBOS.registerWorkflow(standInGenerateVideoFn, {
+  name: GENERATE_VIDEO_WORKFLOW_NAME,
 });
 
 let app: FastifyInstance;
@@ -324,6 +355,16 @@ function musicBody(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function videoBody(overrides: Record<string, unknown> = {}) {
+  return {
+    kind: "video",
+    provider: "openrouter",
+    model: "stub/video-model",
+    input: { prompt: "a dove descends over still water", durationSeconds: 6, aspectRatio: "9:16" },
+    ...overrides,
+  };
+}
+
 describe("e2e: POST /v1/ai/generations + poll — full round trip", () => {
   it("creates + enqueues, polls queued→running→succeeded, surfaces resultJson", async () => {
     armGates();
@@ -379,16 +420,15 @@ describe("e2e: POST validation gates (before any row is created)", () => {
     expect(after).toBe(before);
   });
 
-  it("501s a matrix-valid but still-unwired kind (video+openrouter) and creates no row", async () => {
+  it("400s a video POST with no prompt (the real GenerateVideoInputSchema, Task #34)", async () => {
     disarmGates();
-    const owner = await seedUser("unwired");
+    const owner = await seedUser("vid-noprompt");
     const before = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
     const res = await api("/ai/generations", owner.token, {
       method: "POST",
       body: { kind: "video", provider: "openrouter", model: "m", input: {} },
     });
-    expect(res.status).toBe(501);
-    expect((await res.json()).error).toBe("generation_kind_unsupported");
+    expect(res.status).toBe(400);
     const after = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
     expect(after).toBe(before);
   });
@@ -505,6 +545,26 @@ describe("e2e: audio is wired (Task #33)", () => {
 
     const done = await pollUntilStatus(owner.token, generationId, "succeeded");
     expect(done.kind).toBe("music");
+    expect(done.resultAssetKey).toBe(buildAssetKey(projectId, generationId));
+  }, 60_000);
+});
+
+describe("e2e: video is wired (Task #34)", () => {
+  it("creates + enqueues generateVideo, reaches succeeded, and surfaces resultAssetKey", async () => {
+    disarmGates();
+    const owner = await seedUser("vid-wired");
+    const projectId = await seedProject(owner.userId, "vid");
+
+    const created = await api("/ai/generations", owner.token, {
+      method: "POST",
+      body: videoBody({ projectId }),
+    });
+    expect(created.status).toBe(201);
+    const { generationId } = await created.json();
+    expect(generationId).toBeTruthy();
+
+    const done = await pollUntilStatus(owner.token, generationId, "succeeded");
+    expect(done.kind).toBe("video");
     expect(done.resultAssetKey).toBe(buildAssetKey(projectId, generationId));
   }, 60_000);
 });

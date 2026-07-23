@@ -162,14 +162,14 @@ describe("POST /ai/generations", () => {
       method: "POST",
       url: "/ai/generations",
       headers: BEARER,
-      // `video` is the last matrix-valid-but-unwired kind (narration/music wired in #33); its
-      // input is still the passthrough placeholder, so `{}` passes the boundary and reaches
-      // the (mocked) service that throws the 501.
+      // Every real kind is now wired, so this test drives the 501 mapping via a MOCKED service
+      // that throws UnsupportedGenerationKindError regardless of kind. The body must still be
+      // structurally valid to pass the Zod boundary — video now needs a real prompt (Task #34).
       payload: {
         ...CREATE_BODY,
         kind: "video",
         provider: "openrouter",
-        input: {},
+        input: { prompt: "a dove descends over still water" },
       },
     });
     expect(res.statusCode).toBe(501);
