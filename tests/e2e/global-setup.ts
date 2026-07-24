@@ -4,18 +4,24 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createPrismaClient } from "@supagloo/database-lib";
 
-// Reuse-or-spawn e2e infra for the API auth suite. The auth e2e boots the Fastify
-// app IN-PROCESS (real listen + real fetch) but needs two real dependencies from
-// the root Compose stack: Postgres (with db-lib migrations applied) and the
-// containerized YouVersion stub (with the Task #10 /auth/v1/userinfo route).
+// Reuse-or-spawn e2e infra for the API e2e suites. They boot the Fastify app
+// IN-PROCESS (real listen + real fetch) but need real dependencies from the root
+// Compose stack: Postgres (with db-lib migrations applied), the containerized
+// GitHub stub (REST + repo + Contents routes), and MinIO (S3 store + bucket).
 //
 // This mirrors the root repo's reuse-or-spawn harness: if a healthy stack is
 // already up (e.g. the developer ran the root e2e), reuse it untouched; otherwise
-// bring up just `postgres` + `youversion-stub` from the root Compose files, apply
-// migrations with the API's own prisma CLI, and tear down on exit.
+// bring up just `postgres` + `github-stub` + `minio(-init)` from the root Compose
+// files, apply migrations with the API's own prisma CLI, and tear down on exit.
 //
-// NOTE (deviation from the "API e2e does no docker orchestration" convention):
-// auth genuinely needs infra, so we adopt the same reuse-or-spawn pattern the root
+// Task 34-E8 (design-delta §10.7): the openrouter/gloo/youversion stubs are GONE.
+// The real-provider e2e specs (connections.e2e) reach the LIVE hosts and fail fast
+// on missing secrets via their own `resolveConnectionSeedCreds()` — no stub, and no
+// provider secret is needed HERE just to bring up infra, so this global-setup does
+// not gate on provider secrets (they belong to the specs that actually use them).
+//
+// NOTE (deviation from the "API e2e does no docker orchestration" convention): the
+// e2e genuinely needs infra, so we adopt the same reuse-or-spawn pattern the root
 // harness uses. It stays a no-op when a stack is already running.
 
 const API_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -25,12 +31,7 @@ const ROOT_REPO =
 const APP_URL =
   process.env.DATABASE_URL ??
   "postgres://supagloo:supagloo@localhost:5432/supagloo";
-const YOUVERSION_BASE =
-  process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
 const GITHUB_BASE = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
-const OPENROUTER_BASE =
-  process.env.OPENROUTER_STUB_URL ?? "http://localhost:4802";
-const GLOO_BASE = process.env.GLOO_STUB_URL ?? "http://localhost:4803";
 // MinIO (Task #13): the files e2e presigns + round-trips against the Compose MinIO.
 // Probe the host-reachable (public) endpoint's health route.
 const MINIO_BASE = process.env.S3_PUBLIC_ENDPOINT ?? "http://localhost:9000";
@@ -79,25 +80,6 @@ async function dbReady(): Promise<boolean> {
   }
 }
 
-async function stubReady(): Promise<boolean> {
-  try {
-    const health = await fetch(`${YOUVERSION_BASE}/__stub/health`, {
-      signal: AbortSignal.timeout(3000),
-    });
-    if (!health.ok) return false;
-    // A stale stub image (built before Task #10) lacks the userinfo route and
-    // would 404; a current one 401s an invalid token. Distinguish them so a
-    // reused-but-stale stack is rebuilt rather than silently failing the suite.
-    const probe = await fetch(`${YOUVERSION_BASE}/auth/v1/userinfo`, {
-      headers: { authorization: "Bearer yv-access-invalid" },
-      signal: AbortSignal.timeout(3000),
-    });
-    return probe.status === 401;
-  } catch {
-    return false;
-  }
-}
-
 async function githubStubReady(): Promise<boolean> {
   try {
     const health = await fetch(`${GITHUB_BASE}/__stub/health`, {
@@ -113,44 +95,6 @@ async function githubStubReady(): Promise<boolean> {
       `${GITHUB_BASE}/repos/acme/probe/contents/supagloo.project.json?ref=main`,
       { signal: AbortSignal.timeout(3000) },
     );
-    return probe.status === 401;
-  } catch {
-    return false;
-  }
-}
-
-async function openrouterStubReady(): Promise<boolean> {
-  try {
-    // The credits route (Task #9) exists in every image version, so a plain health
-    // check suffices — no staleness probe needed for the OpenRouter stub.
-    const health = await fetch(`${OPENROUTER_BASE}/__stub/health`, {
-      signal: AbortSignal.timeout(3000),
-    });
-    return health.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function glooStubReady(): Promise<boolean> {
-  try {
-    const health = await fetch(`${GLOO_BASE}/__stub/health`, {
-      signal: AbortSignal.timeout(3000),
-    });
-    if (!health.ok) return false;
-    // A stale gloo-stub image (built before Task #12) accepts ANY Basic creds and
-    // 200s; a current one rejects the reserved sentinel clientId `gloo-invalid`
-    // with 401. Distinguish them so a reused-but-stale stack is rebuilt.
-    const basic = Buffer.from("gloo-invalid:x").toString("base64");
-    const probe = await fetch(`${GLOO_BASE}/oauth2/token`, {
-      method: "POST",
-      headers: {
-        authorization: `Basic ${basic}`,
-        "content-type": "application/x-www-form-urlencoded",
-      },
-      body: "grant_type=client_credentials",
-      signal: AbortSignal.timeout(3000),
-    });
     return probe.status === 401;
   } catch {
     return false;
@@ -195,10 +139,7 @@ function migrate(): void {
 export default async function setup() {
   if (
     (await dbReady()) &&
-    (await stubReady()) &&
     (await githubStubReady()) &&
-    (await openrouterStubReady()) &&
-    (await glooStubReady()) &&
     (await minioReady())
   ) {
     // Reuse a healthy running stack — leave it exactly as-is.
@@ -207,25 +148,20 @@ export default async function setup() {
 
   if (!existsSync(resolve(ROOT_REPO, "docker-compose.yml"))) {
     throw new Error(
-      `API e2e needs Postgres + the YouVersion + GitHub + OpenRouter + Gloo ` +
-        `stubs + MinIO, but neither a running stack nor the root Compose repo was ` +
-        `found at ${ROOT_REPO}. Bring up the stack (root repo: docker compose ... ` +
-        `up) or set SUPAGLOO_ROOT_DIR.`,
+      `API e2e needs Postgres + the GitHub stub + MinIO, but neither a running ` +
+        `stack nor the root Compose repo was found at ${ROOT_REPO}. Bring up the ` +
+        `stack (root repo: docker compose ... up) or set SUPAGLOO_ROOT_DIR.`,
     );
   }
 
-  // `--build` so the stub images include the Task #10 userinfo + Task #11 repo +
-  // Task #12 Gloo verify-failure sentinel routes. `minio` + `minio-init` provide
-  // the Task #13 S3 store + `supagloo-dev` bucket.
+  // `--build` so the github-stub image includes the Task #11 repo + Task #20 Contents
+  // routes. `minio` + `minio-init` provide the Task #13 S3 store + `supagloo-dev` bucket.
   compose([
     "up",
     "-d",
     "--build",
     "postgres",
-    "youversion-stub",
     "github-stub",
-    "openrouter-stub",
-    "gloo-stub",
     "minio",
     "minio-init",
   ]);
@@ -235,21 +171,9 @@ export default async function setup() {
     throw new Error("Postgres did not accept connections within 90s");
   }
   migrate();
-  if (!(await waitFor(stubReady, 60_000))) {
-    compose(["down"]);
-    throw new Error("YouVersion stub (with userinfo route) not ready within 60s");
-  }
   if (!(await waitFor(githubStubReady, 60_000))) {
     compose(["down"]);
     throw new Error("GitHub stub (with repo-listing route) not ready within 60s");
-  }
-  if (!(await waitFor(openrouterStubReady, 60_000))) {
-    compose(["down"]);
-    throw new Error("OpenRouter stub not ready within 60s");
-  }
-  if (!(await waitFor(glooStubReady, 60_000))) {
-    compose(["down"]);
-    throw new Error("Gloo stub (with verify-failure sentinel) not ready within 60s");
   }
   if (!(await waitFor(minioReady, 60_000))) {
     compose(["down"]);

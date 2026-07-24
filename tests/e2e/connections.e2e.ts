@@ -44,7 +44,7 @@ const APP_URL =
   process.env.DATABASE_URL ??
   "postgres://supagloo:supagloo@localhost:5432/supagloo";
 const YOUVERSION_BASE =
-  process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
+  process.env.YOUVERSION_BASE_URL ?? "https://api.youversion.com";
 const GITHUB_BASE = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
 // Real-provider e2e (design-delta §10.2/§10.3): the OpenRouter + Gloo clients the
 // app-under-test uses point at the LIVE hosts — the same app-boot base-URL vars the
