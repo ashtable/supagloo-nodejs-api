@@ -20,7 +20,7 @@ const APP_URL =
   process.env.DATABASE_URL ??
   "postgres://supagloo:supagloo@localhost:5432/supagloo";
 const YOUVERSION_BASE =
-  process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
+  process.env.YOUVERSION_BASE_URL ?? "https://api.youversion.com";
 const GITHUB_BASE = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
 
 const OAUTH_BASE = "https://github.com";

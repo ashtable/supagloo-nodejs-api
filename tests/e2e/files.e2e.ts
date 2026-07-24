@@ -33,7 +33,7 @@ const APP_URL =
   process.env.DATABASE_URL ??
   "postgres://supagloo:supagloo@localhost:5432/supagloo";
 const YOUVERSION_BASE =
-  process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
+  process.env.YOUVERSION_BASE_URL ?? "https://api.youversion.com";
 
 const S3_CFG: S3EnvConfig = {
   internalEndpoint: process.env.S3_ENDPOINT ?? "http://minio:9000",
