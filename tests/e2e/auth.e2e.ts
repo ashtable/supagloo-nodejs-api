@@ -3,22 +3,27 @@ import type { FastifyInstance } from "fastify";
 import { createPrismaClient, type PrismaClient } from "@supagloo/database-lib";
 import { buildApp } from "../../src/app";
 import { AuthService } from "../../src/auth/auth-service";
-import { makeYouVersionVerifier } from "../../src/auth/youversion";
 import { SESSION_TTL_MS } from "../../src/auth/tokens";
 
-// Non-UI e2e for auth & sessions (Task #10). Boots the REAL Fastify app in-process
-// (real listen + real fetch over loopback), wired to a REAL Postgres (the Compose
-// `supagloo` DB) and the REAL containerized YouVersion stub (host port 4804). No
-// provider/DB mocking — the stub is a real HTTP server, the DB is real Postgres.
-// Infra is ensured by tests/e2e/global-setup.ts (reuse-or-spawn).
+// Non-UI e2e for auth & SESSION MECHANICS (Task #10; reworked for zero YouVersion
+// egress in Task 34-E6 / design-delta §10.4b). Boots the REAL Fastify app
+// in-process (real listen + real fetch over loopback) against REAL Postgres (the
+// Compose `supagloo` DB). Infra is ensured by tests/e2e/global-setup.ts.
+//
+// ZERO YouVersion egress (design-delta §10.4b, "real or not at all"): interactive
+// YouVersion OAuth cannot be automated, so this suite exercises only session/bearer
+// mechanics through the `/v1/test/seed` seam — NEVER the userinfo verifier. The
+// verifier is unit-tested with an injected fetch (src/auth/youversion.test.ts), and
+// the real `POST /v1/auth/youversion` → live userinfo round-trip is the optional,
+// env-gated tests/e2e/auth-live-youversion.e2e.ts. The old stub-URL fallback and the
+// two stub-dependent sign-in tests were deleted here. To PROVE zero egress, the
+// AuthService below is wired with a verifier that THROWS if ever invoked.
 
 const APP_URL =
   process.env.DATABASE_URL ??
   "postgres://supagloo:supagloo@localhost:5432/supagloo";
-const YOUVERSION_BASE =
-  process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
 
-describe("e2e: auth & sessions", () => {
+describe("e2e: auth & session mechanics (zero YouVersion egress)", () => {
   let app: FastifyInstance;
   let prisma: PrismaClient;
   let baseUrl: string;
@@ -27,7 +32,17 @@ describe("e2e: auth & sessions", () => {
     prisma = createPrismaClient({ connectionString: APP_URL });
     const authService = new AuthService({
       prisma,
-      verifyToken: makeYouVersionVerifier({ baseUrl: YOUVERSION_BASE }),
+      // This suite must NEVER reach YouVersion (§10.4b). Session mechanics go
+      // through /v1/test/seed, which never calls verifyToken; a throwing verifier
+      // turns any accidental sign-in egress into a loud, immediate failure.
+      verifyToken: async () => {
+        throw new Error(
+          "auth.e2e.ts must have ZERO YouVersion egress (design-delta §10.4b): " +
+            "session-mechanics tests use the /v1/test/seed seam and must never " +
+            "invoke the userinfo verifier. Live sign-in is covered by the " +
+            "optional tests/e2e/auth-live-youversion.e2e.ts.",
+        );
+      },
       clock: () => new Date(),
       sessionTtlMs: SESSION_TTL_MS,
     });
@@ -61,55 +76,47 @@ describe("e2e: auth & sessions", () => {
       headers: { authorization: `Bearer ${bearer}` },
     });
 
-  it("signs in, authorizes /v1/me, updates on re-signin, onboards, and revokes on signout", async () => {
-    // Unique per run so the derived YouVersion user is fresh even though the DB
-    // persists across reruns — makes the create-vs-update branch deterministic.
-    const accessToken = `yv-e2e-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  it("seeded session authorizes /v1/me, completes onboarding, and revokes on signout", async () => {
+    // Unique per run so the seeded user/session are fresh even though the DB
+    // persists across reruns.
+    const stamp = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    const sessionToken = `auth-e2e-${stamp}`;
+    const youversionUserId = `yv-auth-${stamp}`;
 
-    // 1) Sign in — CREATE branch.
-    const signIn = await post("/v1/auth/youversion", { accessToken });
-    expect(signIn.status).toBe(200);
-    const signInBody = await signIn.json();
-    expect(signInBody.firstSignIn).toBe(true);
-    expect(typeof signInBody.token).toBe("string");
-    expect(signInBody.token.length).toBeGreaterThan(20);
-    expect(signInBody.user.youversionUserId).toBe(`yv_${accessToken}`);
-    const sessionToken: string = signInBody.token;
-    const userId: string = signInBody.user.id;
+    const seed = await post("/v1/test/seed", {
+      users: [
+        {
+          youversionUserId,
+          displayName: "Auth E2E",
+          email: `auth-${stamp}@example.test`,
+          avatarInitials: "AE",
+          sessionToken,
+        },
+      ],
+    });
+    expect(seed.status).toBe(200);
 
-    // 2) The session token authorizes GET /v1/me.
+    // 1) The seeded session token authorizes GET /v1/me — no OAuth flow.
     const me = await authed("GET", "/v1/me", sessionToken);
     expect(me.status).toBe(200);
-    expect((await me.json()).user.youversionUserId).toBe(`yv_${accessToken}`);
+    const meBody = await me.json();
+    expect(meBody.user.youversionUserId).toBe(youversionUserId);
+    expect(meBody.user.onboardingCompletedAt).toBeNull();
 
-    // 3) Sign in again with the SAME access token — UPDATE branch, same user.
-    const reSignIn = await post("/v1/auth/youversion", { accessToken });
-    expect(reSignIn.status).toBe(200);
-    const reSignInBody = await reSignIn.json();
-    expect(reSignInBody.firstSignIn).toBe(false);
-    expect(reSignInBody.user.id).toBe(userId);
-
-    // 4) Onboarding stamps onboardingCompletedAt and persists.
+    // 2) Onboarding stamps onboardingCompletedAt and persists.
     const onboard = await authed("PATCH", "/v1/me/onboarding", sessionToken);
     expect(onboard.status).toBe(200);
     expect((await onboard.json()).user.onboardingCompletedAt).not.toBeNull();
     const meAfter = await authed("GET", "/v1/me", sessionToken);
     expect((await meAfter.json()).user.onboardingCompletedAt).not.toBeNull();
 
-    // 5) Signout deletes the session; the token no longer authorizes (§9-Q6).
+    // 3) Signout deletes the session; the token no longer authorizes (§9-Q6).
     const signout = await post("/v1/auth/signout", {}, sessionToken);
     expect(signout.status).toBe(200);
     expect((await signout.json()).ok).toBe(true);
 
     const revoked = await authed("GET", "/v1/me", sessionToken);
     expect(revoked.status).toBe(401);
-  });
-
-  it("rejects an invalid YouVersion access token with 401", async () => {
-    const res = await post("/v1/auth/youversion", {
-      accessToken: "yv-access-invalid",
-    });
-    expect(res.status).toBe(401);
   });
 
   it("seed endpoint mints a session usable directly for bearer auth", async () => {
