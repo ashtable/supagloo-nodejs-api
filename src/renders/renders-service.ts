@@ -43,8 +43,12 @@ const TERMINAL_RENDER_STATUSES = ["completed", "failed", "canceled"] as const;
 
 /** Render statuses a cancel may flip to `canceled` (the race guard). Exactly the
  *  complement of {@link TERMINAL_RENDER_STATUSES}, and exactly the set the dbos
- *  `markRenderCanceled` `updateMany` guard allows — so the two writers agree. */
-const CANCELABLE_RENDER_STATUSES = [
+ *  `markRenderCanceled` `updateMany` guard allows — so the two writers agree.
+ *
+ *  Exported so the unit suite can assert the `where.status.in` set EXACTLY rather than
+ *  approximately: this list is the whole race guard, and a single terminal status
+ *  leaking into it would let a cancel clobber finished work. */
+export const CANCELABLE_RENDER_STATUSES = [
   "queued",
   "synthesizing",
   "bundling",

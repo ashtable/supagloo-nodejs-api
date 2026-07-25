@@ -6,7 +6,11 @@ import {
   buildRenderOutputKey,
   type PrismaClient,
 } from "@supagloo/database-lib";
-import { RendersService, type EnqueueOptions } from "./renders-service";
+import {
+  CANCELABLE_RENDER_STATUSES,
+  RendersService,
+  type EnqueueOptions,
+} from "./renders-service";
 import { RenderNotCancelableError, RenderNotFoundError } from "./errors";
 import { ProjectNotFoundError } from "../projects/errors";
 
@@ -22,6 +26,11 @@ import { ProjectNotFoundError } from "../projects/errors";
 //     409 on an already-terminal row;
 //   - presignRenderDownload: completed + outputAssetKey gating, delegating with exactly
 //     buildRenderOutputKey(id).
+//
+// Prisma ops AND the enqueue/cancel/presign seams all record onto ONE shared `calls`
+// timeline, so the two ORDERINGS this surface's safety argument rests on — write before
+// enqueue, cancel before the row flip — are assertable as real relative positions
+// (`at(...)`) rather than as mere presence.
 
 type Call = { op: string; args: any };
 
@@ -89,30 +98,56 @@ function makeFake(config: FakeConfig) {
 
 const has = (calls: Call[], op: string) => calls.some((c) => c.op === op);
 const find = (calls: Call[], op: string) => calls.find((c) => c.op === op)!;
-const indexOf = (calls: Call[], op: string) => calls.findIndex((c) => c.op === op);
 
-function makeEnqueueRecorder() {
+/**
+ * Position of `op` on the SHARED timeline — the oracle for every ordering assertion.
+ *
+ * THROWS when the op never happened, deliberately: `findIndex` returns -1 for a missing
+ * op, and `expect(-1).toBeLessThan(0)` passes — an ordering assertion whose first operand
+ * never ran would silently report success. An ordering claim about an op that did not
+ * happen is a bug in the test, not a pass.
+ */
+function at(calls: Call[], op: string): number {
+  const i = calls.findIndex((c) => c.op === op);
+  if (i === -1) {
+    throw new Error(
+      `expected op ${op} on the call timeline; saw: ${calls.map((c) => c.op).join(" → ") || "(nothing)"}`,
+    );
+  }
+  return i;
+}
+
+// The enqueue / cancel recorders push onto the SAME `calls` timeline as the Prisma fake
+// (as `dbos.enqueue` / `dbos.cancel`). Before this they kept private arrays, so no
+// cross-array ordering was observable and both "orders" the service depends on —
+// write-then-enqueue and cancel-then-write — were asserted only by presence. Both are
+// load-bearing (see U-RS4 / U-RS8), so the timeline is REQUIRED, not optional: every
+// recorder factory takes it.
+function makeEnqueueRecorder(calls: Call[]) {
   const enqueued: { opts: EnqueueOptions; payload: unknown }[] = [];
   return {
     enqueue: async (opts: EnqueueOptions, payload: unknown) => {
+      calls.push({ op: "dbos.enqueue", args: { opts, payload } });
       enqueued.push({ opts, payload });
     },
     enqueued,
   };
 }
-function makeCancelRecorder() {
+function makeCancelRecorder(calls: Call[]) {
   const canceled: string[] = [];
   return {
     cancel: async (workflowID: string) => {
+      calls.push({ op: "dbos.cancel", args: { workflowID } });
       canceled.push(workflowID);
     },
     canceled,
   };
 }
-function makePresignRecorder() {
+function makePresignRecorder(calls: Call[]) {
   const presigned: { userId: string; key: string }[] = [];
   return {
     presignDownload: async (userId: string, key: string) => {
+      calls.push({ op: "s3.presignDownload", args: { userId, key } });
       presigned.push({ userId, key });
       return { url: `https://s3.test/${key}?sig=1`, expiresAt: NOW };
     },
@@ -140,10 +175,15 @@ function makeService(fake: { prisma: PrismaClient }, seams: any) {
   });
 }
 
-function seams(overrides: Partial<Record<string, any>> = {}) {
-  const enq = makeEnqueueRecorder();
-  const can = makeCancelRecorder();
-  const pre = makePresignRecorder();
+/** Build the three injected seams, all recording onto `fake.calls`. Takes the fake (not
+ *  an optional timeline) so a seam can never be wired up off-timeline by omission. */
+function seams(
+  fake: { calls: Call[] },
+  overrides: Partial<Record<string, any>> = {},
+) {
+  const enq = makeEnqueueRecorder(fake.calls);
+  const can = makeCancelRecorder(fake.calls);
+  const pre = makePresignRecorder(fake.calls);
   return {
     enqueue: enq.enqueue,
     cancel: can.cancel,
@@ -188,7 +228,7 @@ function renderRow(over: Record<string, unknown> = {}) {
 describe("RendersService.createRender", () => {
   it("U-RS1: a foreign / unknown / soft-deleted project 404s before any write or enqueue", async () => {
     const fake = makeFake({ project: null });
-    const s = seams();
+    const s = seams(fake);
     await expect(
       makeService(fake, s).createRender("user-1", "proj-1", CREATE_REQ),
     ).rejects.toBeInstanceOf(ProjectNotFoundError);
@@ -205,7 +245,7 @@ describe("RendersService.createRender", () => {
 
   it("U-RS2: a versionId that does not belong to that project 404s (uniform denial), nothing created/enqueued", async () => {
     const fake = makeFake({ project: { id: "proj-1" }, version: null });
-    const s = seams();
+    const s = seams(fake);
     await expect(
       makeService(fake, s).createRender("user-1", "proj-1", CREATE_REQ),
     ).rejects.toBeInstanceOf(ProjectNotFoundError);
@@ -223,7 +263,7 @@ describe("RendersService.createRender", () => {
       project: { id: "proj-1" },
       version: { id: "ver-1", projectId: "proj-1" },
     });
-    const s = seams();
+    const s = seams(fake);
     const result = await makeService(fake, s).createRender(
       "user-1",
       "proj-1",
@@ -257,7 +297,7 @@ describe("RendersService.createRender", () => {
       project: { id: "proj-1" },
       version: { id: "ver-1", projectId: "proj-1" },
     });
-    const s = seams();
+    const s = seams(fake);
     await makeService(fake, s).createRender("user-1", "proj-1", CREATE_REQ);
 
     expect(s.enqueued).toHaveLength(1);
@@ -270,9 +310,24 @@ describe("RendersService.createRender", () => {
     expect(RenderWorkflowPayloadSchema.parse(s.enqueued[0].payload)).toEqual({
       renderJobId: "render-fixed",
     });
-    // ordering: the row must exist before the worker can read it (the workflow's very
-    // first step does renderJob.findUnique and treats a missing row as PERMANENT)
-    expect(has(fake.calls, "renderJob.create")).toBe(true);
+
+    // ORDERING (the point of this test). `DBOSClient.enqueue` durably records the
+    // workflow as ENQUEUED the moment it returns, so a 1-worker `render` queue can pick
+    // it up immediately — and the workflow's very first step does `renderJob.findUnique`
+    // and classifies a missing row as a PERMANENT failure. The row must therefore be
+    // COMMITTED before the enqueue, not merely issued.
+    //
+    // Both operands live on one shared timeline now; asserting `renderJob.create` was
+    // merely PRESENT (as this test used to) passed just as happily when the enqueue came
+    // first, which is exactly the regression that would hand the worker a phantom row.
+    expect(at(fake.calls, "renderJob.create")).toBeLessThan(
+      at(fake.calls, "dbos.enqueue"),
+    );
+    // ...and because the write is transactional, the COMMIT boundary — not just the
+    // statement — has to precede the enqueue.
+    expect(at(fake.calls, "$transaction")).toBeLessThan(
+      at(fake.calls, "dbos.enqueue"),
+    );
   });
 
   it("U-RS5: sets Project.lastRenderJobId to the new id in the same transaction (D3)", async () => {
@@ -280,7 +335,7 @@ describe("RendersService.createRender", () => {
       project: { id: "proj-1" },
       version: { id: "ver-1", projectId: "proj-1" },
     });
-    const s = seams();
+    const s = seams(fake);
     await makeService(fake, s).createRender("user-1", "proj-1", CREATE_REQ);
 
     const update = find(fake.calls, "project.update");
@@ -296,7 +351,7 @@ describe("RendersService.getRender / listMyRenders", () => {
   it("U-RS6: getRender scopes directly on RenderJob.userId; a miss/foreign row 404s", async () => {
     const fake = makeFake({ render: null });
     await expect(
-      makeService(fake, seams()).getRender("user-1", "render-1"),
+      makeService(fake, seams(fake)).getRender("user-1", "render-1"),
     ).rejects.toBeInstanceOf(RenderNotFoundError);
     expect(find(fake.calls, "renderJob.findFirst").args.where).toMatchObject({
       id: "render-1",
@@ -305,7 +360,7 @@ describe("RendersService.getRender / listMyRenders", () => {
 
     const ok = makeFake({ render: renderRow() });
     await expect(
-      makeService(ok, seams()).getRender("user-1", "render-1"),
+      makeService(ok, seams(ok)).getRender("user-1", "render-1"),
     ).resolves.toMatchObject({ id: "render-1" });
   });
 
@@ -318,7 +373,7 @@ describe("RendersService.getRender / listMyRenders", () => {
         renderRow({ id: "a", createdAt: t("2026-07-24T00:00:00.000Z") }),
       ],
     });
-    const rows = await makeService(fake, seams()).listMyRenders("user-1");
+    const rows = await makeService(fake, seams(fake)).listMyRenders("user-1");
 
     expect(find(fake.calls, "renderJob.findMany").args.where).toMatchObject({
       userId: "user-1",
@@ -335,24 +390,43 @@ describe("RendersService.cancelRender", () => {
       render: renderRow({ status: "encoding" }),
       reReadRender: renderRow({ status: "canceled", completedAt: NOW }),
     });
-    const s = seams();
+    const s = seams(fake);
     const after = await makeService(fake, s).cancelRender("user-1", "render-1");
 
-    // stop the compute first: a failed cancelWorkflow must never leave a `canceled`
-    // row behind a still-running workflow
     expect(s.canceled).toEqual(["render-1"]);
-    expect(indexOf(fake.calls, "renderJob.updateMany")).toBeGreaterThan(-1);
+
+    // ORDERING (the point of this test's title). Stop the COMPUTE first: if
+    // `DBOSClient.cancelWorkflow` throws, the row must still read as whatever the
+    // still-running workflow is doing — a `canceled` row sitting in front of a live
+    // render is a lie the UI cannot recover from. Asserting that both happened (as this
+    // test used to) passed identically when the service flipped the row first, which is
+    // the exact inversion the design note at renders-service.ts:203-218 exists to prevent.
+    expect(at(fake.calls, "dbos.cancel")).toBeLessThan(
+      at(fake.calls, "renderJob.updateMany"),
+    );
 
     const upd = find(fake.calls, "renderJob.updateMany").args;
     expect(upd.where.id).toBe("render-1");
-    // the race guard: only a NON-terminal row is touched, exactly mirroring the dbos
-    // markRenderCanceled guard (a cancel racing a completion must lose)
-    expect(upd.where.status.in).toEqual(
-      expect.arrayContaining(["queued", "synthesizing", "bundling", "encoding", "uploading"]),
-    );
-    expect(upd.where.status.in).not.toEqual(
-      expect.arrayContaining(["completed", "failed", "canceled"]),
-    );
+    // The race guard, asserted as an EXACT SET. The previous
+    // `not.toEqual(arrayContaining([completed, failed, canceled]))` was unsound:
+    // `arrayContaining` requires ALL of its members, so the negation passed whenever ANY
+    // one was absent — a `where` that wrongly admitted `completed` (but not `failed`)
+    // sailed through, and a cancel would then clobber a finished render.
+    const CANCELABLE_SORTED = [
+      "bundling",
+      "encoding",
+      "queued",
+      "synthesizing",
+      "uploading",
+    ];
+    expect([...upd.where.status.in].sort()).toEqual(CANCELABLE_SORTED);
+    // ...and the service's own constant is that same set, so neither the literal above
+    // nor the guard the dbos `markRenderCanceled` docstring is written for can drift
+    // without this failing.
+    expect([...CANCELABLE_RENDER_STATUSES].sort()).toEqual(CANCELABLE_SORTED);
+    for (const terminal of ["completed", "failed", "canceled"]) {
+      expect(upd.where.status.in).not.toContain(terminal);
+    }
     expect(upd.data).toMatchObject({ status: "canceled", completedAt: NOW });
     expect(after.status).toBe("canceled");
   });
@@ -360,7 +434,7 @@ describe("RendersService.cancelRender", () => {
   it("U-RS9: a terminal render 409s and never touches DBOS or the row", async () => {
     for (const status of ["completed", "failed", "canceled"]) {
       const fake = makeFake({ render: renderRow({ status }) });
-      const s = seams();
+      const s = seams(fake);
       await expect(
         makeService(fake, s).cancelRender("user-1", "render-1"),
       ).rejects.toBeInstanceOf(RenderNotCancelableError);
@@ -379,14 +453,14 @@ describe("RendersService.cancelRender", () => {
         completedAt: NOW,
       }),
     });
-    const after = await makeService(fake, seams()).cancelRender("user-1", "render-1");
+    const after = await makeService(fake, seams(fake)).cancelRender("user-1", "render-1");
     expect(after.status).toBe("completed");
   });
 
   it("U-RS9b: cancel of a missing/foreign render 404s", async () => {
     const fake = makeFake({ render: null });
     await expect(
-      makeService(fake, seams()).cancelRender("user-1", "nope"),
+      makeService(fake, seams(fake)).cancelRender("user-1", "nope"),
     ).rejects.toBeInstanceOf(RenderNotFoundError);
   });
 });
@@ -401,7 +475,7 @@ describe("RendersService.presignRenderDownload", () => {
       renderRow({ status: "completed", outputAssetKey: null }),
     ]) {
       const fake = makeFake({ render: row });
-      const s = seams();
+      const s = seams(fake);
       await expect(
         makeService(fake, s).presignRenderDownload("user-1", "render-1"),
       ).rejects.toBeInstanceOf(RenderNotFoundError);
@@ -417,7 +491,7 @@ describe("RendersService.presignRenderDownload", () => {
         completedAt: NOW,
       }),
     });
-    const s = seams();
+    const s = seams(fake);
     const out = await makeService(fake, s).presignRenderDownload(
       "user-1",
       "render-1",
