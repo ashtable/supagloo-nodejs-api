@@ -18,19 +18,64 @@ import { ProjectJobsService } from "../../src/jobs/project-jobs-service";
 import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
 import { makeGithubUserAuthClient } from "../../src/connections/github-user-auth-client";
 import { RepoProvisioningService } from "../../src/projects/repo-provisioning-service";
+import {
+  githubApiBaseUrl,
+  githubOauthBaseUrl,
+  loadRootE2eHarness,
+  resolveGithubE2eContext,
+  resolveGithubOauthClientCreds,
+  seedGithubConnection,
+  shimOnlyTheUserAuthorizationTokenExchange,
+  type GithubE2eContext,
+  type GithubOauthClientCreds,
+} from "../../src/testing/github-e2e";
 
-// Non-UI e2e for the Task #26 create-new-repo JIT hop (design-delta §2.3/§6b/§8).
-// Boots the REAL Fastify app in-process (real listen + fetch) with the REAL
-// user-auth client pointed at the containerized github-stub (host port 4801, which
-// serves BOTH the OAuth host `/login/oauth/access_token` and the API host
-// `/user/repos` + `PUT /user/installations/:id/repositories/:repoId`), a REAL
-// DBOSClient enqueuer, AND the SAME stand-in `scaffoldProject` worker the task-18
-// e2e uses (so the delegated create job advances queued→running→succeeded).
+// Non-UI e2e for the Task #26 create-new-repo JIT hop (design-delta §2.3/§6b/§8),
+// REPOINTED AT REAL GITHUB in task-62 (D13 **tier 1**). Boots the REAL Fastify app
+// in-process (real listen + fetch) with the REAL user-auth client, a REAL DBOSClient
+// enqueuer, AND the SAME stand-in `scaffoldProject` worker the task-18 e2e uses (so the
+// delegated create job advances queued→running→succeeded).
 //
-// The github-stub has NO counter-reset/introspection route, and it accumulates state
-// across a shared container, so this e2e asserts through the API's OWN observable
-// effects (201 body, created Project row, job status) with UNIQUE stamped repo names
-// — never exact stub counters. In-process per the in-flight-dblib constraint.
+// ONE HOP IS SHIMMED, AND ONLY ONE: `POST https://github.com/login/oauth/access_token`.
+// Steps 2–3 of the designed flow are a HUMAN clicking "Authorize" on a GitHub-hosted
+// consent page and the short-lived `code` that click produces. Those cannot be
+// automated headlessly, and a fabricated code is rejected by real GitHub with
+// `bad_verification_code` (the retired github-stub accepted any non-empty string, which
+// is the only reason `code=e2e-create-repo-code` ever "worked"). So the exchange is
+// answered with `GITHUB_E2E_PAT_TOKEN` — a user-scoped credential for the SAME account,
+// which `POST /user/repos` cannot distinguish from an OAuth-issued one. The only thing
+// faked is the token's PROVENANCE. Sanctioned by design-delta §10.2 (1448-1452), the
+// same exception already used for YouVersion sign-in and OpenRouter PKCE, and BINDING
+// per preflight §5a (decided by the user — not to be re-litigated).
+//
+// EVERYTHING PAST THAT HOP IS REAL: `POST https://api.github.com/user/repos` really
+// creates a prefixed `…-jit-<runid>` repo in the installation account, with real
+// name-collision 422s and real permission behaviour. The shim helper
+// (`shimOnlyTheUserAuthorizationTokenExchange`) THROWS if asked for any other URL, so it
+// structurally cannot drift into general-purpose stubbing.
+//
+// NOT PROVEN HERE, and deliberately not implied: the code-for-token exchange itself
+// (redirect round-trip, `state` handling, `bad_verification_code`). That lives at unit
+// level in `src/connections/github-user-auth-client.test.ts`, which is also where
+// task-62 D18-2 landed — real GitHub returns HTTP **200** with
+// `{"error":"bad_verification_code"}`, and the client now raises a typed
+// `GithubUserAuthExchangeError` instead of an anonymous Zod parse failure.
+//
+// KNOWN PRODUCT GAP, NOT FIXED HERE (plan row N1): `createUserRepo` POSTs
+// `{name, private}` with **no `auto_init`**, so the created repo has NO commits and no
+// `main`. `scaffold-project.ts` then opens its base PR with `base: "main"`, which real
+// GitHub 422s. This spec does not hit that because it uses the stand-in scaffold worker
+// (it is testing the api's JIT hop, not the workflow), so the gap is REAL and remains
+// un-exercised end to end against real GitHub. The stub masked it by claiming
+// `default_branch: "main"` while a separate git-server fixture seeded an actual `main`.
+// A proper fix touches `ProjectVersion` PR-number nullability — a design decision.
+//
+// This e2e never asserted stub counters (it predates that pattern by design), so
+// nothing here needed the task-62 D9 counter reclassification. It asserts through the
+// api's OWN observable effects: the 201 body, the created Project row, the job status.
+//
+// DURABLE SIDE EFFECTS: one private throwaway repo per successful create case, NEVER
+// auto-removed (task-62 D6). Reclaim with the root repo's `npm run cleanup:github-e2e`.
 
 const APP_URL =
   process.env.DATABASE_URL ??
@@ -40,8 +85,6 @@ const DBOS_URL =
   "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos";
 const YOUVERSION_BASE =
   process.env.YOUVERSION_BASE_URL ?? "https://api.youversion.com";
-const GITHUB_BASE = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
-
 const stamp = () => `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -73,12 +116,24 @@ DBOS.registerWorkflow(standInScaffoldFn, { name: SCAFFOLD_PROJECT_WORKFLOW_NAME 
 
 let app: FastifyInstance;
 let baseUrl: string;
+let ctx: GithubE2eContext;
+let oauthCreds: GithubOauthClientCreds;
+/** Root's naming module — the ONE place the throwaway-repo prefix literal lives
+ *  (task-62 D1). Never re-typed here: a throwaway repo whose name drifts from the
+ *  cleanup script's hard gate would be unreclaimable. */
+let naming: { buildE2eRepoName(slug: string, runId: string): string };
 let enqueuer: {
   enqueue: (o: any, p: unknown) => Promise<void>;
   close: () => Promise<void>;
 };
 
 beforeAll(async () => {
+  // Fail FAST + LOUD on a missing credential / uninstalled App, before any DBOS or
+  // Compose work. Never warn-and-skip (plan row 56 item 2).
+  ctx = await resolveGithubE2eContext();
+  oauthCreds = resolveGithubOauthClientCreds();
+  naming = (await loadRootE2eHarness()).naming;
+
   DBOS.setConfig({ name: "supagloo-api-repo-prov-e2e", systemDatabaseUrl: DBOS_URL });
   await DBOS.launch();
   await DBOS.registerQueue(GIT_OPS_QUEUE_NAME, { workerConcurrency: 4 });
@@ -96,10 +151,13 @@ beforeAll(async () => {
     enqueue: enqueuer.enqueue,
   });
   const userAuthClient = makeGithubUserAuthClient({
-    oauthBaseUrl: GITHUB_BASE,
-    apiBaseUrl: GITHUB_BASE,
-    clientId: "Iv1.stubclient",
-    clientSecret: "stubsecret",
+    // The stub served BOTH hosts off one port; real GitHub splits them. The OAuth host
+    // is where the (shimmed) exchange lives; the API host is fully real.
+    oauthBaseUrl: githubOauthBaseUrl(),
+    apiBaseUrl: githubApiBaseUrl(),
+    clientId: oauthCreds.clientId,
+    clientSecret: oauthCreds.clientSecret,
+    fetchImpl: shimOnlyTheUserAuthorizationTokenExchange(fetch, ctx.pat),
   });
   const repoProvisioningService = new RepoProvisioningService({
     prisma,
@@ -149,20 +207,19 @@ async function seedUser(tag: string): Promise<{ token: string; userId: string }>
   return { token, userId: body.users[0].user.id };
 }
 
-async function connectGithub(
-  userId: string,
-  installationId: string,
-  repositorySelection = "selected",
-): Promise<void> {
-  await prisma.githubConnection.create({
-    data: {
-      userId,
-      githubLogin: "acme",
-      installationId,
-      repositorySelection,
-      status: "connected",
-    },
-  });
+/**
+ * Connect with the DISCOVERED installation id, login and `repositorySelection` — never
+ * the fabricated `installationId: "42"` / `githubLogin: "acme"`.
+ *
+ * The live installation is `repository_selection: "all"`, so
+ * `RepoProvisioningService` correctly SKIPS `addRepoToInstallation`
+ * (repo-provisioning-service.ts:96). That is not a coverage hole: real GitHub 422s a
+ * repository-access-list edit under an all-repos install, so the `"selected"` branch is
+ * unreachable here by construction and is covered at unit level instead
+ * (`github-user-auth-client.test.ts`, task-62 D13).
+ */
+async function connectGithub(userId: string): Promise<void> {
+  await seedGithubConnection(prisma, userId);
 }
 
 const api = (
@@ -209,8 +266,12 @@ describe("e2e: GET /v1/projects/repo-authorize-url", () => {
     expect(res.status).toBe(200);
     const { url } = await res.json();
     const parsed = new URL(url);
-    expect(parsed.origin + parsed.pathname).toBe(`${GITHUB_BASE}/login/oauth/authorize`);
-    expect(parsed.searchParams.get("client_id")).toBe("Iv1.stubclient");
+    // The URL a real user's browser would actually be sent to — no stub host, and the
+    // REAL App client id (task-62 D13 / preflight §5a).
+    expect(parsed.origin + parsed.pathname).toBe(
+      "https://github.com/login/oauth/authorize",
+    );
+    expect(parsed.searchParams.get("client_id")).toBe(oauthCreds.clientId);
     expect(parsed.searchParams.get("redirect_uri")).toBe(redirectUri);
     expect(parsed.searchParams.get("scope")).toBe("repo");
     expect(parsed.searchParams.get("state")).toBe("nonce-xyz");
@@ -226,13 +287,17 @@ describe("e2e: GET /v1/projects/repo-authorize-url", () => {
 describe("e2e: POST /v1/projects/create-repo — the JIT hop → scaffold", () => {
   it("exchanges the code, creates the repo, and scaffolds it to succeeded", async () => {
     const owner = await seedUser("create");
-    await connectGithub(owner.userId, "42", "selected");
-    const repoName = `psalm-jit-${stamp()}`;
+    await connectGithub(owner.userId);
+    // A prefixed, per-run name so the durable artifact this test leaves behind is
+    // unmistakably a throwaway and is reclaimable by the cleanup script's hard gate.
+    const repoName = naming.buildE2eRepoName("jit", ctx.runId);
 
     const created = await api("/projects/create-repo", owner.token, {
       method: "POST",
       body: {
-        code: "gh-user-auth-code",
+        // Any non-empty code: the exchange is the one shimmed hop, and the real
+        // `bad_verification_code` path is unit-tested instead (preflight §5a).
+        code: "shimmed-user-authorization-code",
         name: "Psalm JIT",
         repoName,
         visibility: "private",
@@ -244,11 +309,11 @@ describe("e2e: POST /v1/projects/create-repo — the JIT hop → scaffold", () =
     expect(projectId).toBeTruthy();
     expect(jobId).toBeTruthy();
 
-    // The created Project points at the GitHub-assigned owner ("acme" from the stub)
-    // and the requested repo name — proving the repo was created via the user token,
-    // not supplied by the client.
+    // The created Project points at the owner GITHUB assigned (echoed back by
+    // `POST /user/repos`, i.e. the discovered account) and the requested repo name —
+    // proving the repo was created via the user token, not supplied by the client.
     const project = await prisma.project.findUnique({ where: { id: projectId } });
-    expect(project?.repoOwner).toBe("acme");
+    expect(project?.repoOwner).toBe(ctx.owner);
     expect(project?.repoName).toBe(repoName);
     expect(project?.createdFrom).toBe("blank");
 

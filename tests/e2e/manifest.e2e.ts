@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { generateKeyPairSync } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import {
   createPrismaClient,
@@ -14,40 +13,91 @@ import { SESSION_TTL_MS } from "../../src/auth/tokens";
 import { makeGithubAppClient } from "../../src/connections/github-app-client";
 import { ProjectsService } from "../../src/projects/projects-service";
 import { ManifestService } from "../../src/manifests/manifest-service";
+import {
+  githubApiBaseUrl,
+  mintE2eInstallationToken,
+  provisionFixtureRepo,
+  resolveGithubE2eContext,
+  seedGithubConnection,
+  seedRepoFileOnBranch,
+  type FixtureRepo,
+  type GithubE2eContext,
+} from "../../src/testing/github-e2e";
 
-// Non-UI e2e for the manifest read (Task #20, design-delta §5.3/§8). Boots the REAL
-// Fastify app in-process (real listen + real fetch) wired to the REAL Compose Postgres
-// (`supagloo` DB) and the REAL containerized GitHub stub (host port 4801). No mocking —
-// the manifest is read over real HTTP from the stub's Contents API (seeded via the
-// stub's `POST /__admin/contents`). Users are seeded via `/v1/test/seed`;
-// Project + GithubConnection rows are created directly with the test's own Prisma
-// client. Runs IN-PROCESS per the in-flight-dblib-e2e constraint (the containerized API
-// can't yet see the uncommitted db-lib DTOs). Infra ensured by
-// tests/e2e/global-setup.ts (reuse-or-spawn: postgres + the github stub).
+// Non-UI e2e for the manifest read (Task #20, design-delta §5.3/§8), REPOINTED AT REAL
+// GITHUB in task-62 (design-delta §11 / D11). Boots the REAL Fastify app in-process
+// (real listen + real fetch) wired to the REAL Compose Postgres (`supagloo` DB) and to
+// **real api.github.com**. The manifest is read over real HTTPS from GitHub's own
+// Contents API. Runs IN-PROCESS per the in-flight-dblib-e2e constraint (the
+// containerized API can't yet see the uncommitted db-lib DTOs). Infra ensured by
+// tests/e2e/global-setup.ts (Postgres + MinIO — GitHub needs no local service).
+//
+// WHAT REPLACED THE STUB'S `POST /__admin/contents` (task-62 D11)
+// ONE throwaway repo per run (root's `buildE2eRepoName("manifest", runId)`, created with
+// `auto_init: true` so `main` exists), plus FOUR real branches cut from `main` with the
+// INSTALLATION token and real `PUT /repos/:o/:r/contents/supagloo.project.json` writes:
+//
+//   branch `valid`     — a real, schema-valid manifest         (happy path)
+//   branch `other`     — a DIFFERENT valid manifest            (real `?ref=` semantics)
+//   branch `badjson`   — the literal bytes `{ this is not valid json`
+//   branch `badschema` — valid JSON that fails ProjectManifestSchema
+//   branch `absent`    — created with NO manifest file         (real Contents 404)
+//
+// Every error case here is **file-content** injection, not provider-behaviour
+// injection: a real repo holds corrupt bytes exactly as readily as a stub did, so
+// nothing needed reclassifying to unit level to stay covered.
+//
+// The two remaining cases (409 no-connection, 404 cross-owner + 401) are ZERO-EGRESS —
+// they short-circuit in the api before any GitHub call — so they seed no fixture at all.
+// The stub era hid that: it seeded a manifest for the 409 case that could never be read.
+//
+// DELETED, NOT WEAKENED (task-62 D9): the `installationTokensIssued === 1` +
+// `byRoute["GET /repos/:owner/:repo/contents/:path"] === 1` assertions, and the
+// `/__stub/reset` + re-seed dance they required. Real GitHub has no per-caller call
+// counter. They are RECLASSIFIED to `src/connections/github-app-client.test.ts` with an
+// injected counting fetchImpl ("one getRepositoryFileContents ⇒ exactly ONE mint and
+// ONE contents GET"), which attributes each call to the method that made it.
+//
+// Also newly in play, and impossible against the stub: the Contents API's 1 MB inline
+// cap / `encoding:"none"` representation switch, and multi-segment paths (the stub only
+// ever routed a single segment). Both are covered at unit level; every fixture here is
+// far under the cap.
+//
+// DURABLE SIDE EFFECTS: one private throwaway repo per run, NEVER auto-removed
+// (task-62 D6). Reclaim with the root repo's `npm run cleanup:github-e2e`.
 
 const APP_URL =
   process.env.DATABASE_URL ??
   "postgres://supagloo:supagloo@localhost:5432/supagloo";
 const YOUVERSION_BASE =
   process.env.YOUVERSION_BASE_URL ?? "https://api.youversion.com";
-const GITHUB_BASE = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
 
 const MANIFEST_PATH = "supagloo.project.json";
 const stamp = () => `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
 
-describe("e2e: manifest read", () => {
+/** The four seeded branches + the one deliberately-empty branch. */
+const VALID_MANIFEST = {
+  ...buildBlankManifest(),
+  narratorVoice: { description: "Working branch narrator" },
+};
+const OTHER_MANIFEST = {
+  ...buildBlankManifest(),
+  narratorVoice: { description: "the other ref" },
+};
+
+describe("e2e: manifest read (real github.com Contents API)", () => {
   let app: FastifyInstance;
   let prisma: PrismaClient;
   let baseUrl: string;
+  let ctx: GithubE2eContext;
+  let fixture: FixtureRepo;
 
   beforeAll(async () => {
-    prisma = createPrismaClient({ connectionString: APP_URL });
+    // Fail FAST + LOUD (never warn-and-skip) on a missing credential or an
+    // uninstalled App — see src/testing/github-e2e.ts for the remediation text.
+    ctx = await resolveGithubE2eContext();
 
-    const { privateKey } = generateKeyPairSync("rsa", {
-      modulusLength: 2048,
-      privateKeyEncoding: { type: "pkcs1", format: "pem" },
-      publicKeyEncoding: { type: "spki", format: "pem" },
-    });
+    prisma = createPrismaClient({ connectionString: APP_URL });
 
     const authService = new AuthService({
       prisma,
@@ -56,9 +106,12 @@ describe("e2e: manifest read", () => {
     });
     const projectsService = new ProjectsService({ prisma });
     const githubAppClient = makeGithubAppClient({
-      apiBaseUrl: GITHUB_BASE,
-      appId: "123456",
-      privateKey,
+      // Real host, real App credentials. A throwaway keypair could only prove we
+      // produce a well-formed JWT; the real key proves GitHub ACCEPTS it (row 62
+      // item (c)'s bug class).
+      apiBaseUrl: githubApiBaseUrl(),
+      appId: ctx.appId,
+      privateKey: ctx.privateKey,
     });
     const manifestService = new ManifestService({
       getProject: (userId, id) => projectsService.getProject(userId, id),
@@ -75,11 +128,47 @@ describe("e2e: manifest read", () => {
       manifests: { service: manifestService },
     });
     baseUrl = await app.listen({ port: 0, host: "127.0.0.1" });
+
+    // ONE repo for all seven cases (task-62 D7: repo creation is governed by GitHub's
+    // secondary/abuse limits, so the per-run creation budget is deliberately minimal).
+    fixture = await provisionFixtureRepo("manifest", {
+      spec: "supagloo-nodejs-api/tests/e2e/manifest.e2e.ts",
+    });
+
+    // Seeding uses the INSTALLATION token, not the PAT (task-62 D6): it exercises the
+    // installation's granted `contents:write` for real, and a PAT — a strictly stronger
+    // credential than production ever holds — could green-light a permission the
+    // product does not actually have.
+    const token = await mintE2eInstallationToken();
+    const seed = (branch: string, content?: string) =>
+      seedRepoFileOnBranch({
+        owner: fixture.owner,
+        repo: fixture.repo,
+        branch,
+        token,
+        fromBranch: fixture.defaultBranch,
+        ...(content === undefined
+          ? {}
+          : { path: MANIFEST_PATH, content }),
+      });
+
+    await seed("valid", JSON.stringify(VALID_MANIFEST));
+    await seed("other", JSON.stringify(OTHER_MANIFEST));
+    await seed("badjson", "{ this is not valid json");
+    await seed(
+      "badschema",
+      JSON.stringify({ ...buildBlankManifest(), manifestVersion: 2 }),
+    );
+    // No manifest on this branch → a REAL Contents 404. `seedRepoFileOnBranch`
+    // verifies the branch itself exists, because a 404 from a NON-EXISTENT ref would
+    // pass this test for entirely the wrong reason (task-62 D11 case 5).
+    await seed("absent");
   });
 
   afterAll(async () => {
     if (app) await app.close();
     if (prisma) await prisma.$disconnect();
+    // NO fixture teardown, deliberately (task-62 D6).
   });
 
   async function seedUser(tag: string): Promise<{ token: string; userId: string }> {
@@ -104,56 +193,32 @@ describe("e2e: manifest read", () => {
     return { token, userId: body.users[0].user.id };
   }
 
-  async function connectGithub(userId: string, installationId = "42"): Promise<void> {
-    await prisma.githubConnection.create({
-      data: {
-        userId,
-        githubLogin: "acme",
-        installationId,
-        repositorySelection: "selected",
-        status: "connected",
-        connectedAt: new Date(),
-      },
-    });
-  }
+  /** Connect with the DISCOVERED installation id + login (never `"42"` / `"acme"`). */
+  const connectGithub = (userId: string) =>
+    seedGithubConnection(prisma, userId);
 
+  /**
+   * A Project row pointing at THIS RUN's real repo. `currentBranch` selects which of
+   * the seeded fixture branches the read resolves to, so the branch IS the fixture.
+   */
   async function makeProject(
     ownerId: string,
-    opts: { repoName?: string; currentBranch?: string } = {},
+    opts: { currentBranch: string; repoName?: string; repoOwner?: string } = {
+      currentBranch: "valid",
+    },
   ): Promise<Project> {
-    const repoName = opts.repoName ?? `repo-${stamp()}`;
     return prisma.project.create({
       data: {
         slug: `slug-${stamp()}`,
         ownerId,
-        name: repoName,
-        repoOwner: "acme",
-        repoName,
+        name: opts.repoName ?? fixture.repo,
+        repoOwner: opts.repoOwner ?? fixture.owner,
+        repoName: opts.repoName ?? fixture.repo,
         repoVisibility: "private",
         createdFrom: "blank",
-        currentBranch: opts.currentBranch ?? "v0.0.1",
+        currentBranch: opts.currentBranch,
       },
     });
-  }
-
-  // Seed a raw file body into the github stub's in-memory Contents store.
-  async function seedManifest(args: {
-    repo: string;
-    ref: string;
-    content: string;
-  }): Promise<void> {
-    const res = await fetch(`${GITHUB_BASE}/__admin/contents`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        owner: "acme",
-        repo: args.repo,
-        ref: args.ref,
-        path: MANIFEST_PATH,
-        content: args.content,
-      }),
-    });
-    expect(res.status).toBe(201);
   }
 
   const api = (path: string, token?: string) =>
@@ -163,62 +228,32 @@ describe("e2e: manifest read", () => {
 
   // --------------------------------------------------------------- happy path
 
-  it("returns the Zod-parsed manifest for the working branch, minting a fresh token", async () => {
+  it("returns the Zod-parsed manifest read from the project's working branch on real GitHub", async () => {
     const owner = await seedUser("ok");
     await connectGithub(owner.userId);
-    const project = await makeProject(owner.userId, { currentBranch: "v0.0.1" });
-    const manifest = {
-      ...buildBlankManifest(),
-      narratorVoice: { description: "Working branch narrator" },
-    };
-    await seedManifest({
-      repo: project.repoName,
-      ref: "v0.0.1",
-      content: JSON.stringify(manifest),
-    });
-
-    await fetch(`${GITHUB_BASE}/__stub/reset`, { method: "POST" });
-    // reset clears the seeded store too, so re-seed AFTER the reset for the count check.
-    await seedManifest({
-      repo: project.repoName,
-      ref: "v0.0.1",
-      content: JSON.stringify(manifest),
-    });
+    const project = await makeProject(owner.userId, { currentBranch: "valid" });
 
     const res = await api(`/projects/${project.id}/manifest`, owner.token);
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.manifest).toEqual(manifest);
-
-    // A fresh installation token was minted for this read (never cached/stored).
-    const calls = await (await fetch(`${GITHUB_BASE}/__stub/calls`)).json();
-    expect(calls.state.installationTokensIssued).toBe(1);
-    expect(
-      calls.byRoute["GET /repos/:owner/:repo/contents/:path"],
-    ).toBe(1);
+    // Byte-exact round-trip through a real commit, real base64 transport (GitHub wraps
+    // it with newlines) and a real Zod parse.
+    expect(body.manifest).toEqual(VALID_MANIFEST);
   });
 
-  it("honors an explicit ?ref= over the project's current branch", async () => {
+  it("honors an explicit ?ref= over the project's current branch, using REAL GitHub ref semantics", async () => {
     const owner = await seedUser("ref");
     await connectGithub(owner.userId);
-    const project = await makeProject(owner.userId, { currentBranch: "v0.0.1" });
+    const project = await makeProject(owner.userId, { currentBranch: "valid" });
 
-    const working = { ...buildBlankManifest(), narratorVoice: { description: "working" } };
-    const other = { ...buildBlankManifest(), narratorVoice: { description: "v0.0.2 branch" } };
-    await seedManifest({
-      repo: project.repoName,
-      ref: "v0.0.1",
-      content: JSON.stringify(working),
-    });
-    await seedManifest({
-      repo: project.repoName,
-      ref: "v0.0.2",
-      content: JSON.stringify(other),
-    });
+    // Both refs really exist and really hold different bytes, so this now exercises
+    // GitHub's own `?ref=` resolution rather than a stub's keyed map.
+    const working = await api(`/projects/${project.id}/manifest`, owner.token);
+    expect((await working.json()).manifest).toEqual(VALID_MANIFEST);
 
-    const res = await api(`/projects/${project.id}/manifest?ref=v0.0.2`, owner.token);
+    const res = await api(`/projects/${project.id}/manifest?ref=other`, owner.token);
     expect(res.status).toBe(200);
-    expect((await res.json()).manifest).toEqual(other);
+    expect((await res.json()).manifest).toEqual(OTHER_MANIFEST);
   });
 
   // ----------------------------------------------------- corrupted → typed 422
@@ -226,12 +261,7 @@ describe("e2e: manifest read", () => {
   it("returns a typed 422 for a manifest that is not valid JSON", async () => {
     const owner = await seedUser("badjson");
     await connectGithub(owner.userId);
-    const project = await makeProject(owner.userId, { currentBranch: "v0.0.1" });
-    await seedManifest({
-      repo: project.repoName,
-      ref: "v0.0.1",
-      content: "{ this is not valid json",
-    });
+    const project = await makeProject(owner.userId, { currentBranch: "badjson" });
 
     const res = await api(`/projects/${project.id}/manifest`, owner.token);
     expect(res.status).toBe(422);
@@ -241,12 +271,7 @@ describe("e2e: manifest read", () => {
   it("returns a typed 422 for JSON that fails ProjectManifestSchema", async () => {
     const owner = await seedUser("badschema");
     await connectGithub(owner.userId);
-    const project = await makeProject(owner.userId, { currentBranch: "v0.0.1" });
-    await seedManifest({
-      repo: project.repoName,
-      ref: "v0.0.1",
-      content: JSON.stringify({ ...buildBlankManifest(), manifestVersion: 2 }),
-    });
+    const project = await makeProject(owner.userId, { currentBranch: "badschema" });
 
     const res = await api(`/projects/${project.id}/manifest`, owner.token);
     expect(res.status).toBe(422);
@@ -255,39 +280,52 @@ describe("e2e: manifest read", () => {
 
   // ------------------------------------------------------------- 404 / 409 / 401
 
-  it("404s when the manifest file is absent on the ref", async () => {
+  it("404s when the manifest file is absent on an EXISTING ref", async () => {
     const owner = await seedUser("missing");
     await connectGithub(owner.userId);
-    const project = await makeProject(owner.userId, { currentBranch: "v0.0.1" });
-    // No seedManifest for this repo/ref.
+    // Branch `absent` exists (asserted at seed time) but carries no manifest, so this
+    // is a real Contents 404 for the file — not for the ref.
+    const project = await makeProject(owner.userId, { currentBranch: "absent" });
 
     const res = await api(`/projects/${project.id}/manifest`, owner.token);
     expect(res.status).toBe(404);
     expect((await res.json()).error).toBe("manifest_not_found");
   });
 
-  it("409s when the project owner has no GitHub connection", async () => {
+  it("404s when the REF itself does not exist (a distinct real-GitHub 404 path)", async () => {
+    const owner = await seedUser("badref");
+    await connectGithub(owner.userId);
+    const project = await makeProject(owner.userId, { currentBranch: "valid" });
+
+    const res = await api(
+      `/projects/${project.id}/manifest?ref=no-such-branch-${stamp()}`,
+      owner.token,
+    );
+    expect(res.status).toBe(404);
+    expect((await res.json()).error).toBe("manifest_not_found");
+  });
+
+  it("409s when the project owner has no GitHub connection — ZERO GitHub egress", async () => {
+    // No fixture is seeded for this case on purpose: the 409 short-circuits in the api
+    // before any GitHub call. The stub era seeded a manifest here that could never be
+    // read, which obscured the fact that this path needs no provider at all.
     const owner = await seedUser("noconn");
-    const project = await makeProject(owner.userId, { currentBranch: "v0.0.1" });
-    await seedManifest({
-      repo: project.repoName,
-      ref: "v0.0.1",
-      content: JSON.stringify(buildBlankManifest()),
-    });
+    const project = await makeProject(owner.userId, { currentBranch: "valid" });
 
     const res = await api(`/projects/${project.id}/manifest`, owner.token);
     expect(res.status).toBe(409);
   });
 
-  it("404s a cross-owner project (never 403) and 401s without a bearer token", async () => {
+  it("404s a cross-owner project (never 403) and 401s without a bearer token — pure authz, zero egress", async () => {
     const owner = await seedUser("owner");
     const other = await seedUser("other");
     await connectGithub(other.userId);
-    const project = await makeProject(owner.userId, { currentBranch: "v0.0.1" });
+    const project = await makeProject(owner.userId, { currentBranch: "valid" });
 
     expect(
       (await api(`/projects/${project.id}/manifest`, other.token)).status,
     ).toBe(404);
     expect((await api(`/projects/${project.id}/manifest`)).status).toBe(401);
   });
+
 });

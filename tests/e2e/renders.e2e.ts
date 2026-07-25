@@ -41,8 +41,10 @@ import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
 // for zero new information.
 //
 // ZERO provider egress: the API render path makes no OpenRouter / Gloo / YouVersion /
-// GitHub calls. Infra (postgres + minio + minio-init) via tests/e2e/global-setup.ts;
-// `git-server` is deliberately NOT needed (no real clone happens here).
+// GitHub calls. Infra (postgres + minio + minio-init) via tests/e2e/global-setup.ts.
+// Task 62 repointed every GitHub-touching api e2e at real github.com and retired the
+// github-stub + git-server fixtures; this spec is UNAFFECTED because it never needed
+// either, and it needs no GitHub credential for the same reason.
 //
 // Assumes the root Compose `dbos` container is NOT running (no competing render worker) —
 // the same standing assumption ai-generations.e2e.ts and project-jobs.e2e.ts make.
