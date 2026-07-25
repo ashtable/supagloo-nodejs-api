@@ -20,6 +20,7 @@ import { ProjectJobsService } from "./jobs/project-jobs-service";
 import { AiGenerationsService } from "./ai/ai-generations-service";
 import { makeGithubUserAuthClient } from "./connections/github-user-auth-client";
 import { RepoProvisioningService } from "./projects/repo-provisioning-service";
+import { RendersService } from "./renders/renders-service";
 
 /**
  * Process entry point: validate the environment (fail-fast), build the app with
@@ -113,6 +114,18 @@ async function main(): Promise<void> {
     cancel: jobEnqueuer.cancel,
   });
 
+  // Renders (design-delta §2.7/§6c/§8): create + enqueue on the `render` queue, poll,
+  // cancel, and presign the completed output. Reuses the same enqueue-only DBOS client
+  // (its `cancel` seam backs POST /:id/cancel → DBOSClient.cancelWorkflow) and delegates
+  // download presigning to the already-built FilesService, so `renders/{id}/…` keys have
+  // exactly ONE ownership rule and ONE signer in the process.
+  const rendersService = new RendersService({
+    prisma,
+    enqueue: jobEnqueuer.enqueue,
+    cancel: jobEnqueuer.cancel,
+    presignDownload: (userId, key) => filesService.presignDownload(userId, key),
+  });
+
   // Create-new-repo JIT hop (design-delta §2.3/§6b): the zero-storage user-token
   // dance that creates the repo before delegating to the scaffold create path.
   const githubUserAuthClient = makeGithubUserAuthClient({
@@ -149,6 +162,7 @@ async function main(): Promise<void> {
     projectJobs: { service: projectJobsService },
     aiGenerations: { service: aiGenerationsService },
     repoProvisioning: { service: repoProvisioningService },
+    renders: { service: rendersService },
   });
 
   app.addHook("onClose", async () => {
