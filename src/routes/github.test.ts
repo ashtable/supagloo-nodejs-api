@@ -1,11 +1,14 @@
+import { generateKeyPairSync } from "node:crypto";
 import { describe, it, expect, afterEach } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import {
   serializerCompiler,
   validatorCompiler,
 } from "fastify-type-provider-zod";
+import { mintInstallationToken } from "@supagloo/database-lib";
 import { bearerAuthPlugin } from "../auth/bearer-auth";
 import { registerGithubConnectionRoutes, registerGithubRepoRoutes } from "./github";
+import { GithubAppRequestError } from "../connections/github-app-client";
 import {
   InstallationVerificationError,
   GithubNotConnectedError,
@@ -212,5 +215,146 @@ describe("GitHub routes — error mapping", () => {
       headers: BEARER,
     });
     expect(res.statusCode).toBe(400);
+  });
+});
+
+// ───────────────────── upstream GitHub failures never become OUR status ──────
+//
+// Fastify's default error handler derives the reply status from the thrown error:
+// `error.status` first, then `error.statusCode`
+// (`fastify/lib/error-handler.js` `setErrorHeaders`). This app registers NO
+// `setErrorHandler`, so any error escaping a handler dictates the wire status by
+// whatever fields it happens to carry.
+//
+// `GET /v1/github/repos` reaches GitHub twice — `mintInstallationToken` (db-lib) and
+// the listing walk (`GithubAppRequestError`) — and NEITHER `GithubConnectionService`
+// nor this route catches either class. A GitHub **401** on the token exchange (a wrong
+// App credential, a revoked install) was therefore replied to the browser as OUR 401 —
+// telling the caller to re-authenticate, indistinguishable from a real session expiry,
+// when the caller's session was fine and OUR credential was the broken one. A 404
+// became a spurious "not found".
+//
+// The rule this suite pins: an upstream provider failure is **502**, always, and no
+// provider error class can dictate our status whatever its fields are named.
+
+/** A real RSA key so db-lib's App-JWT signing is genuinely exercised. */
+const { privateKey: PRIVATE_KEY } = generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  privateKeyEncoding: { type: "pkcs1", format: "pem" },
+  publicKeyEncoding: { type: "spki", format: "pem" },
+});
+
+/**
+ * A GENUINE db-lib `GithubAppError` — the exact object production throws — obtained by
+ * running `mintInstallationToken` against a hostile fake fetch. Deliberately NOT a
+ * hand-rolled stand-in: a stand-in would carry whichever fields this test chose, and the
+ * whole question here is which fields the REAL error carries onto the wire.
+ */
+async function realTokenExchangeError(status: number): Promise<unknown> {
+  return mintInstallationToken({
+    appId: "123456",
+    privateKey: PRIVATE_KEY,
+    installationId: "42",
+    apiBaseUrl: "https://api.github.com",
+    maxAttempts: 1,
+    sleepImpl: async () => {},
+    fetchImpl: (async () =>
+      new Response(JSON.stringify({ message: "Bad credentials" }), {
+        status,
+      })) as unknown as typeof fetch,
+  }).then(
+    () => {
+      throw new Error(`expected a ${status} token exchange to reject`);
+    },
+    (err: unknown) => err,
+  );
+}
+
+describe("GitHub routes — an upstream status never becomes the reply status", () => {
+  let app: FastifyInstance | undefined;
+  afterEach(async () => {
+    if (app) await app.close();
+    app = undefined;
+  });
+
+  for (const upstream of [401, 404, 500]) {
+    it(`repos replies 502 when db-lib's GithubAppError carries an upstream ${upstream}`, async () => {
+      const err = await realTokenExchangeError(upstream);
+      app = await buildApp(
+        makeFakeService({
+          listRepos: async () => {
+            throw err;
+          },
+        }),
+      );
+      const res = await app.inject({
+        method: "GET",
+        url: "/github/repos",
+        headers: BEARER,
+      });
+      expect(res.statusCode).toBe(502);
+      expect(res.json().error).toBe("github_upstream_failed");
+    });
+  }
+
+  it("repos replies 502 when the client's own GithubAppRequestError escapes", async () => {
+    app = await buildApp(
+      makeFakeService({
+        listRepos: async () => {
+          throw new GithubAppRequestError("listing walk failed: 401", {
+            upstreamStatus: 401,
+          });
+        },
+      }),
+    );
+    const res = await app.inject({
+      method: "GET",
+      url: "/github/repos",
+      headers: BEARER,
+    });
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toBe("github_upstream_failed");
+  });
+
+  it("repos replies 502 even if a future db-lib re-adds a literal `status` field", async () => {
+    // Defence in depth, and the reason the route catches by CLASS rather than trusting
+    // the error's own `statusCode`. If the rename this row made is ever reverted
+    // upstream — a one-word change in another repo, invisible from here — the route
+    // must still refuse to leak GitHub's status.
+    const err = (await realTokenExchangeError(401)) as Record<string, unknown>;
+    Object.defineProperty(err, "status", { value: 401, enumerable: false });
+    app = await buildApp(
+      makeFakeService({
+        listRepos: async () => {
+          throw err;
+        },
+      }),
+    );
+    const res = await app.inject({
+      method: "GET",
+      url: "/github/repos",
+      headers: BEARER,
+    });
+    expect(res.statusCode).toBe(502);
+  });
+
+  it("callback replies 502 when the installation verify fails upstream", async () => {
+    app = await buildApp(
+      makeFakeService({
+        connectFromCallback: async () => {
+          throw new GithubAppRequestError("verify failed: 500", {
+            upstreamStatus: 500,
+          });
+        },
+      }),
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: "/connections/github/callback",
+      headers: BEARER,
+      payload: { installationId: "42" },
+    });
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toBe("github_upstream_failed");
   });
 });

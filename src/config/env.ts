@@ -126,9 +126,17 @@ const baseEnvSchema = z.object({
   //
   // It is NOT GITHUB_E2E_PAT_TOKEN. That one is a broad classic-`repo` credential over
   // an account holding the user's real repositories, and §11.8's "it never enters any
-  // container" property stays intact. This is a purpose-built fine-grained token with
-  // repository-CREATION rights only and deliberately no `delete_repo` (the cleanup
-  // script archives, never deletes).
+  // container" property stays intact — this is a SEPARATE, independently revocable
+  // value, which is the only sense in which it is "narrower".
+  //
+  // It is NOT a fine-grained "creation-only, no `delete_repo`" token; an earlier
+  // revision of this comment claimed that and it is unobtainable. Any GitHub token
+  // able to CREATE repositories can also DELETE them (fine-grained
+  // `Administration: write` is the same permission `DELETE /repos/{o}/{r}` requires,
+  // and `delete_repo` is a classic-PAT-only scope). What limits the exposure is the
+  // double gate, the fact that the value is read ONLY when that route registers, and
+  // the route's timing-safe check of the POSTed client_id/client_secret against
+  // GITHUB_APP_CLIENT_ID/GITHUB_APP_CLIENT_SECRET below. See design-delta §11.8.
   GITHUB_E2E_EXCHANGE_TOKEN: z.string().optional(),
 
   // Task #11 GitHub App (design-delta §2.3/§9-Q1). App-LEVEL secrets/config — one

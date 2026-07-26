@@ -1,11 +1,25 @@
 import { generateKeyPairSync } from "node:crypto";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
+import Fastify, { type FastifyInstance } from "fastify";
+import {
+  serializerCompiler,
+  validatorCompiler,
+} from "fastify-type-provider-zod";
 import { DEFAULT_GITHUB_MAX_ATTEMPTS } from "@supagloo/database-lib";
 import {
   makeGithubAppClient,
+  makeInteractiveGithubAppClient,
   EMPTINESS_PROBE_CONCURRENCY,
+  INTERACTIVE_GITHUB_MAX_ATTEMPTS,
+  INTERACTIVE_GITHUB_RETRY_BUDGET_MS,
   GithubAppRequestError,
 } from "./github-app-client";
+import { bearerAuthPlugin } from "../auth/bearer-auth";
+import {
+  registerGithubConnectionRoutes,
+  registerGithubRepoRoutes,
+} from "../routes/github";
+import { registerManifestRoutes } from "../routes/manifests";
 
 // The GitHub App HTTP client (design-delta §2.3/§6a). Mirrors youversion.ts:
 // injectable fetch, unit-tested with hand-built Response objects (no mocking
@@ -38,6 +52,17 @@ function recordingFetch(
 }
 
 const isJwt = (tok: string) => tok.split(".").length === 3;
+
+/**
+ * "I will read `empty` on every row" — the caller intent plan row 65's probe now
+ * requires (deferred review finding DR2: the probe is opt-in, because
+ * `GET /v1/github/repos` also serves a per-page-load repo COUNT that never reads it).
+ *
+ * Every probe test below passes this DELIBERATELY rather than relying on a default, so
+ * none of them can quietly become vacuous: without it there is no probe to assert on,
+ * and a test that asserts "no probe" would then pass for the wrong reason.
+ */
+const PROBE_ALL = () => true;
 
 describe("makeGithubAppClient.verifyInstallation", () => {
   it("GETs /app/installations/:id with an App JWT and maps the result", async () => {
@@ -184,7 +209,10 @@ describe("makeGithubAppClient.listInstallationRepos", () => {
       fetchImpl,
     });
 
-    const repos = await client.listInstallationRepos({ installationId: "42" });
+    const repos = await client.listInstallationRepos({
+      installationId: "42",
+      deriveEmptinessFor: PROBE_ALL,
+    });
 
     // First mint (App JWT), then list (minted installation token).
     expect(calls[0].url).toBe(
@@ -312,7 +340,10 @@ describe("makeGithubAppClient.listInstallationRepos", () => {
       fetchImpl,
     });
 
-    const repos = await client.listInstallationRepos({ installationId: "42" });
+    const repos = await client.listInstallationRepos({
+      installationId: "42",
+      deriveEmptinessFor: PROBE_ALL,
+    });
 
     // The UNION of both pages, in order — not just the first page.
     expect(repos.map((r) => r.id)).toEqual([101, 102, 103]);
@@ -424,6 +455,7 @@ describe("plan row 65: listInstallationRepos emptiness probe", () => {
 
     const repos = await build(fetchImpl).listInstallationRepos({
       installationId: "42",
+      deriveEmptinessFor: PROBE_ALL,
     });
 
     expect(repos.map((r) => r.name)).toEqual(["two-commits"]);
@@ -449,6 +481,7 @@ describe("plan row 65: listInstallationRepos emptiness probe", () => {
 
     const repos = await build(fetchImpl).listInstallationRepos({
       installationId: "42",
+      deriveEmptinessFor: PROBE_ALL,
     });
 
     expect(repos[0].empty).toBe(true);
@@ -477,6 +510,7 @@ describe("plan row 65: listInstallationRepos emptiness probe", () => {
 
     const repos = await build(fetchImpl).listInstallationRepos({
       installationId: "42",
+      deriveEmptinessFor: PROBE_ALL,
     });
 
     expect(repos[0].empty).toBe(true);
@@ -499,6 +533,7 @@ describe("plan row 65: listInstallationRepos emptiness probe", () => {
 
     const repos = await build(fetchImpl).listInstallationRepos({
       installationId: "42",
+      deriveEmptinessFor: PROBE_ALL,
     });
 
     expect(repos.map((r) => r.empty)).toEqual([true, false]);
@@ -512,6 +547,12 @@ describe("plan row 65: listInstallationRepos emptiness probe", () => {
     // after it: task-62 D9's `expect(total()).toBe(4)` budget assertion (two
     // listings ⇒ exactly TWO mints and TWO listing GETs) survives ONLY on this
     // property. Making it an explicit, named test stops that from being luck.
+    //
+    // `PROBE_ALL` is passed DELIBERATELY (deferred review finding DR2 made the probe
+    // opt-in). Without it this test would still pass — because no probe would be
+    // requested at all — and would then be asserting the opt-in, not the `size > 0`
+    // short-circuit it exists for. The caller here asks for a verdict on every row;
+    // the point is that `size` already answered for all of them.
     const { fetchImpl, calls } = recordingFetch((url) => {
       if (url.endsWith("/access_tokens")) return mintResponse();
       if (isProbe(url)) throw new Error("no probe should have been issued");
@@ -524,6 +565,7 @@ describe("plan row 65: listInstallationRepos emptiness probe", () => {
 
     const repos = await build(fetchImpl).listInstallationRepos({
       installationId: "42",
+      deriveEmptinessFor: PROBE_ALL,
     });
 
     expect(repos.every((r) => r.empty === false)).toBe(true);
@@ -553,6 +595,7 @@ describe("plan row 65: listInstallationRepos emptiness probe", () => {
 
     const repos = await build(fetchImpl).listInstallationRepos({
       installationId: "42",
+      deriveEmptinessFor: PROBE_ALL,
     });
 
     // Nothing thrown, nothing dropped, and the `size === 0` fallback stands.
@@ -594,7 +637,10 @@ describe("plan row 65: listInstallationRepos emptiness probe", () => {
 
     let settled = false;
     const listing = build(fetchImpl)
-      .listInstallationRepos({ installationId: "42" })
+      .listInstallationRepos({
+        installationId: "42",
+        deriveEmptinessFor: PROBE_ALL,
+      })
       .then((r) => {
         settled = true;
         return r;
@@ -626,6 +672,7 @@ describe("plan row 65: listInstallationRepos emptiness probe", () => {
 
     const repos = await build(fetchImpl).listInstallationRepos({
       installationId: "42",
+      deriveEmptinessFor: PROBE_ALL,
     });
 
     expect(repos[0].empty).toBe(true);
@@ -830,8 +877,14 @@ describe("task-62 D9: fresh-installation-token-per-call (was a github-stub count
       fetchImpl,
     });
 
-    await client.listInstallationRepos({ installationId: "77" });
-    await client.listInstallationRepos({ installationId: "77" });
+    await client.listInstallationRepos({
+      installationId: "77",
+      deriveEmptinessFor: PROBE_ALL,
+    });
+    await client.listInstallationRepos({
+      installationId: "77",
+      deriveEmptinessFor: PROBE_ALL,
+    });
 
     // No caching across calls: one exchange per listing, never reused.
     expect(count("POST /app/installations/77/access_tokens")).toBe(2);
@@ -845,6 +898,9 @@ describe("task-62 D9: fresh-installation-token-per-call (was a github-stub count
     // are zero size:0 candidates". If this ever goes to 5 or 6, do NOT raise the
     // number: the probe has started firing where it should not, and D9's whole
     // request-budget assertion would be silently retired by the edit.
+    //
+    // Both calls pass `PROBE_ALL` on purpose (DR2 made the probe opt-in): the budget
+    // must hold for the MOST expensive caller, not merely for one that opted out.
     expect(total()).toBe(4);
   });
 
@@ -1126,7 +1182,10 @@ describe("task-62 §11.6: real-GitHub failure shapes (injected fetch, zero egres
       sleepImpl: async (ms) => {
         sleeps.push(ms);
       },
-    }).listInstallationRepos({ installationId: "77" });
+    }).listInstallationRepos({
+      installationId: "77",
+      deriveEmptinessFor: PROBE_ALL,
+    });
 
     expect(repos.map((r) => r.name)).toEqual(["a", "b"]);
     expect(page2Attempts).toBe(2);
@@ -1431,6 +1490,7 @@ describe("plan row 64: bounded rate-limit backoff (injected sleep, zero egress)"
 
     const repos = await buildWithSleep(fetchImpl, sleeps).listInstallationRepos({
       installationId: "77",
+      deriveEmptinessFor: PROBE_ALL,
     });
 
     expect(calls.filter((c) => isProbe(c.url))).toHaveLength(1);
@@ -1489,25 +1549,466 @@ describe("plan row 64: bounded rate-limit backoff (injected sleep, zero egress)"
     expect(sleeps).toEqual([]);
   });
 
-  it("every one of the three throws replies 502, never GitHub's own status (Fastify trap)", async () => {
+  it("none of the three throws carries a Fastify-consumable `status` field", async () => {
+    // The OBJECT-level half of the guard; the WIRE-level half is the describe block
+    // below, and it is the one that actually proves "replies 502".
+    //
     // Fastify's default error handler prefers `error.status` over `error.statusCode`
     // (`fastify/lib/error-handler.js` `setErrorHeaders`), so an error field literally
-    // named `status` would silently become the HTTP reply code — turning a GitHub 401
-    // into OUR 401 and logging the user out on an upstream credential fault. That is why
-    // the upstream value is `upstreamStatus` and the reply value is `statusCode = 502`.
-    // If anyone ever renames `upstreamStatus` to `status`, this test is what stops it.
+    // named `status` silently becomes the HTTP reply code — turning a GitHub 401 into
+    // OUR 401 and logging the user out on an upstream credential fault. That is why the
+    // upstream value is `upstreamStatus` and the reply value is `statusCode = 502`.
+    const deny = (url: string) =>
+      url.endsWith("/access_tokens")
+        ? mintResponse()
+        : new Response(JSON.stringify({ message: "Bad credentials" }), {
+            status: 401,
+          });
     const sleeps: number[] = [];
-    const { fetchImpl } = recordingFetch(
-      () => new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401 }),
-    );
-    const err = await buildWithSleep(fetchImpl, sleeps)
-      .verifyInstallation("77")
-      .then(
+    const build = () => buildWithSleep(recordingFetch(deny).fetchImpl, sleeps);
+    const catchIt = (p: Promise<unknown>) =>
+      p.then(
         () => null,
         (e: unknown) => e as GithubAppRequestError & { status?: number },
       );
-    expect(err?.statusCode).toBe(502);
-    expect(err?.upstreamStatus).toBe(401);
-    expect(err?.status).toBeUndefined();
+
+    // All THREE call paths, not just the verify — the sibling test above already
+    // loops over all three, and this one used to check only one of them.
+    for (const err of [
+      await catchIt(build().verifyInstallation("77")),
+      await catchIt(build().listInstallationRepos({ installationId: "77" })),
+      await catchIt(
+        build().getRepositoryFileContents({
+          installationId: "77",
+          owner: "octo",
+          repo: "widget",
+          path: "supagloo.project.json",
+          ref: "main",
+        }),
+      ),
+    ]) {
+      expect(err).toBeInstanceOf(GithubAppRequestError);
+      expect(err?.statusCode).toBe(502);
+      expect(err?.upstreamStatus).toBe(401);
+      expect(err?.status).toBeUndefined();
+    }
   });
+});
+
+// ===========================================================================
+// plan row 65 FOLLOW-UP (deferred review finding DR2) — the probe is OPT-IN.
+//
+// Row 65 shipped the probe inside `listInstallationRepos`, i.e. over the FULL
+// installation listing, BEFORE `GithubConnectionService.listRepos` applies
+// `filterRepos(repos, {filter, q})`. Two costs nobody booked:
+//
+//   1. `GET /v1/github/repos` is NOT only the repo picker. nextjs
+//      `app/_components/session-provider.tsx` calls `fetchGithubRepoCount()` from an
+//      effect that runs on EVERY hard page load of every page, purely to render an
+//      "N repos accessible" count — a caller that never reads `empty` at all. On the
+//      live installation (582 repos, 6 pages, 55 of them `size: 0`) that made one
+//      page load ~62 GitHub requests against a ~5,000/hour installation budget:
+//      ~80 page loads to exhaustion, down from ~700. And the listing GETs (unlike the
+//      probes) THROW on exhaustion, so the picker fails outright rather than degrading.
+//   2. `?filter=empty&q=<name>` narrows to a single repo and still paid the whole
+//      55-candidate fan-out.
+//
+// The fix is intent, threaded down: `deriveEmptinessFor` names the repos the caller
+// will actually read `empty` on. Omitted ⇒ ZERO probes. The row-65 properties are
+// untouched and still pinned by their own tests above — the `size > 0` short-circuit,
+// the concurrency cap, null-is-UNKNOWN, and the deliberate non-retry.
+// ===========================================================================
+
+describe("plan row 65 follow-up (DR2): the emptiness probe is opt-in per caller", () => {
+  const build = (fetchImpl: typeof fetch) =>
+    makeGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+    });
+
+  it("issues NO probe when the caller does not ask for an emptiness verdict", async () => {
+    // THE page-load path: `GET /v1/github/repos` with no `filter=empty` and no `q`.
+    // Every repo here is a `size: 0` candidate, so the pre-fix client would have
+    // probed all four. The caller never reads `empty`, so the correct cost is zero.
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) throw new Error("no probe should have been issued");
+      return listingResponse([
+        rawRepo(101, "a", 0),
+        rawRepo(102, "b", 0),
+        rawRepo(103, "c", 0),
+        rawRepo(104, "d", 0),
+      ]);
+    });
+
+    const repos = await build(fetchImpl).listInstallationRepos({
+      installationId: "42",
+    });
+
+    expect(calls.filter((c) => isProbe(c.url))).toHaveLength(0);
+    // 1 mint + 1 listing GET, and NOTHING else.
+    expect(calls).toHaveLength(2);
+    // The provisional `size`-derived verdict is what is returned — exactly the
+    // pre-row-65 answer, which is all a caller that does not read `empty` needs.
+    expect(repos.map((r) => r.empty)).toEqual([true, true, true, true]);
+  });
+
+  it("probes ONLY the repos that survive the caller's narrowing", async () => {
+    // `?filter=empty&q=target` must cost ONE probe, not one per `size: 0` repo in
+    // the whole installation.
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) {
+        return new Response(JSON.stringify([commitEntry("readme")]), { status: 200 });
+      }
+      return listingResponse([
+        rawRepo(101, "noise-one", 0),
+        rawRepo(102, "target", 0),
+        rawRepo(103, "noise-two", 0),
+      ]);
+    });
+
+    const repos = await build(fetchImpl).listInstallationRepos({
+      installationId: "42",
+      deriveEmptinessFor: (repo) => repo.name === "target",
+    });
+
+    const probes = calls.filter((c) => isProbe(c.url));
+    expect(probes).toHaveLength(1);
+    expect(probes[0].url).toBe(
+      "https://api.github.com/repos/acme/target/commits?per_page=2",
+    );
+    // Un-probed rows keep the provisional verdict; nothing is dropped.
+    expect(repos.map((r) => r.name)).toEqual(["noise-one", "target", "noise-two"]);
+  });
+
+  it("still short-circuits size > 0 even when the caller admits every repo", async () => {
+    // The predicate NARROWS; it never widens. `deriveEmptinessFor: () => true` must
+    // not resurrect a probe for a repo whose `size` already answered definitively.
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) {
+        return new Response(JSON.stringify([commitEntry("readme")]), { status: 200 });
+      }
+      return listingResponse([
+        rawRepo(101, "candidate", 0),
+        rawRepo(102, "populated", 512),
+      ]);
+    });
+
+    await build(fetchImpl).listInstallationRepos({
+      installationId: "42",
+      deriveEmptinessFor: () => true,
+    });
+
+    const probes = calls.filter((c) => isProbe(c.url));
+    expect(probes).toHaveLength(1);
+    expect(probes[0].url).toContain("/repos/acme/candidate/commits");
+  });
+});
+
+// ===========================================================================
+// plan row 64 FOLLOW-UP (deferred review finding DR3) — the INTERACTIVE budget.
+//
+// Row 64 wrapped every non-fallback request in `withGithubRetry` with NO
+// `maxAttempts` and no deadline, so each wrapped call could sleep up to 3 x 60 s.
+// `listInstallationRepos` makes 1 wrapped mint + N wrapped page GETs (6 measured)
+// and `getRepositoryFileContents` makes 2 — each retried INDEPENDENTLY, so a
+// throttled installation could hold `GET /v1/github/repos` (and the browser
+// connection behind it) open for ~24 minutes. Before row 64 these routes failed fast.
+//
+// D64.1 reasoned only about the DBOS step budget. The same primitive now sits on a
+// page-load path, and a page load must fail fast: there is a human waiting, and the
+// repo picker degrades to "try again" far better than to a hung tab.
+//
+// So the API constructs an INTERACTIVE client (`makeInteractiveGithubAppClient`,
+// wired in `src/server.ts`) with a much tighter budget, while db-lib's defaults —
+// and therefore every DBOS workflow, where a slow success genuinely beats a fast
+// failure — are left exactly as they are.
+// ===========================================================================
+
+describe("plan row 64 follow-up (DR3): the interactive client's tighter budget", () => {
+  it("keeps the interactive budget strictly under db-lib's workflow default", () => {
+    expect(INTERACTIVE_GITHUB_MAX_ATTEMPTS).toBeLessThan(
+      DEFAULT_GITHUB_MAX_ATTEMPTS,
+    );
+    // A whole listing's in-request sleeping, bounded. db-lib's per-request worst case
+    // is 3 x 60s = 180s, and a 7-request listing multiplied that by seven.
+    expect(INTERACTIVE_GITHUB_RETRY_BUDGET_MS).toBeLessThan(180_000);
+  });
+
+  it("retries a throttled request FEWER times than the db-lib default", async () => {
+    const sleeps: number[] = [];
+    const { fetchImpl, calls } = recordingFetch(
+      () => new Response("boom", { status: 500 }),
+    );
+    const err = await makeInteractiveGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
+    })
+      .verifyInstallation("42")
+      .then(
+        () => null,
+        (e: unknown) => e as GithubAppRequestError,
+      );
+
+    expect(err).toBeInstanceOf(GithubAppRequestError);
+    expect(calls).toHaveLength(INTERACTIVE_GITHUB_MAX_ATTEMPTS);
+    expect(sleeps).toHaveLength(INTERACTIVE_GITHUB_MAX_ATTEMPTS - 1);
+    // Strictly fewer than the workflow client would have made.
+    expect(calls.length).toBeLessThan(DEFAULT_GITHUB_MAX_ATTEMPTS);
+  });
+
+  it("caps TOTAL in-request sleeping across a WHOLE listing, not per request", async () => {
+    // The defect DR3 names: the mint and each of N pages had INDEPENDENT budgets, so
+    // the wall clock multiplied by the page count. One deadline, shared, is what makes
+    // the route's worst case a property of the route rather than of the account size.
+    const sleeps: number[] = [];
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      // EVERY page answers a 60s secondary-limit throttle, forever, across a
+      // multi-page walk. Unbounded, this is (1 + pages) x 3 x 60s of sleeping.
+      return new Response(
+        JSON.stringify({ message: "You have exceeded a secondary rate limit" }),
+        { status: 403, headers: { "retry-after": "60" } },
+      );
+    });
+
+    await makeInteractiveGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
+    })
+      .listInstallationRepos({ installationId: "77" })
+      .catch(() => null);
+
+    const total = sleeps.reduce((a, b) => a + b, 0);
+    expect(total).toBeLessThanOrEqual(INTERACTIVE_GITHUB_RETRY_BUDGET_MS);
+    // ...and the budget is actually SPENT (this is a real throttle, not a no-op path).
+    expect(total).toBeGreaterThan(0);
+  });
+
+  it("shares ONE budget across the mint AND every page of a listing", async () => {
+    // Proof the deadline spans the whole call: the mint burns the budget first, so the
+    // page GET that follows it has nothing left to sleep with.
+    const sleeps: number[] = [];
+    let mintAttempts = 0;
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) {
+        mintAttempts += 1;
+        if (mintAttempts === 1) {
+          return new Response(JSON.stringify({ message: "secondary rate limit" }), {
+            status: 403,
+            headers: { "retry-after": "3600" },
+          });
+        }
+        return mintResponse();
+      }
+      return new Response(JSON.stringify({ message: "rate limited" }), {
+        status: 429,
+        headers: { "retry-after": "60" },
+      });
+    });
+
+    await makeInteractiveGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
+    })
+      .listInstallationRepos({ installationId: "77" })
+      .catch(() => null);
+
+    // The mint's own throttle consumed the entire shared budget (clamped from the
+    // 3600s GitHub asked for), so the listing walk that followed slept 0.
+    expect(sleeps[0]).toBe(INTERACTIVE_GITHUB_RETRY_BUDGET_MS);
+    expect(sleeps.slice(1).every((ms) => ms === 0)).toBe(true);
+  });
+
+  it("[GUARD] leaves db-lib's full budget intact when no interactive budget is set", () => {
+    // The DBOS workflows must keep the 4-attempt / 60s-per-sleep behaviour: there is
+    // no human waiting on a durable step, and a slow success beats a fast failure.
+    // The row-64 tests above assert that verbatim (4 attempts, [500, 1000, 2000]) on a
+    // client built WITHOUT the interactive options, so this is a signpost to them.
+    expect(DEFAULT_GITHUB_MAX_ATTEMPTS).toBe(4);
+  });
+});
+
+// ════════════════════════ THE FASTIFY TRAP, AT THE WIRE ══════════════════════
+//
+// Asserting fields on an error object does not prove what a browser receives. This
+// block drives each of the client's three call paths through the REAL route that
+// reaches it, with a hostile fake fetch, and asserts the status `app.inject` sees:
+//
+//   verifyInstallation        → POST /connections/github/callback
+//   listInstallationRepos     → GET  /github/repos
+//   getRepositoryFileContents → GET  /projects/:id/manifest
+//
+// Two DIFFERENT error classes escape those paths and both must be caught:
+//   • `GithubAppRequestError` — this client's own non-2xx throw. Names the upstream
+//     status `upstreamStatus` precisely so Fastify cannot consume it.
+//   • db-lib's `GithubAppError` — thrown by `mintInstallationToken`, which runs FIRST
+//     inside both `listInstallationRepos` and `getRepositoryFileContents`. This is the
+//     class where the trap was actually LIVE: it carried the upstream status in a field
+//     named `status` until plan row 63-68's follow-up renamed it, so a GitHub 401 on the
+//     token exchange was replied to the browser as a 401 (telling the caller to
+//     re-authenticate, indistinguishable from a real session expiry, when OUR credential
+//     was the broken one) and a 404 as a spurious not-found.
+//
+// The route-level catch is what makes this hold regardless of the field names any
+// present or future provider error class happens to use.
+
+/** Auth that admits exactly one bearer token, so these cases isolate the error path. */
+const wireAuthService = {
+  authenticate: async (token: string) =>
+    token === "valid" ? { user: { id: "u1" }, session: { id: "s1" } } : null,
+};
+
+/**
+ * Mount the three real routes over the real client, wired through fake services that do
+ * nothing but delegate — the same single call each real service makes — so the client's
+ * raw throw reaches the route exactly as it does in production.
+ */
+async function buildWireApp(fetchImpl: typeof fetch): Promise<FastifyInstance> {
+  const client = makeGithubAppClient({
+    apiBaseUrl: "https://api.github.com",
+    appId: APP_ID,
+    privateKey: PRIVATE_KEY,
+    fetchImpl,
+    sleepImpl: async () => {},
+  });
+  const unreachable = () => {
+    throw new Error("the hostile fetch was expected to fail this call");
+  };
+  const githubService = {
+    installUrl: () => "https://github.com/apps/supagloo-app/installations/new",
+    connectFromCallback: async (_userId: string, installationId: string) => {
+      await client.verifyInstallation(installationId);
+      return unreachable();
+    },
+    disconnect: async () => {},
+    listRepos: async () => {
+      await client.listInstallationRepos({ installationId: "77" });
+      return unreachable();
+    },
+  } as never;
+  const manifestService = {
+    readManifest: async () => {
+      await client.getRepositoryFileContents({
+        installationId: "77",
+        owner: "acme",
+        repo: "widget",
+        path: "supagloo.project.json",
+        ref: "main",
+      });
+      return unreachable();
+    },
+  } as never;
+
+  const app = Fastify();
+  app.setValidatorCompiler(validatorCompiler);
+  app.setSerializerCompiler(serializerCompiler);
+  await app.register(bearerAuthPlugin, { authService: wireAuthService as never });
+  registerGithubConnectionRoutes(app, { service: githubService });
+  registerGithubRepoRoutes(app, { service: githubService });
+  registerManifestRoutes(app, { service: manifestService });
+  await app.ready();
+  return app;
+}
+
+const WIRE_BEARER = { authorization: "Bearer valid" };
+
+/** The three (route, request) pairs, one per client call path. */
+const WIRE_PATHS = [
+  {
+    what: "verifyInstallation via POST /connections/github/callback",
+    inject: {
+      method: "POST" as const,
+      url: "/connections/github/callback",
+      headers: WIRE_BEARER,
+      payload: { installationId: "77" },
+    },
+  },
+  {
+    what: "listInstallationRepos via GET /github/repos",
+    inject: {
+      method: "GET" as const,
+      url: "/github/repos",
+      headers: WIRE_BEARER,
+    },
+  },
+  {
+    what: "getRepositoryFileContents via GET /projects/:id/manifest",
+    inject: {
+      method: "GET" as const,
+      url: "/projects/p1/manifest",
+      headers: WIRE_BEARER,
+    },
+  },
+];
+
+describe("the Fastify trap, at the wire: every GitHub failure replies 502", () => {
+  let app: FastifyInstance | undefined;
+  afterEach(async () => {
+    if (app) await app.close();
+    app = undefined;
+  });
+
+  // ── The client's OWN throw (`GithubAppRequestError`). The mint succeeds so the
+  //    failure lands on the request after it. 404 is excluded deliberately: it is a
+  //    real product outcome on two of these paths (no such installation → 400; no such
+  //    file/branch → the caller's 404), not an upstream fault.
+  for (const upstream of [401, 403, 500]) {
+    for (const path of WIRE_PATHS) {
+      it(`${path.what} replies 502 on a GitHub ${upstream}`, async () => {
+        const { fetchImpl } = recordingFetch((url) =>
+          url.endsWith("/access_tokens")
+            ? mintResponse()
+            : new Response(JSON.stringify({ message: "denied" }), {
+                status: upstream,
+              }),
+        );
+        app = await buildWireApp(fetchImpl);
+        const res = await app.inject(path.inject);
+        expect(res.statusCode).toBe(502);
+        expect(res.json().error).toBe("github_upstream_failed");
+      });
+    }
+  }
+
+  // ── db-lib's `GithubAppError`: the TOKEN EXCHANGE itself fails. Only the two minting
+  //    paths can reach it (`verifyInstallation` signs an App JWT and never mints), and
+  //    it is the class where the status hijack was live.
+  for (const upstream of [401, 404, 500]) {
+    for (const path of WIRE_PATHS.slice(1)) {
+      it(`${path.what} replies 502 when the token exchange itself ${upstream}s`, async () => {
+        const { fetchImpl } = recordingFetch(
+          () =>
+            new Response(JSON.stringify({ message: "Bad credentials" }), {
+              status: upstream,
+            }),
+        );
+        app = await buildWireApp(fetchImpl);
+        const res = await app.inject(path.inject);
+        // Not `upstream`. A GitHub 401 here is OUR credential being wrong, not the
+        // caller's session expiring; a GitHub 404 here is not a missing manifest.
+        expect(res.statusCode).toBe(502);
+        expect(res.json().error).toBe("github_upstream_failed");
+      });
+    }
+  }
 });

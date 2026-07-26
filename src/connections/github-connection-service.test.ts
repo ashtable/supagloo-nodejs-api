@@ -175,7 +175,109 @@ describe("GithubConnectionService.listRepos", () => {
       filter: "empty",
     });
 
-    expect(calls.listInstallationRepos).toEqual([{ installationId: "77" }]);
+    expect(calls.listInstallationRepos).toHaveLength(1);
+    expect(calls.listInstallationRepos[0].installationId).toBe("77");
     expect(empty.map((r) => r.id)).toEqual([1]);
+  });
+});
+
+// ===========================================================================
+// deferred review finding DR2 — WHO PAYS FOR THE EMPTINESS PROBE.
+//
+// The row-65 probe fans out over every `size: 0` repo in the FULL installation
+// listing, inside `listInstallationRepos` — i.e. BEFORE this service applies
+// `filterRepos(repos, {filter, q})`. Two costs followed:
+//
+//   1. `GET /v1/github/repos` is not only the repo picker: nextjs's
+//      `SessionProvider` calls it on EVERY hard page load, unfiltered, to render an
+//      "N repos accessible" count that never reads `empty`. On the live installation
+//      that was ~62 GitHub requests per page load (582 repos / 6 pages / 55 `size: 0`)
+//      against a ~5,000/hour budget — ~80 page loads to exhaustion.
+//   2. `?filter=empty&q=<name>` narrows to ONE repo and still paid the full fan-out.
+//
+// This service is where the caller's intent is known, so this is where it is
+// converted into a probe budget: the client is told exactly which repos need an
+// authoritative verdict, and is told NOTHING when the query cannot use one.
+// ===========================================================================
+
+describe("GithubConnectionService.listRepos — probe intent (DR2)", () => {
+  const REPOS = [
+    { id: 1, name: "alpha", fullName: "acme/alpha", owner: "acme", private: true, defaultBranch: "main", empty: true },
+    { id: 2, name: "beta", fullName: "acme/beta", owner: "acme", private: true, defaultBranch: "main", empty: true },
+    { id: 3, name: "alpha-full", fullName: "acme/alpha-full", owner: "acme", private: false, defaultBranch: "main", empty: false },
+  ];
+
+  const connected = () =>
+    makeFakePrisma({ findUnique: () => ({ userId: "u1", installationId: "77" }) });
+
+  /** The predicate the service handed the client, or null when it handed none. */
+  const probeIntent = (calls: any[]) =>
+    (calls[0].deriveEmptinessFor as ((r: any) => boolean) | undefined) ?? null;
+
+  it("asks for NO emptiness verdict on the unnarrowed filter=all listing", async () => {
+    // The `SessionProvider` repo-count call, on every page load. It renders a COUNT;
+    // it never reads `empty`. Zero probes is the only correct cost.
+    const { prisma } = connected();
+    const { client, calls } = makeFakeClient({ listInstallationRepos: () => REPOS });
+
+    await service(prisma, client).listRepos("u1", { filter: "all" });
+
+    expect(probeIntent(calls.listInstallationRepos)).toBeNull();
+  });
+
+  it("asks for a verdict on every candidate when filter=empty carries no q", async () => {
+    // Wireframe 13a's "use existing empty repo" tab: `empty` GATES the picker row, so
+    // the fan-out is genuinely earned here — and it is paid when the user opens that
+    // tab, not on every page load of every page.
+    const { prisma } = connected();
+    const { client, calls } = makeFakeClient({ listInstallationRepos: () => REPOS });
+
+    await service(prisma, client).listRepos("u1", { filter: "empty" });
+
+    const intent = probeIntent(calls.listInstallationRepos);
+    expect(intent).not.toBeNull();
+    expect(REPOS.filter((r) => intent!(r)).map((r) => r.id)).toEqual([1, 2]);
+  });
+
+  it("narrows the verdict set by q, so a single-repo query costs a single probe", async () => {
+    const { prisma } = connected();
+    const { client, calls } = makeFakeClient({ listInstallationRepos: () => REPOS });
+
+    await service(prisma, client).listRepos("u1", { filter: "empty", q: "alpha" });
+
+    const intent = probeIntent(calls.listInstallationRepos);
+    expect(intent).not.toBeNull();
+    // `alpha-full` matches `q` but is not a candidate; `beta` is a candidate but does
+    // not match `q`. Exactly one repo survives BOTH.
+    expect(REPOS.filter((r) => intent!(r)).map((r) => r.id)).toEqual([1]);
+  });
+
+  it("asks for a verdict on a narrowed filter=all query too (q= is a targeted lookup)", async () => {
+    // `?filter=all&q=<exact name>` is how the api e2e reads a specific repo's verdict,
+    // and how a caller checks one repo. Its fan-out is bounded by the narrowing, so
+    // the answer can be authoritative without costing the whole account.
+    const { prisma } = connected();
+    const { client, calls } = makeFakeClient({ listInstallationRepos: () => REPOS });
+
+    await service(prisma, client).listRepos("u1", { filter: "all", q: "alpha" });
+
+    const intent = probeIntent(calls.listInstallationRepos);
+    expect(intent).not.toBeNull();
+    // The predicate is the NARROWING and nothing else: it admits the `q` matches and
+    // rejects `beta`. It deliberately does NOT re-implement the `size > 0`
+    // short-circuit — that stays the client's single responsibility (pinned there by
+    // "still short-circuits size > 0 even when the caller admits every repo"), so the
+    // two layers cannot drift into disagreeing about what "already answered" means.
+    expect(REPOS.filter((r) => intent!(r)).map((r) => r.id)).toEqual([1, 3]);
+    expect(intent!(REPOS[1])).toBe(false);
+  });
+
+  it("treats a blank/whitespace q as no narrowing at all (matches filterRepos)", async () => {
+    const { prisma } = connected();
+    const { client, calls } = makeFakeClient({ listInstallationRepos: () => REPOS });
+
+    await service(prisma, client).listRepos("u1", { filter: "all", q: "   " });
+
+    expect(probeIntent(calls.listInstallationRepos)).toBeNull();
   });
 });

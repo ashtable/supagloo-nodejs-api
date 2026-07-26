@@ -17,6 +17,8 @@ import { z } from "zod";
  *   - `createUserRepo` → `POST {apiBase}/user/repos` with that user token → the repo.
  *   - `addRepoToInstallation` → `PUT {apiBase}/user/installations/:id/repositories/:repoId`
  *     with the same user token (only for `selected`-mode installations).
+ *   - `listInstallationRepos` → `GET {apiBase}/user/installations/:id/repositories`
+ *     with the same user token — the read the visibility gate polls (DR1).
  * The user token is used ONLY inside a single `createRepoAndProject` call and is
  * never persisted anywhere.
  */
@@ -48,6 +50,22 @@ export interface GithubUserAuthClient {
     installationId: string;
     repositoryId: number;
   }): Promise<void>;
+  /**
+   * Every repo full name (`owner/name`) an installation can reach, as seen through the
+   * USER token — the READ analogue of {@link GithubUserAuthClient.addRepoToInstallation}
+   * and the only installation listing this client can reach with the credential it
+   * already holds (`GET /user/installations/:id/repositories` is user-to-server,
+   * answered for the same `repo` scope as that PUT — no App JWT, no installation token,
+   * no new wiring).
+   *
+   * It exists for ONE caller: `RepoProvisioningService`'s bounded visibility gate
+   * between "the repo now exists on GitHub" and "enqueue the scaffold workflow". See
+   * that gate for why absence is not merely a slow start.
+   */
+  listInstallationRepos(args: {
+    token: string;
+    installationId: string;
+  }): Promise<string[]>;
 }
 
 export interface MakeGithubUserAuthClientOptions {
@@ -116,17 +134,26 @@ export class GithubUserAuthExchangeError extends Error {
  * opaque `502 repo_creation_failed` — so a 422 "name already exists", a 401 bad token
  * and a 503 were indistinguishable to anyone reading the reply or the logs. The route's
  * status code and error slug are contract-pinned and do NOT change; what this adds is
- * the upstream `status` plus GitHub's own words, carried through the boundary so the
+ * the upstream status plus GitHub's own words, carried through the boundary so the
  * message can say WHICH upstream failure it was.
+ *
+ * The field is `upstreamStatus`, NEVER `status` (DR5). Fastify's default error handler
+ * prefers an error's `status` property over `statusCode`, so an error carrying GitHub's
+ * status under that name alongside `statusCode = 502` replies to the CLIENT with
+ * GitHub's status the moment it reaches that handler — a 422 "name already exists"
+ * would surface as a 422 on our own contract-pinned 502 endpoint. It is contained today
+ * (the sole caller wraps it in `RepoCreationError`), which is precisely why it was worth
+ * removing before the next call site inherits the trap. db-lib's `GithubAppError` and
+ * `RepoCreationError` use `upstreamStatus` for the same reason; this was the last copy.
  */
 export class GithubCreateRepoError extends Error {
   /** The upstream HTTP status from `POST /user/repos`. */
-  readonly status: number;
+  readonly upstreamStatus: number;
   readonly statusCode = 502;
-  constructor(message: string, opts: { status: number; cause?: unknown }) {
+  constructor(message: string, opts: { upstreamStatus: number; cause?: unknown }) {
     super(message, { cause: opts.cause });
     this.name = "GithubCreateRepoError";
-    this.status = opts.status;
+    this.upstreamStatus = opts.upstreamStatus;
   }
 }
 
@@ -164,6 +191,27 @@ async function readGithubErrorDetail(res: Response): Promise<string> {
 
 const tokenResponseSchema = z.object({
   access_token: z.string().min(1),
+});
+
+/**
+ * `Link: <url>; rel="next"` → `url`, else undefined. GitHub paginates
+ * `/user/installations/:id/repositories` and a brand-new repo is not guaranteed to land
+ * on page 1, so the visibility gate that reads it must walk every page or it can decide
+ * "absent" about a repo that is right there on page 2.
+ */
+function parseNextLink(linkHeader: string | null): string | undefined {
+  if (!linkHeader) return undefined;
+  for (const part of linkHeader.split(",")) {
+    const m = /^\s*<([^>]+)>\s*;\s*rel="?next"?\s*$/.exec(part);
+    if (m) return m[1];
+  }
+  return undefined;
+}
+
+/** `GET /user/installations/:id/repositories` — `{ total_count, repositories[] }`.
+ *  Only `full_name` is read; every other field is ignored on purpose. */
+const installationReposSchema = z.object({
+  repositories: z.array(z.object({ full_name: z.string() }).passthrough()),
 });
 
 const createdRepoSchema = z.object({
@@ -292,7 +340,7 @@ export function makeGithubUserAuthClient(
         throw new GithubCreateRepoError(
           `GitHub create-repo failed for ${name}: ${res.status}` +
             (detail ? ` — ${detail}` : ""),
-          { status: res.status },
+          { upstreamStatus: res.status },
         );
       }
       const raw = createdRepoSchema.parse(await res.json());
@@ -324,6 +372,40 @@ export function makeGithubUserAuthClient(
         );
       }
       // 204 No Content — nothing to parse.
+    },
+
+    async listInstallationRepos({ token, installationId }) {
+      const out: string[] = [];
+      let url: string | undefined =
+        `${apiBaseUrl}/user/installations/${installationId}/repositories?per_page=100`;
+      // A user with 2 000+ installation repos is already implausible; the guard exists
+      // so a malformed `Link` header can never spin this into an infinite loop inside a
+      // request the browser is waiting on.
+      for (let page = 1; url; page += 1) {
+        if (page > 20) {
+          throw new Error(
+            `GitHub list-installation-repos for ${installationId} exceeded 20 pages — ` +
+              "refusing to keep walking Link: rel=next",
+          );
+        }
+        const res: Response = await fetchImpl(url, {
+          headers: {
+            authorization: `token ${token}`,
+            accept: "application/vnd.github+json",
+          },
+        });
+        if (!res.ok) {
+          const detail = await readGithubErrorDetail(res);
+          throw new Error(
+            `GitHub list-installation-repos failed for installation ` +
+              `${installationId}: ${res.status}` + (detail ? ` — ${detail}` : ""),
+          );
+        }
+        const parsed = installationReposSchema.parse(await res.json());
+        for (const repo of parsed.repositories) out.push(repo.full_name);
+        url = parseNextLink(res.headers.get("link"));
+      }
+      return out;
     },
   };
 }

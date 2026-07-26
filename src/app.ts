@@ -7,7 +7,10 @@ import { registerHealthRoutes } from "./routes/health";
 import { bearerAuthPlugin } from "./auth/bearer-auth";
 import { registerAuthRoutes } from "./routes/auth";
 import { registerTestSeedRoute } from "./routes/test-seed";
-import { registerTestGithubOauthRoute } from "./routes/test-github-oauth";
+import {
+  registerTestGithubOauthRoute,
+  type TestGithubOauthDeps,
+} from "./routes/test-github-oauth";
 import {
   registerGithubConnectionRoutes,
   registerGithubRepoRoutes,
@@ -53,14 +56,12 @@ export interface AuthDeps {
  * supplied — but this route registers OUTSIDE `/v1` (the client requests a fixed
  * unversioned `/login/oauth/access_token`), so inheriting that coupling would tie a
  * GitHub seam to whether the session surface happens to be wired.
+ *
+ * Aliased to the route's own dep type rather than re-declared, so the round-4 R5
+ * addition (the App OAuth `client_id`/`client_secret` the route now verifies the
+ * POSTed pair against) cannot be forgotten here and silently fail open.
  */
-export interface TestGithubOauthWiring {
-  env: {
-    NODE_ENV: "development" | "test" | "production";
-    SUPAGLOO_ENABLE_TEST_SEED?: string;
-    GITHUB_E2E_EXCHANGE_TOKEN?: string;
-  };
-}
+export type TestGithubOauthWiring = TestGithubOauthDeps;
 
 /** Dependencies for the GitHub App connection surface (design-delta §2.3/§8).
  *  Registered inside the same bearer-protected `/v1` scope as `auth`, so it is

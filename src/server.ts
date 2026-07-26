@@ -4,7 +4,7 @@ import { loadEnv } from "./config/env";
 import { AuthService } from "./auth/auth-service";
 import { makeYouVersionVerifier } from "./auth/youversion";
 import { SESSION_TTL_MS } from "./auth/tokens";
-import { makeGithubAppClient } from "./connections/github-app-client";
+import { makeInteractiveGithubAppClient } from "./connections/github-app-client";
 import { GithubConnectionService } from "./connections/github-connection-service";
 import { makeOpenRouterClient } from "./connections/openrouter-client";
 import { makeGlooClient } from "./connections/gloo-client";
@@ -37,7 +37,14 @@ async function main(): Promise<void> {
     sessionTtlMs: SESSION_TTL_MS,
   });
 
-  const githubAppClient = makeGithubAppClient({
+  // INTERACTIVE, not the workflow default (deferred review finding DR3). Every route
+  // this client serves — `GET /v1/github/repos` (the repo picker AND the web client's
+  // per-page-load repo count), `POST /v1/connections/github/callback`,
+  // `GET /v1/projects/:id/manifest` — has a browser waiting on it. Plan row 64's
+  // unbounded budget could hold one of those requests open for over twenty minutes on a
+  // throttled installation; the interactive factory caps attempts AND the whole call's
+  // sleeping. db-lib's full budget is untouched and still applies to every DBOS workflow.
+  const githubAppClient = makeInteractiveGithubAppClient({
     apiBaseUrl: env.GITHUB_API_BASE_URL,
     appId: env.GITHUB_APP_ID,
     privateKey: env.GITHUB_APP_PRIVATE_KEY,
@@ -157,11 +164,17 @@ async function main(): Promise<void> {
     // TEST-ONLY (plan row 66). Passing the wiring does NOT enable the route: it is
     // registered only when NODE_ENV !== 'production' AND SUPAGLOO_ENABLE_TEST_SEED
     // === '1', and it throws at boot rather than register without its credential.
+    // The App's OAuth client pair is the SECOND factor (round-4 review R5): the route
+    // verifies the POSTed client_id/client_secret against it, so the credential is not
+    // handed to anyone who can merely reach the published port. It is the same pair
+    // `githubUserAuthClient` above sends, which is why the product path is unaffected.
     testGithubOauth: {
       env: {
         NODE_ENV: env.NODE_ENV,
         SUPAGLOO_ENABLE_TEST_SEED: env.SUPAGLOO_ENABLE_TEST_SEED,
         GITHUB_E2E_EXCHANGE_TOKEN: env.GITHUB_E2E_EXCHANGE_TOKEN,
+        GITHUB_APP_CLIENT_ID: env.GITHUB_APP_CLIENT_ID,
+        GITHUB_APP_CLIENT_SECRET: env.GITHUB_APP_CLIENT_SECRET,
       },
     },
     github: { service: githubService },

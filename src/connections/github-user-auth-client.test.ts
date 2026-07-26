@@ -388,7 +388,13 @@ describe("makeGithubUserAuthClient.createUserRepo", () => {
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(GithubCreateRepoError);
-    expect((err as GithubCreateRepoError).status).toBe(422);
+    // DR5: the field is `upstreamStatus`, NOT `status`. Fastify's default error handler
+    // prefers a `status` property over `statusCode`, so an error carrying GitHub's own
+    // `status` alongside `statusCode = 502` replies with GitHub's status if it ever
+    // escapes to that handler. db-lib's `GithubAppError` and `RepoCreationError` were
+    // both renamed for exactly this reason; this was the last copy of the footgun.
+    expect((err as GithubCreateRepoError).upstreamStatus).toBe(422);
+    expect((err as unknown as { status?: number }).status).toBeUndefined();
     // GitHub's own words survive verbatim — that is the whole point of the typed error.
     expect((err as Error).message).toContain("name already exists on this account");
     expect((err as Error).message).toContain("psalm-121");
@@ -460,5 +466,87 @@ describe("makeGithubUserAuthClient.addRepoToInstallation", () => {
     ).rejects.toThrow(/422/);
     expect(calls).toHaveLength(1);
     expect(calls[0].method).toBe("PUT");
+  });
+});
+
+// ------------------------------------------------------------------------- DR1
+// The READ analogue of `addRepoToInstallation`, and the only installation listing this
+// client can reach with the credential it already holds: `GET
+// /user/installations/:id/repositories` is user-to-server, answered for the same `repo`
+// scope as the PUT. `RepoProvisioningService` polls it between "the repo now exists on
+// GitHub" and "enqueue the scaffold workflow", because dbos's `ensureRepoReachable`
+// treats absence from the installation's view as PERMANENT.
+describe("makeGithubUserAuthClient.listInstallationRepos", () => {
+  const repoPage = (fullNames: string[], link?: string) =>
+    new Response(
+      JSON.stringify({
+        total_count: fullNames.length,
+        repositories: fullNames.map((full_name, i) => ({
+          id: i + 1,
+          name: full_name.split("/")[1],
+          full_name,
+        })),
+      }),
+      {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          ...(link ? { link } : {}),
+        },
+      },
+    );
+
+  it("GETs the installation's repositories with the ghu_ token and returns full names", async () => {
+    const { fetchImpl, calls } = recordingFetch(() =>
+      repoPage(["acme/psalm-121", "acme/other"]),
+    );
+
+    const names = await makeClient(fetchImpl).listInstallationRepos({
+      token: "ghu_stub_user_1",
+      installationId: "42",
+    });
+
+    expect(names).toEqual(["acme/psalm-121", "acme/other"]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe("GET");
+    expect(calls[0].url).toBe(
+      "https://api.github.com/user/installations/42/repositories?per_page=100",
+    );
+    expect(calls[0].auth).toBe("token ghu_stub_user_1");
+  });
+
+  it("follows Link rel=next so a repo on a later page is still seen", async () => {
+    const page2 =
+      "https://api.github.com/user/installations/42/repositories?per_page=100&page=2";
+    const { fetchImpl, calls } = recordingFetch((url) =>
+      url.includes("page=2")
+        ? repoPage(["acme/psalm-121"])
+        : repoPage(["acme/first"], `<${page2}>; rel="next"`),
+    );
+
+    const names = await makeClient(fetchImpl).listInstallationRepos({
+      token: "ghu_stub_user_1",
+      installationId: "42",
+    });
+
+    expect(names).toEqual(["acme/first", "acme/psalm-121"]);
+    expect(calls).toHaveLength(2);
+    expect(calls[1].url).toBe(page2);
+  });
+
+  it("throws on a non-2xx listing, naming GitHub's own words", async () => {
+    const { fetchImpl } = recordingFetch(
+      () =>
+        new Response(JSON.stringify({ message: "Requires authentication" }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    await expect(
+      makeClient(fetchImpl).listInstallationRepos({
+        token: "ghs_wrong",
+        installationId: "42",
+      }),
+    ).rejects.toThrow(/401.*Requires authentication/);
   });
 });
