@@ -14,7 +14,16 @@ export interface GalleryItemRow extends GalleryItem {
 export interface GalleryItemDtoExtras {
   /** Short-lived presigned poster URL; `null` when it could not be signed. */
   thumbnailUrl: string | null;
-  /** 1-based global popular ordinal, or `null` under any other sort (plan D11). */
+  /**
+   * 1-based ordinal in the UNFILTERED popular ordering, or `null` — under any other sort,
+   * AND under any listing carrying a search term (plan D11).
+   *
+   * The `q` carve-out is the same honesty rule as the sort one, not a second policy: the
+   * ILIKE predicate and the `ORDER BY` are one statement, so a ranked search result would
+   * be a position among the HITS wearing a badge that claims a position in the ordering.
+   * Suppressed at the one place it is computed — `GalleryService.listGallery` — and held by
+   * U-GV10c plus E-G6b.
+   */
   rank: number | null;
   /** Always `false` for an anonymous viewer (no query is issued at all). */
   viewerHasUpvoted: boolean;

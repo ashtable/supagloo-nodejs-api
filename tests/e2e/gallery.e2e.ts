@@ -50,6 +50,15 @@ import { sortByTrendingDesc } from "../../src/gallery/trending";
 // scoped to a user, so every test that asserts an exact set or order scopes itself with a
 // per-test `q=<nonce>` token embedded in its fixtures' text. That is not a workaround: it
 // exercises the real free-text predicate at the same time.
+//
+// ...and it has ONE blind spot, which cost a shipped false badge. Because `q` is the
+// isolation mechanism, every listing this spec looked at was a FILTERED listing — so all
+// four of its `rank` assertions measured a position among search hits and called it a
+// global ordinal, while three JSDocs promised the opposite. A property that is only true
+// of the WHOLE listing cannot be tested through the isolation seam. E-G6b is the case that
+// reads the unfiltered listing, and it asserts properties that survive foreign rows
+// (each item's ordinal against an independently counted position) rather than an exact
+// page. Any future claim about the global listing belongs there, not behind a nonce.
 
 const APP_URL =
   process.env.DATABASE_URL ??
@@ -71,6 +80,30 @@ const HOUR_MS = 3_600_000;
 const prisma: PrismaClient = createPrismaClient({ connectionString: APP_URL });
 let s3: S3Client;
 const putKeys: string[] = [];
+
+/**
+ * EVERY row this spec causes to exist, so `afterAll` can delete exactly its own.
+ *
+ * WHY THIS IS NOT OPTIONAL, and why the render / project / ai-generation specs get away
+ * without it. Every OTHER surface in this api is scoped to a user, so a leftover row is
+ * invisible to everybody else. `GET /v1/gallery` is the one endpoint that is not: it is a
+ * GLOBAL projection of `visibility='public'`. This spec publishes dozens of items through
+ * the real route, so leaving them behind does not merely bloat the database — it changes
+ * what a later reader of the gallery sees.
+ *
+ * The concrete casualty was the nextjs UI spec, whose `beforeAll` asserts that the only
+ * public items present are its own `e2e-gallery-`-prefixed fixtures (its grid assertions
+ * are exact, so it cannot tolerate foreign rows). It threw and took all of its UI tests
+ * down with a message that read like the developer's own database was dirty. The guard is
+ * RIGHT and stays loud; the leak was here.
+ *
+ * Deleted by TRACKED ID, never by pattern: an id pattern would eventually match somebody
+ * else's row, and this suite must not be able to delete data it did not create.
+ */
+const createdUserIds: string[] = [];
+const createdProjectIds: string[] = [];
+const createdVersionIds: string[] = [];
+const createdRenderIds: string[] = [];
 
 /** Full-page app (the production page size) and a 2-per-page app, so cursor pagination
  *  and rank continuity are exercised without seeding 25 renders. `pageSize` is a
@@ -137,12 +170,73 @@ beforeAll(async () => {
   pagedUrl = await pagedApp.listen({ port: 0, host: "127.0.0.1" });
 }, 120_000);
 
+/**
+ * Run one teardown step, and NEVER let it abort the rest.
+ *
+ * Teardown that stops at the first failure is worse than no teardown: it leaves a partial
+ * delete behind, which is precisely the state — public `GalleryItem` rows with no owner
+ * story — that trips the next reader of the global listing. So every step reports and
+ * continues, and the failures are printed rather than swallowed, because a teardown that
+ * silently does nothing is how this leak survived a whole suite in the first place.
+ */
+async function teardownStep(what: string, run: () => Promise<unknown>) {
+  try {
+    await run();
+  } catch (error) {
+    console.error(`[gallery.e2e teardown] ${what} FAILED:`, error);
+  }
+}
+
 afterAll(async () => {
   for (const key of putKeys) {
     await s3
       .send(new DeleteObjectCommand({ Bucket: S3_CFG.bucket, Key: key }))
       .catch(() => {});
   }
+
+  // FK-safe order, child → parent. Every FK in the schema is `onDelete: Cascade`, so
+  // deleting the users alone would in fact suffice — the explicit walk is deliberate: it
+  // deletes exactly the rows this spec is accountable for, it does not depend on a schema
+  // property that a future migration could relax, and each step's row count is separately
+  // visible when one of them fails.
+  //
+  // Gallery items are matched by their PARENT ids rather than by a list of item ids,
+  // because items are created by the REAL publish route from several call sites (some
+  // tests call `publish` directly and read the 201 body) and a hand-kept list of item ids
+  // would be one forgotten `push` away from leaking again. Every item this spec creates
+  // belongs to a tracked render, project and user, so the OR cannot miss one.
+  await teardownStep("galleryUpvote", () =>
+    prisma.galleryUpvote.deleteMany({ where: { userId: { in: createdUserIds } } }),
+  );
+  await teardownStep("galleryItem", () =>
+    prisma.galleryItem.deleteMany({
+      where: {
+        OR: [
+          { renderJobId: { in: createdRenderIds } },
+          { projectId: { in: createdProjectIds } },
+          { ownerId: { in: createdUserIds } },
+        ],
+      },
+    }),
+  );
+  await teardownStep("renderJob", () =>
+    prisma.renderJob.deleteMany({ where: { id: { in: createdRenderIds } } }),
+  );
+  await teardownStep("projectVersion", () =>
+    prisma.projectVersion.deleteMany({ where: { id: { in: createdVersionIds } } }),
+  );
+  await teardownStep("project", () =>
+    prisma.project.deleteMany({ where: { id: { in: createdProjectIds } } }),
+  );
+  // Sessions are minted by `POST /v1/test/seed`, not by any helper here, so they are
+  // deleted by their user rather than by id.
+  await teardownStep("session", () =>
+    prisma.session.deleteMany({ where: { userId: { in: createdUserIds } } }),
+  );
+  await teardownStep("user", () =>
+    prisma.user.deleteMany({ where: { id: { in: createdUserIds } } }),
+  );
+
   if (app) await app.close();
   if (pagedApp) await pagedApp.close();
   if (s3) s3.destroy();
@@ -173,10 +267,12 @@ async function seedUsers(tag: string, n: number): Promise<SeededUser[]> {
   });
   expect(res.status).toBe(200);
   const body = await res.json();
-  return body.users.map((u: any, i: number) => ({
+  const seeded = body.users.map((u: any, i: number) => ({
     token: users[i].sessionToken,
     userId: u.user.id,
   }));
+  createdUserIds.push(...seeded.map((u: SeededUser) => u.userId));
+  return seeded;
 }
 
 const seedUser = async (tag: string) => (await seedUsers(tag, 1))[0];
@@ -205,6 +301,8 @@ async function seedProject(userId: string, tag: string) {
       changedFiles: [],
     },
   });
+  createdProjectIds.push(project.id);
+  createdVersionIds.push(version.id);
   return { projectId: project.id, versionId: version.id };
 }
 
@@ -226,6 +324,7 @@ async function seedCompletedRender(
   over: Record<string, unknown> = {},
 ): Promise<string> {
   const id = `gal-e2e-${tag}-${stamp()}`;
+  createdRenderIds.push(id);
   await prisma.renderJob.create({
     data: {
       id,
@@ -484,7 +583,9 @@ describe("e2e: publish", () => {
     // THE HEADLINE ACCEPTANCE: no auth header whatsoever.
     const anon = await listItems(`?q=${token}`);
     expect(idsOf(anon.items)).toEqual([item.id]);
-    expect(anon.items[0].rank).toBe(1); // popular is the default sort
+    // NO rank: this listing carries a `q`, and an ordinal among search hits is not a
+    // position in the popular ordering. E-G6b is where rank is actually asserted.
+    expect(anon.items[0].rank).toBeNull();
     expect(anon.items[0].viewerHasUpvoted).toBe(false);
     expect(typeof anon.items[0].thumbnailUrl).toBe("string");
     expect(anon.nextCursor).toBeNull();
@@ -637,8 +738,6 @@ describe("e2e: the three sorts", () => {
 
     const popular = await listItems(`?q=${groupNonce}&sort=popular`);
     expect(idsOf(popular.items)).toEqual([0, 2, 4, 3, 5, 1].map(byIndex));
-    // Ranks are 1-based, contiguous, and present only here.
-    expect(popular.items.map((i) => i.rank)).toEqual([1, 2, 3, 4, 5, 6]);
 
     const trending = await listItems(`?q=${groupNonce}&sort=trending`);
     // Hand-computed with TRENDING = {voteOffset 1, ageOffsetHours 2, gravity 1.5}.
@@ -648,9 +747,102 @@ describe("e2e: the three sorts", () => {
     // (trending ≡ newest).
     expect(idsOf(trending.items)).not.toEqual(idsOf(popular.items));
     expect(idsOf(trending.items)).not.toEqual(idsOf(newest.items));
-    // rank is a property of the GLOBAL popular ordering, so it is null elsewhere.
+    // rank is null on ALL THREE of these listings — and, importantly, for two different
+    // reasons that this case cannot tell apart. `newest`/`trending` are not the popular
+    // ordering; and every listing here is `q`-scoped, which is not an ordering at all. The
+    // comment that used to sit on this line claimed these assertions demonstrated a GLOBAL
+    // property, three lines above a `popular` assertion that only passed because it did
+    // not. E-G6b is the case that separates the two.
+    expect(popular.items.every((i) => i.rank === null)).toBe(true);
     expect(trending.items.every((i) => i.rank === null)).toBe(true);
     expect(newest.items.every((i) => i.rank === null)).toBe(true);
+  }, 120_000);
+
+  it("E-G6b: rank is the position in the UNFILTERED popular ordering — a searched listing has none", async () => {
+    // THE CASE THAT DID NOT EXIST, and the reason a false badge shipped. `q` is how this
+    // whole spec isolates its fixtures from a listing that is global by design, so all four
+    // of its rank assertions ran against `?q=<nonce>` — i.e. every listing the spec ever
+    // inspected was a FILTERED one. The ILIKE predicate sits in the same `WHERE` as the
+    // `ORDER BY` and the `LIMIT`, so `rank` was a position among the HITS: type anything
+    // into the gallery search box and the top match wore "#1".
+    //
+    // This case therefore has to read the UNFILTERED listing, which is global and carries
+    // every other test's rows. So it asserts PROPERTIES that survive foreign data rather
+    // than an exact page, and it computes each item's TRUE position with an independent
+    // query instead of re-deriving it from the response it is checking.
+    const decoy = await seedGroup("rankdecoy", [{ upvoteCount: 900_000 }]);
+    const group = await seedGroup("rankglobal", [
+      { upvoteCount: 7 },
+      { upvoteCount: 6 },
+      { upvoteCount: 5 },
+    ]);
+
+    /** The item's real 1-based place in the global `popular` ordering, counted in SQL
+     *  against the SAME `ORDER BY "upvoteCount" DESC, "id" DESC` the builder emits. */
+    const truePosition = async (item: { id: string; upvoteCount: number }) =>
+      1 +
+      (await prisma.galleryItem.count({
+        where: {
+          visibility: "public",
+          OR: [
+            { upvoteCount: { gt: item.upvoteCount } },
+            { upvoteCount: item.upvoteCount, id: { gt: item.id } },
+          ],
+        },
+      }));
+
+    // 1. THE BUG, stated as a number. The group's top item is the FIRST hit for its nonce,
+    //    so the old code badged it "#1"; its real place in the ordering is strictly worse,
+    //    because the decoy's 900 000 votes are ahead of it. A rank on a searched listing is
+    //    not merely imprecise — it is a different quantity.
+    const filtered = await listItems(`?q=${group.groupNonce}&sort=popular`);
+    expect(idsOf(filtered.items)).toEqual(idsOf(group.items));
+    expect(await truePosition(group.items[0])).toBeGreaterThan(1);
+    expect(filtered.items.map((i) => i.rank)).toEqual([null, null, null]);
+
+    // 2. The UNFILTERED listing DOES rank, and the ordinal is the item's true position —
+    //    checked per item against the independent count, not against its own index.
+    const whole = await listItems("?sort=popular");
+    expect(whole.items.length).toBeGreaterThan(0);
+    for (const [index, item] of whole.items.entries()) {
+      expect(item.rank, `${item.id} at index ${index}`).toBe(await truePosition(item));
+    }
+    // ...which for page one means exactly 1..n, contiguous and strictly increasing.
+    expect(whole.items.map((i) => i.rank)).toEqual(
+      whole.items.map((_, index) => index + 1),
+    );
+
+    // 3. Continuity across a page boundary, on the unfiltered listing this time: the
+    //    2-per-page app's second page must CONTINUE the ordering, not restart at 1. (This
+    //    is the proof E-G8 used to carry against a q-scoped walk, where it was a statement
+    //    about five hits rather than about the gallery.)
+    const first = await listItems("?sort=popular", undefined, paged);
+    expect(first.items.map((i) => i.rank)).toEqual([1, 2]);
+    expect(first.nextCursor).not.toBeNull();
+    const second = await listItems(
+      `?sort=popular&cursor=${encodeURIComponent(first.nextCursor!)}`,
+      undefined,
+      paged,
+    );
+    expect(second.items.map((i) => i.rank)).toEqual([3, 4]);
+    for (const item of [...first.items, ...second.items]) {
+      expect(item.rank, item.id).toBe(await truePosition(item));
+    }
+
+    // 4. A BLANK `q` is ABSENT, not a filter — the builder emits no predicate for it — so
+    //    it must still rank. The UI's model always appends `q=`, so gating on the raw
+    //    parameter instead of the parsed term would have dropped every badge in the product.
+    const blank = await listItems("?sort=popular&q=%20%20");
+    expect(idsOf(blank.items)).toEqual(idsOf(whole.items));
+    expect(blank.items.map((i) => i.rank)).toEqual(whole.items.map((i) => i.rank));
+
+    // The decoy exists only to make (1)'s inequality CERTAIN rather than incidental: with
+    // 900 000 votes it is ahead of the group's 7 in the ordering whatever else the gallery
+    // holds, so `truePosition(group.items[0]) > 1` cannot pass by luck. Measured, not
+    // assumed — and stated as a comparison so it survives a busier gallery.
+    expect(await truePosition(decoy.items[0])).toBeLessThan(
+      await truePosition(group.items[0]),
+    );
   }, 120_000);
 
   it("E-G7: the SQL trending expression agrees with the pure TS twin, on the epoch the cursor froze", async () => {
@@ -692,7 +884,7 @@ describe("e2e: the three sorts", () => {
 let pageOneCursor: string | undefined;
 
 describe("e2e: cursor pagination", () => {
-  it("E-G8: a 2-per-page walk over 5 items yields 5 distinct ids, no duplicates, a null final cursor, and contiguous ranks 1..5", async () => {
+  it("E-G8: a 2-per-page walk over 5 items yields 5 distinct ids, no duplicates and a null final cursor", async () => {
     const group = await seedGroup(
       "page",
       [50, 40, 30, 20, 10].map((upvoteCount) => ({ upvoteCount })),
@@ -709,8 +901,18 @@ describe("e2e: cursor pagination", () => {
     // "Load more" honestly — hence the pageSize+1 probe.
     expect(cursors).toHaveLength(2);
 
-    // Ranks are continuous ACROSS page boundaries — a direct test of cursor correctness.
-    expect(pages.flatMap((p) => p.map((i: any) => i.rank))).toEqual([1, 2, 3, 4, 5]);
+    // This walk is `q`-scoped — that is how it gets a deterministic 5-item population out
+    // of a global listing — so it carries NO ranks, and the cursor's ordinal continuity is
+    // proven on the unfiltered listing by E-G6b instead. The assertion that used to live
+    // here read `[1, 2, 3, 4, 5]` and was described as "a direct test of cursor
+    // correctness"; it was a test that five search hits are numbered one to five.
+    expect(pages.flatMap((p) => p.map((i: any) => i.rank))).toEqual([
+      null,
+      null,
+      null,
+      null,
+      null,
+    ]);
 
     pageOneCursor = cursors[0];
   }, 120_000);
@@ -1700,7 +1902,7 @@ describe("e2e: upvotes", () => {
     expect(await prisma.galleryUpvote.count({ where: { galleryItemId: item.id } })).toBe(1);
   }, 120_000);
 
-  it("E-U8: rank badges follow the votes — the 8-vote item is rank 1 and ranks stay contiguous", async () => {
+  it("E-U8: real votes move the popular ORDER — 8 > 3 > 0 — and a searched listing still carries no rank", async () => {
     if (!concurrentFixture) throw new Error("E-U4 must run first");
     const { itemIds, users, groupNonce } = concurrentFixture;
 
@@ -1713,7 +1915,9 @@ describe("e2e: upvotes", () => {
     const { items } = await listItems(`?q=${groupNonce}&sort=popular`);
     expect(idsOf(items)).toEqual([itemIds[0], itemIds[1], itemIds[2]]);
     expect(items.map((i) => i.upvoteCount)).toEqual([8, 3, 0]);
-    expect(items.map((i) => i.rank)).toEqual([1, 2, 3]);
+    // The ORDER is what real votes move; the BADGE is a claim about the whole gallery and
+    // this listing is `q`-scoped, so there is none. (E-G6b is where a rank is asserted.)
+    expect(items.map((i) => i.rank)).toEqual([null, null, null]);
   }, 120_000);
 
   it("E-U9: deleting an item cascades its upvote rows", async () => {

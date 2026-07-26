@@ -617,6 +617,51 @@ describe("GalleryService.listGallery", () => {
     ).toEqual({ s: "popular", k: 1, i: "c", n: 3 });
   });
 
+  it("U-GV10c: a SEARCH-FILTERED listing carries NO rank — a position among hits is not a global ordinal", async () => {
+    // `rank` is documented — on the DTO, in the service and in the UI — as the item's
+    // position in the GLOBAL popular ordering, and the grid badges 1/2/3 with a trophy on
+    // that promise. But the listing is ONE statement: the `q` ILIKE predicate sits in the
+    // SAME `WHERE` as the `ORDER BY` and the `LIMIT`, so `startOrdinal + index + 1` counts
+    // positions AMONG THE HITS. Typing anything into the gallery search box therefore
+    // badged the top hit "#1" — an item that may be #400 globally, or have two upvotes.
+    //
+    // WHY THIS CASE DID NOT EXIST, honestly: `q` is how `tests/e2e/gallery.e2e.ts`
+    // isolates its fixtures from a listing that is global by design, so every one of its
+    // four rank assertions ran against a `?q=<nonce>` listing — i.e. the only listings the
+    // spec ever inspected were filtered ones, which is exactly the case that is wrong. And
+    // U-GV10's fake Prisma returns `rawRows` verbatim, so it cannot express filtering at
+    // all. Both layers agreed with each other and neither agreed with the claim.
+    const filtered = makeFake({ rawRows: threeRaw, items: threeRows });
+    const { items } = await makeService(filtered).service.listGallery(null, {
+      sort: "popular",
+      q: "psalm",
+    });
+    expect(items.map((i) => i.rank)).toEqual([null, null, null]);
+    // ...and the `q` really did reach the query, so this is rank SUPPRESSION and not a
+    // parameter that got dropped on the way to the builder.
+    expect(find(filtered.calls, "$queryRaw").args.sql.values).toContain("%psalm%");
+
+    // The UNFILTERED listing still ranks: there the statement IS the whole ordering, so an
+    // ordinal in it is a true global position.
+    const unfiltered = makeFake({ rawRows: threeRaw, items: threeRows });
+    const whole = await makeService(unfiltered).service.listGallery(null, {
+      sort: "popular",
+    });
+    expect(whole.items.map((i) => i.rank)).toEqual([1, 2, 3]);
+
+    // A BLANK `q` is ABSENT, not a filter: `parseSearchTerm` collapses it to `undefined`
+    // and the builder emits no predicate at all. So it must NOT suppress the rank — and
+    // that is why the gate reads the PARSED term rather than `query.q`. Gating on the raw
+    // parameter would drop every rank in the product, because the UI's model always emits
+    // `q=` whether or not the box has anything in it.
+    const blank = makeFake({ rawRows: threeRaw, items: threeRows });
+    const blankPage = await makeService(blank).service.listGallery(null, {
+      sort: "popular",
+      q: "   ",
+    });
+    expect(blankPage.items.map((i) => i.rank)).toEqual([1, 2, 3]);
+  });
+
   it("U-GV11: exhaustion — pageSize+1 is fetched, pageSize is returned, and nextCursor is minted ONLY if the extra row existed", async () => {
     // 3 raw rows with pageSize 2 ⇒ there IS a next page.
     const more = makeFake({

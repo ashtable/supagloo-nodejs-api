@@ -12,19 +12,45 @@ import { z } from "zod";
  * sorts, and so were the `:id` path parameter of both anonymous item routes and three of the
  * publish body's four strings. Per-field patches move the gap; they do not close it.
  *
- * So the rule lives HERE, once, and every request-derived string on the surface passes
- * through it at its own boundary:
+ * So the rule lives HERE, once, and is applied at each gated value's own boundary:
  *
- * | value                          | boundary                                     |
- * |--------------------------------|----------------------------------------------|
- * | cursor `i`                     | `decodeCursor` (400 `invalid_cursor`)        |
- * | `q`                            | `parseSearchTerm` (400 `invalid_query`)      |
- * | `:id` on every gallery route   | the route's params schema (400, Zod)         |
- * | the publish body's strings     | the route's body schema (400, Zod)           |
+ * | value                              | boundary                                     |
+ * |------------------------------------|----------------------------------------------|
+ * | cursor `i`                         | `decodeCursor` (400 `invalid_cursor`)        |
+ * | `q`                                | `parseSearchTerm` (400 `invalid_query`)      |
+ * | every `:id` in the api             | the route's params schema (400, Zod)         |
+ * | the gallery publish body's strings | the route's body schema (400, Zod)           |
  *
  * The Zod boundaries use {@link withPostgresSafeStrings}, which WALKS the parsed value
  * rather than naming fields — so a schema that grows a new string is gated with no change
  * here and no change at the call site. That walk is the actual anti-regression measure.
+ *
+ * SCOPE — WHAT IS DELIBERATELY NOT GATED. The table above is the WHOLE of it, and saying so
+ * is the point of this paragraph: an earlier draft claimed "every request-derived string on
+ * the surface" passes through here, which is a claim about the api that the code does not
+ * make. PATH PARAMETERS are gated api-wide, and `src/routes/path-params-gate.test.ts`
+ * enumerates the real route table to keep them that way. REQUEST BODIES ARE NOT: of the
+ * FOURTEEN `body` schemas across this api's ten route files, exactly ONE —
+ * `POST /v1/renders/:id/gallery` in `src/routes/gallery.ts` — is wrapped. The other
+ * thirteen are not, and these among them reach Prisma carrying a caller's string:
+ *
+ *   POST  /v1/projects                     `name`  → `prisma.project.create`
+ *   PATCH /v1/projects/:id                 `name`  → `prisma.project.update`
+ *   POST  /v1/ai/generations               `input` → `prisma.aiGeneration.create` (jsonb)
+ *   POST  /v1/projects/import, /:id/commit, /:id/publish, /:id/renders
+ *
+ * Those are the SAME class as the anonymous 500s this module was built for, one
+ * authentication step further in — read off the call paths, and NOT measured against real
+ * Postgres the way the gallery ones were, so no number is claimed for them here.
+ *
+ * They stay ungated ON PURPOSE, for the reason that already rejected a scope-wide
+ * `preValidation` hook: this is a gallery task (plan rows 39/40/41), and widening the gate
+ * to those bodies changes the error contract of seven route files nothing in this run
+ * reviewed or tested — including the bodies carrying OpenRouter keys, Gloo credentials and
+ * YouVersion tokens, where a new 400 is a failed sign-in or a failed connect. Closing them
+ * is its own task with its own measured sweep. Until then this module gates FOUR values and
+ * this paragraph is the inventory; `src/routes/body-gate.test.ts` holds the inventory to the
+ * real route table so it cannot quietly fall behind.
  *
  * WHAT IS AND IS NOT MEASURED. Every claim below was driven against the Compose
  * Postgres 17 through the real Prisma 7.8 client, both as `$queryRaw` with a bound parameter

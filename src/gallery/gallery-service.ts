@@ -277,6 +277,14 @@ export class GalleryService {
     // a property of the GLOBAL popular ordering and a "#7" under another ordering asserts
     // something untrue.
     //
+    // ...and for the SAME reason it is non-null only on an UNFILTERED listing. The `q`
+    // ILIKE predicate lives in the same `WHERE` as this statement's `ORDER BY` and `LIMIT`,
+    // so with a search term `startOrdinal + index + 1` is a position AMONG THE HITS, not a
+    // position in the ordering. Badging the top match "#1" when it is #400 globally is the
+    // very claim the paragraph above refuses to make for `newest` and `trending`; a search
+    // narrows the population exactly the way a different sort reorders it. The gate reads
+    // the PARSED term, so a blank `q=` — which emits no predicate at all — still ranks.
+    //
     // The ordinal is keyed off the position the RAW QUERY gave each id, NOT off this page's
     // surviving rows. That difference is only visible when a row vanishes between the two
     // queries (a concurrent `DELETE /v1/gallery/:id`), and it is the whole point: ranks are
@@ -292,7 +300,10 @@ export class GalleryService {
     const items = await Promise.all(
       ordered.map((row) =>
         this.toDto(row, {
-          rank: query.sort === "popular" ? (ordinalById.get(row.id) ?? null) : null,
+          rank:
+            query.sort === "popular" && search.q === undefined
+              ? (ordinalById.get(row.id) ?? null)
+              : null,
           viewerHasUpvoted: voted.has(row.id),
         }),
       ),
