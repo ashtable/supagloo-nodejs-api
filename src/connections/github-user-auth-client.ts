@@ -59,6 +59,36 @@ export interface MakeGithubUserAuthClientOptions {
   fetchImpl?: typeof fetch;
 }
 
+/**
+ * A typed failure of the user-authorization CODE→TOKEN exchange (task-62 D18-2).
+ *
+ * Real GitHub does NOT signal a rejected authorization code with a 4xx: `POST
+ * /login/oauth/access_token` answers **HTTP 200** with a body like
+ * `{"error":"bad_verification_code","error_description":…,"error_uri":…}`. The
+ * retired github-stub accepted any non-empty code, so this shape never reached the
+ * client and a 200-with-error fell through to `tokenResponseSchema.parse()`, which
+ * threw an anonymous `ZodError: access_token Required` — mentioning neither GitHub
+ * nor the actual cause. `code` carries GitHub's own machine-readable error string
+ * so callers/logs can distinguish "the user's code expired" (retryable by
+ * re-authorizing) from "our client_secret is wrong" (a deployment fault).
+ */
+export class GithubUserAuthExchangeError extends Error {
+  /** GitHub's `error` field when present (e.g. `bad_verification_code`), else undefined. */
+  readonly code?: string;
+  /** GitHub's `error_description` when present. */
+  readonly description?: string;
+  readonly statusCode = 502;
+  constructor(
+    message: string,
+    opts: { code?: string; description?: string; cause?: unknown } = {},
+  ) {
+    super(message, { cause: opts.cause });
+    this.name = "GithubUserAuthExchangeError";
+    this.code = opts.code;
+    this.description = opts.description;
+  }
+}
+
 const tokenResponseSchema = z.object({
   access_token: z.string().min(1),
 });
@@ -105,10 +135,54 @@ export function makeGithubUserAuthClient(
         }),
       });
       if (!res.ok) {
-        throw new Error(`GitHub user-auth code exchange failed: ${res.status}`);
+        throw new GithubUserAuthExchangeError(
+          `GitHub user-auth code exchange failed with HTTP ${res.status}`,
+        );
       }
-      const raw = tokenResponseSchema.parse(await res.json());
-      return { token: raw.access_token };
+
+      // task-62 D18-2: real GitHub answers a REJECTED code with HTTP 200 and an
+      // `error` field, so a 200 is not yet success. Parse defensively (a non-JSON
+      // 200 means something upstream ignored our `accept: application/json`), then
+      // check for `error` BEFORE the token schema so the typed failure carries
+      // GitHub's own code instead of an anonymous "access_token Required".
+      let body: unknown;
+      try {
+        body = await res.json();
+      } catch (cause) {
+        throw new GithubUserAuthExchangeError(
+          `GitHub user-auth code exchange returned a non-JSON 200 body ` +
+            `(expected application/json; got ` +
+            `${res.headers.get("content-type") ?? "no content-type"})`,
+          { cause },
+        );
+      }
+
+      const errorEnvelope = z
+        .object({
+          error: z.string().min(1),
+          error_description: z.string().optional(),
+          error_uri: z.string().optional(),
+        })
+        .safeParse(body);
+      if (errorEnvelope.success) {
+        const { error, error_description, error_uri } = errorEnvelope.data;
+        throw new GithubUserAuthExchangeError(
+          `GitHub rejected the user-authorization code exchange: ${error}` +
+            (error_description ? ` — ${error_description}` : "") +
+            (error_uri ? ` (${error_uri})` : ""),
+          { code: error, description: error_description },
+        );
+      }
+
+      const parsed = tokenResponseSchema.safeParse(body);
+      if (!parsed.success) {
+        throw new GithubUserAuthExchangeError(
+          `GitHub user-auth code exchange returned no access_token and no error ` +
+            `field — the response shape is not GitHub's documented envelope`,
+          { cause: parsed.error },
+        );
+      }
+      return { token: parsed.data.access_token };
     },
 
     async createUserRepo({ token, name, private: priv }) {

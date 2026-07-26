@@ -69,7 +69,10 @@ const repoSchema = z.object({
   owner: z.object({ login: z.string() }),
   private: z.boolean(),
   default_branch: z.string(),
-  // A brand-new repo with no commits reports size 0 ⇒ we surface it as `empty`.
+  // GitHub reports `size` in KILOBYTES and computes it ASYNCHRONOUSLY, so a
+  // just-created repo — including one with a single small README commit from
+  // `auto_init: true` — reports 0. That is what makes `empty = size === 0` work for
+  // wireframe 13a's "Empty · created just now" badge. See the derivation note below.
   size: z.number(),
 });
 const reposResponseSchema = z.object({
@@ -99,8 +102,25 @@ function parseNextLink(link: string | null): string | null {
   return match ? match[1] : null;
 }
 
-/** Restore a PEM whose newlines were escaped to the literal two-char `\n` (as
- *  env vars often carry multi-line secrets). A real multi-line PEM is unchanged. */
+/**
+ * Restore a PEM whose newlines were escaped to the literal two-char `\n` (as
+ * env vars often carry multi-line secrets). A real multi-line PEM is unchanged.
+ *
+ * NOTE (task-62): this is now REDUNDANT with db-lib's `normalizePemNewlines`, which
+ * `signAppJwt` and `mintInstallationToken` apply themselves (db-lib
+ * `src/github.ts:93-105`, the row-62 item (c) fix). It is harmless — db-lib's
+ * replacement is a no-op on an already-restored key, and both are idempotent — and it
+ * is deliberately LEFT IN PLACE here rather than deleted in this task: removing it
+ * would make every JWT in this client depend solely on a db-lib version pin, which is
+ * a change that belongs with a db-lib release, not with an e2e-harness task (task-62
+ * D2 forbids touching db-lib at all). db-lib's version is the strictly more thorough
+ * one (it also folds real CRLF and trims), so behaviour is unchanged either way.
+ *
+ * Recorded as a known duplication: THREE harness-visible PEM normalisations now exist
+ * (db-lib's, root's `signAppJwtLocal`, and this one). The property that actually
+ * matters — that the escaped and real forms produce a byte-identical signature — is
+ * fenced by a unit test in root (task-62 D3).
+ */
 function normalizePrivateKey(key: string): string {
   return key.includes("\\n") ? key.replace(/\\n/g, "\n") : key;
 }
@@ -169,6 +189,30 @@ export function makeGithubAppClient(
         nextUrl = parseNextLink(res.headers.get("link"));
       }
 
+      // EMPTINESS DERIVATION — reviewed and deliberately UNCHANGED in task-62 (D16).
+      //
+      // `size` is KB-rounded and computed asynchronously by GitHub, so it lags UPWARD:
+      // it can read 0 for a repo that already has content, but it never overstates. The
+      // risk is therefore a false `empty: true`, whose blast radius is the repo picker
+      // offering an already-populated repo as a scaffold target.
+      //
+      // A live read-only probe (2026-07-25) found small real repos genuinely reporting
+      // `size: 0`, so an `auto_init` fixture (one README commit) does list as empty —
+      // i.e. REALITY DOES NOT DIFFER for the shapes this product creates, and
+      // design-delta §10.4a's rule ("if reality differs, the client changes, not the
+      // tests") does not fire. Changing it here would be unforced risk.
+      //
+      // The failure mode is silent (a `data-disabled` picker row whose click is a
+      // no-op), so it is fenced from BOTH sides instead: the api e2e asserts this
+      // run's fixture repo appears under `filter=empty`
+      // (tests/e2e/github-connection.e2e.ts), and the nextjs render lane asserts the
+      // chosen row is not `data-disabled` before clicking it.
+      //
+      // CONTINGENCY, if that ever goes red — plan row N3, deliberately NOT done
+      // pre-emptively: treat `size > 0` as definitive not-empty, and probe
+      // `GET /repos/:o/:r/commits?per_page=2` for the `size === 0` subset only
+      // (409 "Git Repository is empty" ⇒ empty; 200 with ≤1 commit ⇒ empty; ≥2 ⇒ not
+      // empty), concurrency-capped. Do NOT relax the e2e assertion instead.
       return collected.map((r) => ({
         id: r.id,
         name: r.name,

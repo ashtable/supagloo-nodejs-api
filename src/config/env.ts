@@ -19,12 +19,17 @@ const SECRETS_KEY_HEX = /^[0-9a-fA-F]{64}$/;
 
 /**
  * A provider base URL: http(s), with the REAL provider URL as the default so
- * production needs zero config. The test Compose overlay overrides ONLY the GitHub
- * base URLs to the in-network `http://github-stub:8080`; since task 34-E8
- * (design-delta §10.7) the OpenRouter/Gloo/YouVersion base URLs are NOT overridden —
- * those providers are exercised for real by the e2e suites. When
- * `supagloo-nodejs-dbos` is bootstrapped (Task 15) it adopts these SAME var names +
- * defaults verbatim.
+ * production needs zero config.
+ *
+ * As of task 62 (design-delta §11) the test Compose overlay overrides **NO** provider
+ * base URL at all: task 34-E8 (§10.7) removed the OpenRouter/Gloo/YouVersion overrides,
+ * and task 62 removed the last two — `GITHUB_API_BASE_URL` and `GITHUB_OAUTH_BASE_URL`
+ * — when the github-stub was retired. All four providers are now exercised for real by
+ * the e2e suites, so these defaults are the values every environment actually uses.
+ * The override MECHANISM stays: it is still the seam a future in-network fake or a
+ * GitHub Enterprise host would use, and `http://` is still accepted for that reason.
+ * When `supagloo-nodejs-dbos` is bootstrapped (Task 15) it adopts these SAME var names
+ * + defaults verbatim.
  */
 const providerBaseUrl = (defaultUrl: string) =>
   z

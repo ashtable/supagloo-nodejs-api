@@ -105,18 +105,23 @@ describe("loadEnv", () => {
       expect(env.YOUVERSION_BASE_URL).toBe("https://api.youversion.com");
     });
 
-    it("accepts overrides that point at http:// stub servers", () => {
+    // The override MECHANISM survives task 62 even though nothing in the repo
+    // overrides a provider base URL any more (all four are real in every lane). It is
+    // the seam a GitHub Enterprise host or an in-network proxy would use, so `http://`
+    // must stay valid. Sample hosts here are deliberately GENERIC — naming a retired
+    // stub container would imply one still exists.
+    it("accepts http:// overrides (the in-network / self-hosted seam)", () => {
       const env = loadEnv(
         validEnv({
-          GITHUB_API_BASE_URL: "http://github-stub:8080",
-          GITHUB_OAUTH_BASE_URL: "http://github-stub:8080",
-          OPENROUTER_BASE_URL: "http://openrouter-stub:8080",
-          GLOO_BASE_URL: "http://gloo-stub:8080",
-          YOUVERSION_BASE_URL: "http://youversion-stub:8080",
+          GITHUB_API_BASE_URL: "http://internal-gateway:8080/api/v3",
+          GITHUB_OAUTH_BASE_URL: "http://internal-gateway:8080",
+          OPENROUTER_BASE_URL: "http://internal-gateway:8081",
+          GLOO_BASE_URL: "http://internal-gateway:8082",
+          YOUVERSION_BASE_URL: "http://internal-gateway:8083",
         }),
       );
-      expect(env.OPENROUTER_BASE_URL).toBe("http://openrouter-stub:8080");
-      expect(env.GITHUB_API_BASE_URL).toBe("http://github-stub:8080");
+      expect(env.OPENROUTER_BASE_URL).toBe("http://internal-gateway:8081");
+      expect(env.GITHUB_API_BASE_URL).toBe("http://internal-gateway:8080/api/v3");
     });
 
     it("rejects a non-http(s) provider base URL", () => {

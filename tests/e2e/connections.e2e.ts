@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { generateKeyPairSync, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import {
   createPrismaClient,
@@ -10,8 +10,6 @@ import { buildApp } from "../../src/app";
 import { AuthService } from "../../src/auth/auth-service";
 import { makeYouVersionVerifier } from "../../src/auth/youversion";
 import { SESSION_TTL_MS } from "../../src/auth/tokens";
-import { makeGithubAppClient } from "../../src/connections/github-app-client";
-import { GithubConnectionService } from "../../src/connections/github-connection-service";
 import { makeOpenRouterClient } from "../../src/connections/openrouter-client";
 import { makeGlooClient } from "../../src/connections/gloo-client";
 import { OpenRouterConnectionService } from "../../src/connections/openrouter-connection-service";
@@ -36,16 +34,22 @@ import {
 // live client-credentials token on every run (a real-API assertion), and the credits
 // proxy returns real OpenRouter account data.
 //
-// Infra (Postgres + the still-present-but-unused-by-this-spec stubs + MinIO) is ensured
-// by tests/e2e/global-setup.ts. The stub containers linger until Task 34-E8 tears down
-// the compose overrides; this spec no longer touches them.
+// Infra (Postgres + MinIO) is ensured by tests/e2e/global-setup.ts.
+//
+// TASK 62: this spec makes **zero GitHub calls**. It used to build a
+// `makeGithubAppClient` pointed at the github-stub purely to satisfy `buildApp`'s
+// optional `github` dep, but `github` stays NULL throughout (the only GitHub
+// assertions here are `connections.github === null` before and after disconnect, which
+// the DB-backed `ConnectionsService` reader answers on its own). With the github-stub
+// retired, that vestigial client is deleted along with its stub URL, its throwaway
+// RSA keypair and the `github` app registration — so there is nothing left in this
+// file that could accidentally reach github.com.
 
 const APP_URL =
   process.env.DATABASE_URL ??
   "postgres://supagloo:supagloo@localhost:5432/supagloo";
 const YOUVERSION_BASE =
   process.env.YOUVERSION_BASE_URL ?? "https://api.youversion.com";
-const GITHUB_BASE = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
 // Real-provider e2e (design-delta §10.2/§10.3): the OpenRouter + Gloo clients the
 // app-under-test uses point at the LIVE hosts — the same app-boot base-URL vars the
 // service reads, defaulting to the real host, with NO stub-port fallback (§10.2: a
@@ -72,29 +76,10 @@ describe("e2e: OpenRouter + Gloo connections (real providers)", () => {
 
     prisma = createPrismaClient({ connectionString: APP_URL });
 
-    const { privateKey } = generateKeyPairSync("rsa", {
-      modulusLength: 2048,
-      privateKeyEncoding: { type: "pkcs1", format: "pem" },
-      publicKeyEncoding: { type: "spki", format: "pem" },
-    });
-
     const authService = new AuthService({
       prisma,
       verifyToken: makeYouVersionVerifier({ baseUrl: YOUVERSION_BASE }),
       sessionTtlMs: SESSION_TTL_MS,
-    });
-
-    const githubAppClient = makeGithubAppClient({
-      apiBaseUrl: GITHUB_BASE,
-      appId: "123456",
-      privateKey,
-    });
-    const githubService = new GithubConnectionService({
-      prisma,
-      verifyInstallation: githubAppClient.verifyInstallation,
-      listInstallationRepos: githubAppClient.listInstallationRepos,
-      oauthBaseUrl: "https://github.com",
-      appSlug: "supagloo-app",
     });
 
     const openrouterClient = makeOpenRouterClient({ apiBaseUrl: OPENROUTER_BASE });
@@ -118,7 +103,6 @@ describe("e2e: OpenRouter + Gloo connections (real providers)", () => {
         authService,
         env: { NODE_ENV: "test", SUPAGLOO_ENABLE_TEST_SEED: "1" },
       },
-      github: { service: githubService },
       connections: {
         openrouter: openrouterService,
         gloo: glooService,

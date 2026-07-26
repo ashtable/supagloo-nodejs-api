@@ -54,7 +54,7 @@ function recordingUserAuthClient(overrides: Partial<GithubUserAuthClient> = {}) 
         owner: "acme",
         private: priv,
         defaultBranch: "main",
-        cloneUrl: "http://git-server:8080/acme/psalm-121.git",
+        cloneUrl: "https://github.com/octo-test/psalm-121.git",
       };
     },
     addRepoToInstallation: async ({ installationId, repositoryId }) => {

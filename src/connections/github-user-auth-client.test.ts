@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { makeGithubUserAuthClient } from "./github-user-auth-client";
+import {
+  makeGithubUserAuthClient,
+  GithubUserAuthExchangeError,
+} from "./github-user-auth-client";
 
 // The GitHub USER-authorization client for the create-new-repo JIT hop (Task #26,
 // design-delta §2.3/§6b). Mirrors github-app-client.ts: injectable fetch, unit-tested
@@ -98,11 +101,107 @@ describe("makeGithubUserAuthClient.exchangeCode", () => {
     await expect(makeClient(fetchImpl).exchangeCode("nope")).rejects.toThrow();
   });
 
-  it("throws when the response omits access_token", async () => {
+  // ------------------------------------------------------------------ task-62 D18-2
+  // REAL GitHub does NOT use a 4xx for a rejected authorization code: it answers
+  // HTTP **200** with `{"error":"bad_verification_code", ...}` (documented behaviour
+  // of `POST /login/oauth/access_token`). The github-stub accepted ANY non-empty code,
+  // so this path never ran in the old e2e; against real github.com it is the single
+  // most likely response while developing the create-new-repo hop. Before the fix the
+  // 200 fell through to `tokenResponseSchema.parse`, which threw an opaque
+  // `ZodError: access_token Required` with no mention of GitHub, the code, or the
+  // remediation. It must be a TYPED failure carrying GitHub's own error code.
+  it("HTTP 200 with { error: 'bad_verification_code' } becomes a TYPED exchange failure", async () => {
     const { fetchImpl } = recordingFetch(
-      () => new Response(JSON.stringify({ error: "x" }), { status: 200 }),
+      () =>
+        new Response(
+          JSON.stringify({
+            error: "bad_verification_code",
+            error_description:
+              "The code passed is incorrect or expired.",
+            error_uri:
+              "https://docs.github.com/apps/managing-oauth-apps/troubleshooting-oauth-app-access-token-request-errors/#bad-verification-code",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
     );
-    await expect(makeClient(fetchImpl).exchangeCode("c")).rejects.toThrow();
+
+    const err = await makeClient(fetchImpl)
+      .exchangeCode("already-used-code")
+      .then(
+        () => {
+          throw new Error("expected exchangeCode to reject");
+        },
+        (e: unknown) => e,
+      );
+
+    expect(err).toBeInstanceOf(GithubUserAuthExchangeError);
+    const typed = err as GithubUserAuthExchangeError;
+    expect(typed.code).toBe("bad_verification_code");
+    expect(typed.description).toBe("The code passed is incorrect or expired.");
+    // The message must name GitHub's error code so a red e2e is diagnosable from
+    // one log line (never an anonymous Zod "Required").
+    expect(typed.message).toContain("bad_verification_code");
+    expect(typed.message).not.toMatch(/access_token/);
+  });
+
+  it("carries the error code for the other documented 200-with-error variants", async () => {
+    for (const code of [
+      "incorrect_client_credentials",
+      "redirect_uri_mismatch",
+      "unverified_user_email",
+    ]) {
+      const { fetchImpl } = recordingFetch(
+        () => new Response(JSON.stringify({ error: code }), { status: 200 }),
+      );
+      const err = await makeClient(fetchImpl)
+        .exchangeCode("c")
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(GithubUserAuthExchangeError);
+      expect((err as GithubUserAuthExchangeError).code).toBe(code);
+    }
+  });
+
+  it("throws when a 200 response omits BOTH access_token and error", async () => {
+    // Not GitHub's documented shape at all (a proxy/HTML interstitial, say). This
+    // must still fail loudly — as a typed exchange failure, not a raw Zod error —
+    // and say that no access_token was returned.
+    const { fetchImpl } = recordingFetch(
+      () => new Response(JSON.stringify({ token_type: "bearer" }), { status: 200 }),
+    );
+    const err = await makeClient(fetchImpl)
+      .exchangeCode("c")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GithubUserAuthExchangeError);
+    expect((err as GithubUserAuthExchangeError).message).toMatch(
+      /no access_token/i,
+    );
+  });
+
+  it("a 5xx from the OAuth host is a typed failure naming the status", async () => {
+    const { fetchImpl } = recordingFetch(
+      () => new Response("<html>unicorn</html>", { status: 502 }),
+    );
+    const err = await makeClient(fetchImpl)
+      .exchangeCode("c")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GithubUserAuthExchangeError);
+    expect((err as GithubUserAuthExchangeError).message).toContain("502");
+  });
+
+  it("a non-JSON 200 body is a typed failure, not a SyntaxError", async () => {
+    const { fetchImpl } = recordingFetch(
+      () =>
+        new Response("access_token=ghu_x&scope=repo&token_type=bearer", {
+          status: 200,
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+    );
+    // We always send `accept: application/json`, so a form-encoded body means
+    // something upstream ignored it — surface that as our own typed failure.
+    const err = await makeClient(fetchImpl)
+      .exchangeCode("c")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GithubUserAuthExchangeError);
   });
 });
 
@@ -118,7 +217,7 @@ describe("makeGithubUserAuthClient.createUserRepo", () => {
             private: true,
             owner: { login: "acme" },
             default_branch: "main",
-            clone_url: "http://git-server:8080/acme/psalm-121.git",
+            clone_url: "https://github.com/octo-test/psalm-121.git",
           }),
           { status: 201, headers: { "content-type": "application/json" } },
         ),
@@ -181,5 +280,35 @@ describe("makeGithubUserAuthClient.addRepoToInstallation", () => {
         repositoryId: 7,
       }),
     ).rejects.toThrow();
+  });
+
+  // ------------------------------------------------------------------ task-62 D13
+  // The live `ashtable` installation is `repository_selection: "all"` (preflight §1),
+  // so `RepoProvisioningService` correctly SKIPS this call (repo-provisioning-service
+  // .ts:96) and the api e2e can never exercise it against real GitHub. Real GitHub
+  // 422s a `PUT /user/installations/:id/repositories/:repoId` against an all-repos
+  // installation ("Repository access list is not editable"). That reality lives HERE,
+  // at unit level, with an injected fetch — never as e2e egress (design-delta §10.6).
+  it("surfaces real GitHub's 422 for an all-repos installation (the branch e2e cannot reach)", async () => {
+    const { fetchImpl, calls } = recordingFetch(
+      () =>
+        new Response(
+          JSON.stringify({
+            message: "Repository access list is not editable",
+            documentation_url:
+              "https://docs.github.com/rest/apps/installations",
+          }),
+          { status: 422 },
+        ),
+    );
+    await expect(
+      makeClient(fetchImpl).addRepoToInstallation({
+        token: "ghu_user_1",
+        installationId: "9000001",
+        repositoryId: 7,
+      }),
+    ).rejects.toThrow(/422/);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe("PUT");
   });
 });

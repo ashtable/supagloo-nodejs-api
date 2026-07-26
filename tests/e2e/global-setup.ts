@@ -6,19 +6,27 @@ import { createPrismaClient } from "@supagloo/database-lib";
 
 // Reuse-or-spawn e2e infra for the API e2e suites. They boot the Fastify app
 // IN-PROCESS (real listen + real fetch) but need real dependencies from the root
-// Compose stack: Postgres (with db-lib migrations applied), the containerized
-// GitHub stub (REST + repo + Contents routes), and MinIO (S3 store + bucket).
+// Compose stack: Postgres (with db-lib migrations applied) and MinIO (S3 store +
+// bucket).
 //
 // This mirrors the root repo's reuse-or-spawn harness: if a healthy stack is
 // already up (e.g. the developer ran the root e2e), reuse it untouched; otherwise
-// bring up just `postgres` + `github-stub` + `minio(-init)` from the root Compose
-// files, apply migrations with the API's own prisma CLI, and tear down on exit.
+// bring up just `postgres` + `minio(-init)` from the root Compose files, apply
+// migrations with the API's own prisma CLI, and tear down on exit.
 //
 // Task 34-E8 (design-delta §10.7): the openrouter/gloo/youversion stubs are GONE.
-// The real-provider e2e specs (connections.e2e) reach the LIVE hosts and fail fast
-// on missing secrets via their own `resolveConnectionSeedCreds()` — no stub, and no
-// provider secret is needed HERE just to bring up infra, so this global-setup does
-// not gate on provider secrets (they belong to the specs that actually use them).
+// Task 62 (design-delta §11): the **github-stub is gone too**. Every GitHub-touching
+// api e2e now reaches REAL github.com / api.github.com, so there is no GitHub service
+// to bring up and no stub-readiness probe to run. What replaced the probe is a
+// per-spec fail-fast: `resolveGithubE2eContext()` (src/testing/github-e2e.ts) resolves
+// the four required credentials, discovers the installation id at runtime and THROWS
+// with remediation text if anything is missing.
+//
+// NO BLANKET GITHUB GATE HERE, deliberately (the 34-E8 key decision: do not couple a
+// spec to infrastructure it never uses). `renders.e2e.ts`, `auth.e2e.ts`, `files.e2e.ts`,
+// `projects.e2e.ts` and `server.e2e.ts` make zero GitHub calls; gating global-setup on
+// GitHub credentials would make them unrunnable for no benefit. The specs that need
+// GitHub gate themselves, loudly, in their own `beforeAll`.
 //
 // NOTE (deviation from the "API e2e does no docker orchestration" convention): the
 // e2e genuinely needs infra, so we adopt the same reuse-or-spawn pattern the root
@@ -31,7 +39,6 @@ const ROOT_REPO =
 const APP_URL =
   process.env.DATABASE_URL ??
   "postgres://supagloo:supagloo@localhost:5432/supagloo";
-const GITHUB_BASE = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
 // MinIO (Task #13): the files e2e presigns + round-trips against the Compose MinIO.
 // Probe the host-reachable (public) endpoint's health route.
 const MINIO_BASE = process.env.S3_PUBLIC_ENDPOINT ?? "http://localhost:9000";
@@ -80,27 +87,6 @@ async function dbReady(): Promise<boolean> {
   }
 }
 
-async function githubStubReady(): Promise<boolean> {
-  try {
-    const health = await fetch(`${GITHUB_BASE}/__stub/health`, {
-      signal: AbortSignal.timeout(3000),
-    });
-    if (!health.ok) return false;
-    // Probe the NEWEST route (Task #20 Contents API). A stale github-stub image
-    // (built before Task #20) lacks it and would 404 (unmatched); a current one
-    // 401s an unauthenticated request (it requires an installation token). Any stub
-    // with this route also has the earlier install/repos routes, so probing the
-    // newest one is sufficient — a reused-but-stale stack is rebuilt.
-    const probe = await fetch(
-      `${GITHUB_BASE}/repos/acme/probe/contents/supagloo.project.json?ref=main`,
-      { signal: AbortSignal.timeout(3000) },
-    );
-    return probe.status === 401;
-  } catch {
-    return false;
-  }
-}
-
 async function minioReady(): Promise<boolean> {
   try {
     // MinIO's liveness endpoint; 200 once the server is accepting requests. The
@@ -137,44 +123,29 @@ function migrate(): void {
 }
 
 export default async function setup() {
-  if (
-    (await dbReady()) &&
-    (await githubStubReady()) &&
-    (await minioReady())
-  ) {
+  if ((await dbReady()) && (await minioReady())) {
     // Reuse a healthy running stack — leave it exactly as-is.
     return;
   }
 
   if (!existsSync(resolve(ROOT_REPO, "docker-compose.yml"))) {
     throw new Error(
-      `API e2e needs Postgres + the GitHub stub + MinIO, but neither a running ` +
-        `stack nor the root Compose repo was found at ${ROOT_REPO}. Bring up the ` +
-        `stack (root repo: docker compose ... up) or set SUPAGLOO_ROOT_DIR.`,
+      `API e2e needs Postgres + MinIO, but neither a running stack nor the root ` +
+        `Compose repo was found at ${ROOT_REPO}. Bring up the stack (root repo: ` +
+        `docker compose ... up) or set SUPAGLOO_ROOT_DIR. (GitHub is NOT part of this ` +
+        `list any more — the api e2e talks to real github.com, which needs no local ` +
+        `service, only the credentials in the root .env.)`,
     );
   }
 
-  // `--build` so the github-stub image includes the Task #11 repo + Task #20 Contents
-  // routes. `minio` + `minio-init` provide the Task #13 S3 store + `supagloo-dev` bucket.
-  compose([
-    "up",
-    "-d",
-    "--build",
-    "postgres",
-    "github-stub",
-    "minio",
-    "minio-init",
-  ]);
+  // `minio` + `minio-init` provide the Task #13 S3 store + `supagloo-dev` bucket.
+  compose(["up", "-d", "postgres", "minio", "minio-init"]);
 
   if (!(await waitFor(pgConnectable, 90_000))) {
     compose(["down"]);
     throw new Error("Postgres did not accept connections within 90s");
   }
   migrate();
-  if (!(await waitFor(githubStubReady, 60_000))) {
-    compose(["down"]);
-    throw new Error("GitHub stub (with repo-listing route) not ready within 60s");
-  }
   if (!(await waitFor(minioReady, 60_000))) {
     compose(["down"]);
     throw new Error("MinIO not ready within 60s");
