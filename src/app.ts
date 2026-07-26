@@ -23,6 +23,7 @@ import { registerProjectJobRoutes } from "./routes/project-jobs";
 import { registerAiGenerationRoutes } from "./routes/ai-generations";
 import { registerRepoProvisioningRoutes } from "./routes/repo-provisioning";
 import { registerRenderRoutes } from "./routes/renders";
+import { registerGalleryRoutes } from "./routes/gallery";
 import type { AuthService } from "./auth/auth-service";
 import type { GithubConnectionService } from "./connections/github-connection-service";
 import type { OpenRouterConnectionService } from "./connections/openrouter-connection-service";
@@ -35,6 +36,7 @@ import type { ProjectJobsService } from "./jobs/project-jobs-service";
 import type { AiGenerationsService } from "./ai/ai-generations-service";
 import type { RepoProvisioningService } from "./projects/repo-provisioning-service";
 import type { RendersService } from "./renders/renders-service";
+import type { GalleryService } from "./gallery/gallery-service";
 
 /** Dependencies needed to serve the `/v1` auth + session surface. Supplied by
  *  `server.ts` (real Prisma-backed service) and by the e2e harness. When omitted,
@@ -129,6 +131,22 @@ export interface RendersDeps {
   service: RendersService;
 }
 
+/**
+ * Dependencies for the gallery surface (Tasks #39 + #40, design-delta §2.7/§6c/§8).
+ *
+ * Registered inside the SAME `/v1` scope as everything else — design-delta §8 says all
+ * routes live under `/v1`, and `bearerAuthPlugin` registers no instance-wide hook, so a
+ * genuinely public route inside that scope needs no second scope and no unversioned
+ * registration: it simply omits `preHandler` (or uses `app.optionalAuth`).
+ *
+ * It still requires `auth`, because that is what registers the bearer plugin whose
+ * `requireAuth` / `optionalAuth` decorators these routes reference — and four of the seven
+ * gallery routes DO need a session.
+ */
+export interface GalleryDeps {
+  service: GalleryService;
+}
+
 export interface BuildAppOptions {
   /** Enable Fastify's request logger (on for the running server, off in tests). */
   logger?: boolean;
@@ -152,6 +170,12 @@ export interface BuildAppOptions {
   repoProvisioning?: RepoProvisioningDeps;
   /** Wire the `/v1` render routes. Requires `auth` (bearer). */
   renders?: RendersDeps;
+  /**
+   * Wire the `/v1` gallery + upvote routes. Requires `auth` — not because every route needs
+   * a bearer (three do not), but because `auth` is what registers the plugin providing the
+   * `requireAuth` / `optionalAuth` decorators.
+   */
+  gallery?: GalleryDeps;
   /**
    * Wire the TEST-ONLY `POST /login/oauth/access_token` route (plan row 66).
    * Independent of `auth`: it lives OUTSIDE `/v1` and needs no bearer. Supplying this
@@ -192,6 +216,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const aiGenerations = options.aiGenerations;
   const repoProvisioning = options.repoProvisioning;
   const renders = options.renders;
+  const gallery = options.gallery;
   if (auth) {
     // Everything versioned lives under `/v1` (design-delta §8). The bearer plugin
     // is registered inside this scope so `requireAuth` is available to the routes.
@@ -238,6 +263,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         }
         if (renders) {
           registerRenderRoutes(v1, { service: renders.service });
+        }
+        if (gallery) {
+          registerGalleryRoutes(v1, { service: gallery.service });
         }
       },
       { prefix: "/v1" },

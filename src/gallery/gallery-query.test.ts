@@ -110,6 +110,17 @@ describe("gallery cursor codec", () => {
       ["n fractional", mint({ s: "popular", k: 1, i: "x", n: 1.5 })],
       ["s outside the closed enum", mint({ s: "hot", k: 1, i: "x", n: 1 })],
       ["s missing", mint({ k: 1, i: "x", n: 1 })],
+      // The key's type is validated AGAINST ITS SORT, and that is what keeps a forged
+      // cursor a 400 rather than a 500: the keyset predicate binds `k` with the cast its
+      // sort's key expression needs (`::timestamptz` / `::integer` / `::double precision`),
+      // so a `newest` key carrying a number — or a `popular` key outside int4 — would fail
+      // inside Postgres's cast, after the request had already been accepted.
+      ["newest key that is not a timestamp", mint({ s: "newest", k: 42, i: "x", n: 1 })],
+      ["newest key that is unparseable", mint({ s: "newest", k: "last tuesday", i: "x", n: 1 })],
+      ["popular key that is a string", mint({ s: "popular", k: "42", i: "x", n: 1 })],
+      ["popular key beyond int4", mint({ s: "popular", k: 2_147_483_648, i: "x", n: 1 })],
+      ["trending key that is a string", mint({ s: "trending", k: "0.5", i: "x", n: 1, t: EPOCH.toISOString() })],
+      ["trending key that is not finite", mint({ s: "trending", k: null, i: "x", n: 1, t: EPOCH.toISOString() })],
       // A trending cursor without an epoch is MEANINGLESS: every row's key would drift
       // every second and the drift would be unbounded (plan D5).
       ["trending with no epoch", mint({ s: "trending", k: 1, i: "x", n: 1 })],
@@ -336,7 +347,13 @@ describe("buildGalleryListQuery", () => {
       cursor: { s: "trending", k: 0.5, i: "clx", n: 2, t: EPOCH.toISOString() },
     });
     expect(page2.epoch).toEqual(EPOCH);
-    expect(page2.sql.values).toContain(EPOCH);
+    // DEEP on the positive side, IDENTITY on the negative side, and the asymmetry is
+    // load-bearing. The paginating epoch is reconstructed from the cursor's ISO string, so it
+    // can never be the same Date OBJECT as this file's `EPOCH` — and `toContain` compares
+    // objects by reference. The negative check below stays reference-based on purpose: `NOW`
+    // is the very object handed to the builder as its clock, so its ABSENCE from `values` is
+    // exactly the proof that the clock was not bound.
+    expect(page2.sql.values).toEqual(expect.arrayContaining([EPOCH]));
     expect(page2.sql.values).not.toContain(NOW);
 
     // The two column sorts have no epoch to freeze — their keys are real columns — so

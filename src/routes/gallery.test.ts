@@ -132,8 +132,15 @@ async function buildTestApp(
   const routes: CapturedRoute[] = [];
   app.addHook("onRoute", (r) => {
     const pre = (r as any).preHandler;
+    const method = Array.isArray(r.method) ? r.method.join(",") : String(r.method);
+    // Fastify auto-exposes a HEAD twin for every GET (`exposeHeadRoutes`, on by default and
+    // therefore true of every other route in this app). The twin is a COPY of the GET's
+    // options — same schema, same preHandler — so it is not a separate contract, and
+    // capturing it would make the route inventory below assert Fastify's defaults rather
+    // than this module's surface.
+    if (method === "HEAD") return;
     routes.push({
-      method: Array.isArray(r.method) ? r.method.join(",") : String(r.method),
+      method,
       url: r.url,
       response: ((r.schema as any)?.response ?? {}) as Record<string, unknown>,
       preHandlers: pre === undefined ? [] : Array.isArray(pre) ? pre : [pre],
@@ -567,8 +574,11 @@ describe("gallery route registration", () => {
       "DELETE /gallery/:id": [200, 401, 404],
     };
 
-    const seen = new Map(
-      built.routes.map((r) => [`${r.method} ${r.url}`, r] as const),
+    // Explicitly `Map<string, …>`: inferring the key from the template literal gives
+    // `` `${string} ${string}` ``, which `Object.entries(expected)`'s plain `string` keys
+    // cannot index (a tsc-only failure — vitest transpiles without typechecking).
+    const seen = new Map<string, CapturedRoute>(
+      built.routes.map((r) => [`${r.method} ${r.url}`, r]),
     );
     expect([...seen.keys()].sort()).toEqual(Object.keys(expected).sort());
 

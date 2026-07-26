@@ -671,6 +671,42 @@ describe("e2e: cursor pagination", () => {
     pageOneCursor = cursors[0];
   }, 120_000);
 
+  it("E-G8b: `newest` paginates too — its cursor key travels as an ISO STRING and must still compare as a timestamptz", async () => {
+    // `newest` is the ONE sort whose cursor key is not a number: it leaves Postgres as a
+    // `Date`, travels through JSON as an ISO-8601 STRING, and comes back to be compared
+    // against a `timestamptz` column — so it is the one keyset predicate whose correctness
+    // depends on parameter TYPE RESOLUTION rather than on SQL text, which is exactly what a
+    // construction-only unit test cannot see. E-G8 walks `popular` (an int key) and E-G7
+    // walks `trending` (a double key); before this case the third was never walked at all.
+    //
+    // Measured while writing it: the walk passes with the `::timestamptz` cast REMOVED too
+    // (Postgres infers the unspecified parameter's type from the column), so this is not a
+    // regression test for that cast — it is the first end-to-end proof that `newest`
+    // paginates, cursor round trip included.
+    const group = await seedGroup(
+      "pagenew",
+      [5, 4, 3, 2, 1].map((ageHours) => ({ ageHours })),
+    );
+    const { groupNonce, items } = group;
+
+    const { pages, cursors } = await walkPages(`?q=${groupNonce}&sort=newest`);
+    const walked = pages.flatMap(idsOf);
+
+    expect(pages.map((p) => p.length)).toEqual([2, 2, 1]);
+    // Seeded oldest-first (5 h → 1 h old), so newest-first is exactly the reverse.
+    expect(walked).toEqual([...idsOf(items)].reverse());
+    expect(new Set(walked).size).toBe(5);
+    expect(cursors).toHaveLength(2);
+    // No rank under any sort but popular, on every page.
+    expect(pages.flatMap((p) => p.map((i: any) => i.rank))).toEqual([
+      null,
+      null,
+      null,
+      null,
+      null,
+    ]);
+  }, 120_000);
+
   it("E-G9: a cursor minted under `popular` replayed with `sort=newest` ⇒ 400 invalid_cursor", async () => {
     if (!pageOneCursor) throw new Error("E-G8 must run first — it mints the cursor");
 

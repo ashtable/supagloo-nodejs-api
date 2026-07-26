@@ -20,6 +20,11 @@ import { FileAccessDeniedError } from "./errors";
  * Any parse failure, missing row, or ownership mismatch throws
  * {@link FileAccessDeniedError} (404) — the three are indistinguishable on the wire.
  * Uploads and deletes are NOT here (server-side worker ops / cleanup workflow).
+ *
+ * It also owns ONE ownership-free signer, {@link FilesService.presignPublicKey}, which the
+ * gallery calls through an injected seam so the whole process still has exactly one S3 URL
+ * signer. Its own JSDoc explains why that is a separate method rather than a flag on
+ * `presignDownload`.
  */
 export interface FilesServiceOptions {
   prisma: PrismaClient;
@@ -71,6 +76,53 @@ export class FilesService {
       this.now().getTime() + this.expiresInSeconds * 1000,
     );
     return { url, expiresAt };
+  }
+
+  /**
+   * Presign a GET URL for `key` with **no ownership check at all** (Task #39, plan D13).
+   *
+   * `GET /v1/gallery/:id/stream-url` is the first presign this process issues to a caller who
+   * owns nothing, so ownership is the wrong question to ask. WHY A SEPARATE METHOD rather
+   * than teaching {@link assertOwnership} about gallery visibility: publication is a
+   * DIFFERENT authorization fact from ownership, and folding it in would make one function
+   * answer two unrelated questions — and risk the gallery rule leaking onto
+   * `GET /v1/files/presign-download`.
+   *
+   * What is preserved is the pair of invariants that actually matter:
+   *   1. `parseS3Key` still runs, so a malformed key never reaches S3 (404, as ever); and
+   *   2. the SAME `S3Role="presign"` client signs, so the design's "the API is the only S3
+   *      URL signer" rule holds with exactly ONE signer in the process.
+   *
+   * THE AUTHORIZATION LIVES IN `GalleryService`: the item must exist (both `public` and
+   * `unlisted` are served), and no caller ever supplies a key — it is recomputed from the
+   * item's `renderJobId`.
+   *
+   * `expiresInSeconds` defaults to this service's configured lifetime, but the gallery passes
+   * a deliberately shorter one (120 s): for an unauthenticated caller the URL *is* the
+   * credential.
+   *
+   * HONEST LIMITATION: an HTTP range session already in flight continues past expiry. The TTL
+   * bounds NEW requests, not the stream currently being served.
+   *
+   * @throws {FileAccessDeniedError} on a malformed key, before touching S3 or the database.
+   */
+  async presignPublicKey(
+    key: string,
+    expiresInSeconds?: number,
+  ): Promise<PresignedDownload> {
+    const parsed = parseS3Key(key);
+    if (!parsed) throw new FileAccessDeniedError();
+
+    const expiresIn = expiresInSeconds ?? this.expiresInSeconds;
+    const url = await getSignedUrl(
+      this.s3,
+      new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+      { expiresIn },
+    );
+    return {
+      url,
+      expiresAt: new Date(this.now().getTime() + expiresIn * 1000),
+    };
   }
 
   /** Load the owning row for the parsed key and require it to belong to `userId`. */

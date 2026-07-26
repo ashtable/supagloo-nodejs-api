@@ -21,6 +21,7 @@ import { AiGenerationsService } from "./ai/ai-generations-service";
 import { makeGithubUserAuthClient } from "./connections/github-user-auth-client";
 import { RepoProvisioningService } from "./projects/repo-provisioning-service";
 import { RendersService } from "./renders/renders-service";
+import { GalleryService } from "./gallery/gallery-service";
 
 /**
  * Process entry point: validate the environment (fail-fast), build the app with
@@ -133,6 +134,22 @@ async function main(): Promise<void> {
     presignDownload: (userId, key) => filesService.presignDownload(userId, key),
   });
 
+  // Gallery + upvotes (design-delta §2.7/§6c/§8): publish, the public listing, stream-url
+  // and the vote transaction. No enqueuer — §7 lists gallery publish under "deliberately
+  // NOT workflows" (it is a single Postgres insert), so nothing here touches DBOS.
+  //
+  // `presignPublic` is the ONE ownership-free signer, handed over as a narrow seam so the
+  // gallery's "published, not owned" rule cannot leak onto GET /v1/files/presign-download —
+  // and so the process still has exactly ONE S3 URL signer. The 120 s stream TTL and the
+  // 24-row page size are GalleryService defaults, deliberately not env vars: neither is
+  // deployment-specific, and adding them to env.ts would mean compose/.env.example churn for
+  // two constants.
+  const galleryService = new GalleryService({
+    prisma,
+    presignPublic: (key, ttlSeconds) =>
+      filesService.presignPublicKey(key, ttlSeconds),
+  });
+
   // Create-new-repo JIT hop (design-delta §2.3/§6b): the zero-storage user-token
   // dance that creates the repo before delegating to the scaffold create path.
   const githubUserAuthClient = makeGithubUserAuthClient({
@@ -190,6 +207,7 @@ async function main(): Promise<void> {
     aiGenerations: { service: aiGenerationsService },
     repoProvisioning: { service: repoProvisioningService },
     renders: { service: rendersService },
+    gallery: { service: galleryService },
   });
 
   app.addHook("onClose", async () => {
