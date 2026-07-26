@@ -103,6 +103,10 @@ describe("loadEnv", () => {
       expect(env.OPENROUTER_BASE_URL).toBe("https://openrouter.ai");
       expect(env.GLOO_BASE_URL).toBe("https://platform.ai.gloo.com");
       expect(env.YOUVERSION_BASE_URL).toBe("https://api.youversion.com");
+      // Plan row 66: the SERVER-side half of the user-authorization host. Unset it
+      // resolves to the public value, so an already-deployed environment needs no
+      // new variable (D66.2 — "production needs zero config" survives the split).
+      expect(env.GITHUB_OAUTH_INTERNAL_BASE_URL).toBe("https://github.com");
     });
 
     // The override MECHANISM survives task 62 even though nothing in the repo
@@ -110,11 +114,16 @@ describe("loadEnv", () => {
     // the seam a GitHub Enterprise host or an in-network proxy would use, so `http://`
     // must stay valid. Sample hosts here are deliberately GENERIC — naming a retired
     // stub container would imply one still exists.
+    //
+    // Plan row 66 moved the GitHub OAuth line of this case onto the INTERNAL var: the
+    // PUBLIC one is a BROWSER redirect target, so an in-network host there is exactly
+    // the DNS_PROBE_FINISHED_NXDOMAIN artifact row 62 item (e) deleted. The only
+    // GitHub base URL an in-network host may legitimately be set on is the internal one.
     it("accepts http:// overrides (the in-network / self-hosted seam)", () => {
       const env = loadEnv(
         validEnv({
           GITHUB_API_BASE_URL: "http://internal-gateway:8080/api/v3",
-          GITHUB_OAUTH_BASE_URL: "http://internal-gateway:8080",
+          GITHUB_OAUTH_INTERNAL_BASE_URL: "http://internal-gateway:8080",
           OPENROUTER_BASE_URL: "http://internal-gateway:8081",
           GLOO_BASE_URL: "http://internal-gateway:8082",
           YOUVERSION_BASE_URL: "http://internal-gateway:8083",
@@ -122,12 +131,52 @@ describe("loadEnv", () => {
       );
       expect(env.OPENROUTER_BASE_URL).toBe("http://internal-gateway:8081");
       expect(env.GITHUB_API_BASE_URL).toBe("http://internal-gateway:8080/api/v3");
+      expect(env.GITHUB_OAUTH_INTERNAL_BASE_URL).toBe(
+        "http://internal-gateway:8080",
+      );
+      // …and the browser-facing one is UNMOVED by that override.
+      expect(env.GITHUB_OAUTH_BASE_URL).toBe("https://github.com");
     });
 
     it("rejects a non-http(s) provider base URL", () => {
       expect(() =>
         loadEnv(validEnv({ OPENROUTER_BASE_URL: "ftp://nope" })),
       ).toThrow(/OPENROUTER_BASE_URL/);
+    });
+
+    // Plan row 66 (D66.2). The internal var is a defaulted-to-the-public-value
+    // OPTIONAL, not S3's required-no-default pair: there IS a correct default here
+    // (the public host), and requiring it would break every deployed environment.
+    it("GITHUB_OAUTH_INTERNAL_BASE_URL follows an override of the PUBLIC base when itself unset", () => {
+      const env = loadEnv(
+        validEnv({ GITHUB_OAUTH_BASE_URL: "https://github.example.test" }),
+      );
+      expect(env.GITHUB_OAUTH_INTERNAL_BASE_URL).toBe(
+        "https://github.example.test",
+      );
+    });
+
+    it("rejects a non-http(s) GITHUB_OAUTH_INTERNAL_BASE_URL", () => {
+      expect(() =>
+        loadEnv(validEnv({ GITHUB_OAUTH_INTERNAL_BASE_URL: "api:4000" })),
+      ).toThrow(/GITHUB_OAUTH_INTERNAL_BASE_URL/);
+    });
+  });
+
+  // Plan row 66 (U1/D66.6). The ONE GitHub credential that ever enters a product
+  // container, consumed only by the double-gated test-only exchange route. Optional
+  // in the schema — it must be ABSENT in production — with the fail-fast living at
+  // the route so an unset value can never degrade into a silent placeholder.
+  describe("GITHUB_E2E_EXCHANGE_TOKEN (plan row 66 test-only credential)", () => {
+    it("is optional and undefined when unset", () => {
+      expect(loadEnv(validEnv()).GITHUB_E2E_EXCHANGE_TOKEN).toBeUndefined();
+    });
+
+    it("passes a supplied value through verbatim", () => {
+      expect(
+        loadEnv(validEnv({ GITHUB_E2E_EXCHANGE_TOKEN: "github_pat_placeholder" }))
+          .GITHUB_E2E_EXCHANGE_TOKEN,
+      ).toBe("github_pat_placeholder");
     });
   });
 

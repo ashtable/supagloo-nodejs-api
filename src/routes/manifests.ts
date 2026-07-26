@@ -11,6 +11,11 @@ import {
   ManifestNotFoundError,
 } from "../manifests/errors";
 import { GithubNotConnectedError } from "../connections/errors";
+import {
+  GITHUB_UPSTREAM_ERROR_SLUG,
+  GITHUB_UPSTREAM_STATUS,
+  isUpstreamGithubError,
+} from "../connections/github-app-client";
 import { ProjectNotFoundError } from "../projects/errors";
 import { errorResponseSchema } from "./auth";
 
@@ -24,7 +29,9 @@ export interface ManifestRoutesDeps {
  * the service; reads `supagloo.project.json` from the repo via the GitHub Contents API
  * and returns the Zod-parsed manifest. Error mapping (explicit `instanceof`, house
  * style): project missing/foreign/deleted → 404; no GitHub connection → 409; manifest
- * file/branch absent → 404; corrupt manifest (bad JSON or schema mismatch) → 422.
+ * file/branch absent → 404; corrupt manifest (bad JSON or schema mismatch) → 422; GitHub
+ * itself failing (the token exchange or the Contents GET) → **502**, never GitHub's own
+ * status (see `isUpstreamGithubError`).
  */
 export function registerManifestRoutes(
   app: FastifyInstance,
@@ -46,6 +53,7 @@ export function registerManifestRoutes(
           404: errorResponseSchema,
           409: errorResponseSchema,
           422: errorResponseSchema,
+          502: errorResponseSchema,
         },
       },
     },
@@ -75,6 +83,17 @@ export function registerManifestRoutes(
           return reply
             .code(422)
             .send({ error: "manifest_invalid", message: err.message });
+        }
+        // GitHub failed on the way to the file — db-lib's `mintInstallationToken`
+        // (which runs first, inside `getRepositoryFileContents`) or the Contents GET
+        // itself. Distinctly NOT this route's 404: "GitHub is broken" and "the manifest
+        // is absent at that ref" are different answers, and an upstream 401 replied as
+        // OUR 401 reads to the web client as an expired session. See
+        // `isUpstreamGithubError`.
+        if (isUpstreamGithubError(err)) {
+          return reply
+            .code(GITHUB_UPSTREAM_STATUS)
+            .send({ error: GITHUB_UPSTREAM_ERROR_SLUG, message: err.message });
         }
         throw err;
       }

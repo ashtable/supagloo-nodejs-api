@@ -22,6 +22,7 @@ import {
   githubApiBaseUrl,
   githubOauthBaseUrl,
   loadRootE2eHarness,
+  mintE2eInstallationToken,
   resolveGithubE2eContext,
   resolveGithubOauthClientCreds,
   seedGithubConnection,
@@ -61,14 +62,28 @@ import {
 // `{"error":"bad_verification_code"}`, and the client now raises a typed
 // `GithubUserAuthExchangeError` instead of an anonymous Zod parse failure.
 //
-// KNOWN PRODUCT GAP, NOT FIXED HERE (plan row N1): `createUserRepo` POSTs
-// `{name, private}` with **no `auto_init`**, so the created repo has NO commits and no
-// `main`. `scaffold-project.ts` then opens its base PR with `base: "main"`, which real
-// GitHub 422s. This spec does not hit that because it uses the stand-in scaffold worker
-// (it is testing the api's JIT hop, not the workflow), so the gap is REAL and remains
-// un-exercised end to end against real GitHub. The stub masked it by claiming
-// `default_branch: "main"` while a separate git-server fixture seeded an actual `main`.
-// A proper fix touches `ProjectVersion` PR-number nullability — a design decision.
+// FIXED BY PLAN ROW 63 (was: "KNOWN PRODUCT GAP"). `createUserRepo` used to POST
+// `{name, private}` with **no `auto_init`**, so the created repo had NO commits and no
+// `main`, and `scaffold-project.ts`'s base PR (`base: "main"`) 422'd against real
+// GitHub. The stub had masked it by claiming `default_branch: "main"` while a separate
+// git-server fixture seeded an actual `main`. The api half of the fix is asserted right
+// here — after the create, `GET /repos/:owner/:name/branches/main` must answer 200; the
+// workflow half (an unborn-base-ref bootstrap, which is what fixes the
+// existing-empty-repo path where there is no create call at all) is proven in
+// `supagloo-nodejs-dbos/tests/e2e/scaffold-project.e2e.ts`. No `ProjectVersion` schema
+// change was involved — `prNumber` was already nullable, and the base PR is preserved.
+// This spec still uses the stand-in scaffold worker: it tests the api's JIT hop, not
+// the workflow.
+//
+// ALSO FIXED HERE (DR1, the installation-visibility race). `createRepoAndProject` used
+// to `POST /user/repos` and enqueue `scaffoldProjectWorkflow` in the very next
+// statement, while the harness itself has gated on installation visibility since task 62
+// (`waitForInstallationVisibility`, "Gate #2 before any workflow enqueue"). Under
+// `repository_selection: "all"` a brand-new repo is covered by the installation but not
+// INSTANTLY, and dbos's `ensureRepoReachable` calls absence PERMANENT — so the loser of
+// that race got a job that went straight to `failed` (row 63's `markJobFailed`) next to
+// a real, empty repo. The product now runs its own bounded gate, and the assertion below
+// pins the resulting invariant with an installation token.
 //
 // This e2e never asserted stub counters (it predates that pattern by design), so
 // nothing here needed the task-62 D9 counter reclassification. It asserts through the
@@ -126,6 +141,62 @@ let enqueuer: {
   enqueue: (o: any, p: unknown) => Promise<void>;
   close: () => Promise<void>;
 };
+/** Minted ONCE (valid an hour) — the gate below polls with it many times per case. */
+let installationToken: string;
+
+const nextLink = (link: string | null): string | undefined => {
+  for (const part of (link ?? "").split(",")) {
+    const m = /^\s*<([^>]+)>\s*;\s*rel="?next"?\s*$/.exec(part);
+    if (m) return m[1];
+  }
+  return undefined;
+};
+
+/**
+ * Every repo full name the App INSTALLATION can reach — `GET /installation/repositories`
+ * with a real installation token, following `Link: rel=next`.
+ *
+ * THIS IS THE VIEW THAT MATTERS: dbos's `ensureRepoReachable`
+ * (`scaffold-project/github-rest.ts`) walks exactly this endpoint and treats absence as
+ * a PERMANENT `RepoUnreachableError`, so it is what the product's visibility gate is
+ * ultimately protecting.
+ *
+ * It is injected into `RepoProvisioningService` as the gate's lister, REPLACING the
+ * production default (`GET /user/installations/:id/repositories` with the user token).
+ * That substitution is forced, not a shortcut: the production endpoint requires a token
+ * **authorized to the GitHub App**, and this lane fakes the user token's PROVENANCE with
+ * a PAT — GitHub answers a classic `repo`-scoped PAT there with
+ * `403 "You must authenticate with an access token authorized to a GitHub App…"`
+ * (verified live against the real host). It is the SAME faked-provenance carve-out this
+ * file's header already declares for the code→token exchange, showing up a second time
+ * on the first endpoint that actually inspects provenance; the production lister itself
+ * is unit-tested in `src/connections/github-user-auth-client.test.ts`. The substitution
+ * makes this lane STRICTER, not laxer — it gates on dbos's own view rather than a proxy
+ * for it.
+ */
+async function installationRepoFullNames(): Promise<string[]> {
+  const out: string[] = [];
+  let url: string | undefined =
+    `${githubApiBaseUrl()}/installation/repositories?per_page=100`;
+  for (let page = 1; url; page += 1) {
+    if (page > 20) throw new Error("installation-repositories pagination guard tripped");
+    const res: Response = await fetch(url, {
+      headers: {
+        authorization: `Bearer ${installationToken}`,
+        accept: "application/vnd.github+json",
+      },
+    });
+    if (!res.ok) {
+      throw new Error(
+        `GET /installation/repositories failed: HTTP ${res.status} — ${await res.text()}`,
+      );
+    }
+    const body = (await res.json()) as { repositories?: { full_name: string }[] };
+    for (const repo of body.repositories ?? []) out.push(repo.full_name);
+    url = nextLink(res.headers.get("link"));
+  }
+  return out;
+}
 
 beforeAll(async () => {
   // Fail FAST + LOUD on a missing credential / uninstalled App, before any DBOS or
@@ -159,11 +230,16 @@ beforeAll(async () => {
     clientSecret: oauthCreds.clientSecret,
     fetchImpl: shimOnlyTheUserAuthorizationTokenExchange(fetch, ctx.pat),
   });
+  installationToken = await mintE2eInstallationToken();
   const repoProvisioningService = new RepoProvisioningService({
     prisma,
     userAuthClient,
     createProject: (userId, req) =>
       jobsService.createProjectWithScaffold(userId, req),
+    // The DR1 visibility gate, reading dbos's own view — see
+    // `installationRepoFullNames` for why the production default cannot be used here.
+    // Everything else about the gate (deadline, backoff, failure mode) is the product's.
+    listInstallationRepos: installationRepoFullNames,
   });
 
   app = buildApp({
@@ -317,10 +393,46 @@ describe("e2e: POST /v1/projects/create-repo — the JIT hop → scaffold", () =
     expect(project?.repoName).toBe(repoName);
     expect(project?.createdFrom).toBe("blank");
 
+    // ----------------------------------------------------------------- plan row 63
+    // The api owns repo SHAPE at creation (design-delta §7:1082-1093 — repo creation
+    // happens before the workflow), so the repo it just created must already have a
+    // real `main`. Without `auto_init: true` this GET is a 404 and every downstream
+    // `base: "main"` PR 422s. Read with the PAT: the installation may not have picked
+    // the brand-new repo up yet, and this assertion is about GitHub's state, not the
+    // installation's view of it.
+    const branchRes = await fetch(
+      `${githubApiBaseUrl()}/repos/${ctx.owner}/${repoName}/branches/main`,
+      {
+        headers: {
+          authorization: `token ${ctx.pat}`,
+          accept: "application/vnd.github+json",
+        },
+      },
+    );
+    expect(branchRes.status).toBe(200);
+
+    // ------------------------------------------------------------------------ DR1
+    // The invariant the installation-visibility gate exists to establish, asserted with
+    // the credential PRODUCTION actually holds (an installation token, minted with the
+    // product primitive) rather than the PAT: by the time `POST /projects/create-repo`
+    // answers 201, the App installation can already reach the new repo. An installation
+    // token is scoped to the installation's repositories, so a repo it cannot yet see
+    // answers 404 — which is precisely the state dbos's `ensureRepoReachable` turns into
+    // a PERMANENT `RepoUnreachableError` (no DBOS retry, job straight to `failed`).
+    //
+    // DELIBERATELY UNRETRIED. Every other real-host read in this suite gets a bounded
+    // retry because GitHub's indexes are eventually consistent; this one must NOT, or it
+    // would re-introduce the very wait it is checking for and go green whether or not
+    // the product waited. Its determinism IS the assertion — before the gate existed,
+    // this line is exactly what would have been intermittently red.
+    expect(await installationRepoFullNames()).toContain(`${ctx.owner}/${repoName}`);
+
     // The delegated scaffold job runs to completion (stand-in worker).
     const done = await pollUntilStatus(owner.token, projectId, jobId, "succeeded");
     expect(done.stages.every((s: any) => s.state === "done")).toBe(true);
-  }, 60_000);
+    // Timeout budget: the create itself is seconds, but the product's visibility gate is
+    // allowed up to 60 s (harness parity) before it gives up, and the job poll another 15.
+  }, 120_000);
 
   it("409 github_not_connected when the user has no GitHub connection", async () => {
     const owner = await seedUser("noconn");

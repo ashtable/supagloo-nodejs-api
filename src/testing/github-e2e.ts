@@ -439,9 +439,27 @@ export function githubApiBaseUrl(env: EnvSource = process.env): string {
   return env.GITHUB_API_BASE_URL ?? "https://api.github.com";
 }
 
-/** The user-authorization host. Real by default, same reasoning. */
+/** The PUBLIC user-authorization host — what a browser opens. Real by default, same
+ *  reasoning. */
 export function githubOauthBaseUrl(env: EnvSource = process.env): string {
   return env.GITHUB_OAUTH_BASE_URL ?? "https://github.com";
+}
+
+/**
+ * The INTERNAL user-authorization host — the one `exchangeCode` POSTs to (plan row
+ * 66). Defaults to the public one, and that default is LOAD-BEARING for this repo's
+ * own e2e lane, not a convenience:
+ *
+ * `shimOnlyTheUserAuthorizationTokenExchange` below matches by EXACT string equality
+ * against `https://github.com/login/oauth/access_token` and THROWS on any other URL —
+ * deliberately, so it can never rot into a general-purpose stub. The api e2e runs the
+ * client IN-PROCESS with that shim as its `fetchImpl`, so the internal base must keep
+ * resolving to the public literal here. Only the CONTAINERISED api (whose exchange
+ * has no in-process seam at all) ever sets `GITHUB_OAUTH_INTERNAL_BASE_URL`, and it
+ * points at itself over the Compose network.
+ */
+export function githubOauthInternalBaseUrl(env: EnvSource = process.env): string {
+  return env.GITHUB_OAUTH_INTERNAL_BASE_URL ?? githubOauthBaseUrl(env);
 }
 
 // ---------------------------------------------------------- fixture provisioning

@@ -10,6 +10,8 @@ import { GithubConnectionService } from "../../src/connections/github-connection
 import {
   githubApiBaseUrl,
   githubOauthBaseUrl,
+  loadRootE2eHarness,
+  mintE2eInstallationToken,
   provisionFixtureRepo,
   resolveGithubE2eContext,
   type FixtureRepo,
@@ -50,10 +52,14 @@ import {
 //     this run's own throwaway repo. The exhaustive filter matrix stays where it belongs,
 //     in `src/connections/repo-filter.test.ts`.
 //
-// DURABLE SIDE EFFECTS: this spec creates ONE private throwaway repo per run in the
-// installation's account, named by root's `buildE2eRepoName(slug, runId)`. It is NEVER
-// auto-deleted or auto-archived (task-62 D6): reclaim it with the root repo's
-// interactive, archive-only `npm run cleanup:github-e2e`.
+// DURABLE SIDE EFFECTS: this spec creates TWO private throwaway repos per run in the
+// installation's account, named by root's `buildE2eRepoName(slug, runId)` — the shared
+// `ghconn` fixture every listing assertion reads, plus a dedicated `ghempty` one for
+// the plan-row-65 second-commit spec, which MUTATES its repo into a non-empty state and
+// therefore cannot share (task-62 D7's per-file sharing rule applies "wherever the
+// workflow permits"; here it does not). Neither is EVER auto-deleted or auto-archived
+// (task-62 D6): reclaim them with the root repo's interactive, archive-only
+// `npm run cleanup:github-e2e`.
 
 const APP_URL =
   process.env.DATABASE_URL ??
@@ -293,14 +299,17 @@ describe("e2e: GitHub App connection (real github.com)", () => {
     ]);
 
     // The same repo must ALSO be reachable under `filter=empty` — this is the
-    // product-level gate on `github-app-client.ts`'s `empty = size === 0` derivation
-    // (task-62 D16). GitHub reports `size` in KB and computes it ASYNCHRONOUSLY, so a
-    // just-created `auto_init` repo (one small README commit) lists as size 0.
+    // product-level gate on `github-app-client.ts`'s emptiness derivation. A fresh
+    // `auto_init` repo has exactly ONE commit (GitHub's own README), and plan row 65's
+    // implemented rule is `≤1 commit ⇒ empty`, so it lists as empty regardless of what
+    // GitHub's asynchronous `size` currently reports.
     // IF THIS GOES RED: the derivation, not this assertion, is what is wrong — see
-    // design-delta §10.4a ("if reality differs, the client changes, not the tests")
-    // and plan row N3, which specifies the contingency (treat `size > 0` as definitive
-    // not-empty and probe `GET /repos/:o/:r/commits?per_page=2` only for the ambiguous
-    // `size === 0` subset). Do NOT relax this assertion instead.
+    // design-delta §10.4a ("if reality differs, the client changes, not the tests").
+    // The specific way it can go wrong is now known and was explicitly rejected:
+    // treating "has any ref / any commit" as not-empty (plan row 65's original,
+    // defective wording) flips every `auto_init` repo to `empty: false`, which
+    // disables the picker row that is the SOLE project-acquisition path for the whole
+    // nextjs `test:e2e:real` lane. Do NOT relax this assertion instead.
     const empty = await (
       await authed(
         "GET",
@@ -325,6 +334,85 @@ describe("e2e: GitHub App connection (real github.com)", () => {
       )
     ).json();
     expect(none.repositories).toEqual([]);
+  });
+
+  it("stops reporting a repo as empty once a SECOND commit lands, while its size still reads 0", async () => {
+    // plan row 65 (E-GC-SECOND-COMMIT) — the row's stated e2e acceptance, and the
+    // only assertion in this repo that can tell `empty = size === 0` apart from the
+    // implemented `≤1 commit` probe.
+    //
+    // GitHub computes `size` ASYNCHRONOUSLY and reports it in rounded KB, so for some
+    // window after a small commit the repo still lists as `size: 0`. Under the old
+    // derivation this spec's step (c) would see `empty: true` and fail. Under the
+    // probe (`GET /repos/:o/:r/commits?per_page=2` ⇒ 409 or ≤1 commit means empty)
+    // the second commit flips the verdict immediately, whatever `size` says.
+    //
+    // There is deliberately NO retry/poll around step (c). A poll would eventually go
+    // green the moment GitHub's async `size` caught up — i.e. it would pass on the
+    // very heuristic this test exists to disprove. The assertion must be immediate.
+    //
+    // This is the ONE spec in this file that does NOT share the file-level fixture
+    // repo (task-62 D7's creation budget): it MUTATES its repo into a non-empty one,
+    // which would invalidate every `filter=empty` assertion above it and make the
+    // whole file order-dependent. A dedicated throwaway repo is the correct cost.
+    const { token } = await seedUser();
+    expect((await connect(token)).status).toBe(200);
+
+    const repo = await provisionFixtureRepo("ghempty", {
+      spec: "supagloo-nodejs-api/tests/e2e/github-connection.e2e.ts",
+    });
+
+    const listEmpty = async () =>
+      (
+        await (
+          await authed(
+            "GET",
+            `/v1/github/repos?filter=empty&q=${encodeURIComponent(repo.repo)}`,
+            token,
+          )
+        ).json()
+      ).repositories as { name: string; empty: boolean }[];
+
+    const listAll = async () =>
+      (
+        await (
+          await authed(
+            "GET",
+            `/v1/github/repos?filter=all&q=${encodeURIComponent(repo.repo)}`,
+            token,
+          )
+        ).json()
+      ).repositories as { name: string; empty: boolean }[];
+
+    // (a) A fresh `auto_init` repo — ONE README commit — is reported EMPTY. This
+    // re-states the assertion above ("filter=empty and q=") on a repo this spec
+    // owns, and is the property that keeps the nextjs real lane's picker row
+    // clickable. A derivation that called a one-commit repo non-empty would break
+    // every real-GitHub browser spec at once.
+    expect((await listEmpty()).map((r) => r.name)).toEqual([repo.repo]);
+    expect((await listAll())[0].empty).toBe(true);
+
+    // (b) Push a SECOND commit with the installation token (the same credential the
+    // product's own workflows write with; `seedRepoFileOnBranch` uses it too).
+    const installationToken = await mintE2eInstallationToken();
+    const harness = await loadRootE2eHarness({});
+    await harness.api.putContents({
+      token: installationToken,
+      owner: repo.owner,
+      repo: repo.repo,
+      branch: repo.defaultBranch,
+      path: "row-65-second-commit.txt",
+      content:
+        "plan row 65: a second commit, so this repo must stop listing as empty " +
+        "even while GitHub's asynchronous `size` still reports 0.\n",
+    });
+
+    // (c) IMMEDIATELY — no sleep, no poll — the repo must stop being reported empty
+    // and must drop out of `filter=empty`.
+    const afterAll = await listAll();
+    expect(afterAll.map((r) => r.name)).toEqual([repo.repo]);
+    expect(afterAll[0].empty).toBe(false);
+    expect((await listEmpty()).map((r) => r.name)).toEqual([]);
   });
 
   it("listing repos before connecting GitHub returns 409", async () => {

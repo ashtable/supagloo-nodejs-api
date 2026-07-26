@@ -14,6 +14,11 @@ import {
   GithubNotConnectedError,
   InstallationVerificationError,
 } from "../connections/errors";
+import {
+  GITHUB_UPSTREAM_ERROR_SLUG,
+  GITHUB_UPSTREAM_STATUS,
+  isUpstreamGithubError,
+} from "../connections/github-app-client";
 import { toGithubConnectionDto } from "../connections/dto";
 import { errorResponseSchema } from "./auth";
 
@@ -65,6 +70,7 @@ export function registerGithubConnectionRoutes(
           200: GithubConnectionResponseSchema,
           400: errorResponseSchema,
           401: errorResponseSchema,
+          502: errorResponseSchema,
         },
       },
     },
@@ -80,6 +86,13 @@ export function registerGithubConnectionRoutes(
           return reply
             .code(400)
             .send({ error: "invalid_installation", message: err.message });
+        }
+        // GitHub itself failed (a non-2xx on the App-JWT verify). NOT the caller's
+        // fault and NOT the caller's status — see `isUpstreamGithubError`.
+        if (isUpstreamGithubError(err)) {
+          return reply
+            .code(GITHUB_UPSTREAM_STATUS)
+            .send({ error: GITHUB_UPSTREAM_ERROR_SLUG, message: err.message });
         }
         throw err;
       }
@@ -108,6 +121,14 @@ export function registerGithubConnectionRoutes(
  * Live GitHub repo listing (design-delta §8) — mints a fresh installation token
  * per request (never cached/stored). Bearer-protected; 409 if the user has no
  * GitHub connection.
+ *
+ * **This route is not only the repo picker.** The web client's `SessionProvider`
+ * calls it on every hard page load of every page to render an "N repos accessible"
+ * count, so its cost is a per-page-load cost for every connected user. The query is
+ * therefore also a REQUEST BUDGET: `GithubConnectionService.listRepos` derives from
+ * `filter`/`q` whether plan row 65's per-repo emptiness probe is worth issuing at
+ * all (deferred review finding DR2). Widening what this route asks for widens what
+ * every page load pays.
  */
 export function registerGithubRepoRoutes(
   app: FastifyInstance,
@@ -126,6 +147,7 @@ export function registerGithubRepoRoutes(
           200: GithubRepoListResponseSchema,
           401: errorResponseSchema,
           409: errorResponseSchema,
+          502: errorResponseSchema,
         },
       },
     },
@@ -141,6 +163,16 @@ export function registerGithubRepoRoutes(
           return reply
             .code(409)
             .send({ error: "github_not_connected", message: err.message });
+        }
+        // This route reaches GitHub TWICE — db-lib's `mintInstallationToken` and the
+        // paginated listing walk — and each throws its own error class. Both mean
+        // "GitHub failed", and neither may set our status: an upstream 401 replied as
+        // a 401 is read by the web client as an expired session, so an infrastructure
+        // fault would log the user out. See `isUpstreamGithubError`.
+        if (isUpstreamGithubError(err)) {
+          return reply
+            .code(GITHUB_UPSTREAM_STATUS)
+            .send({ error: GITHUB_UPSTREAM_ERROR_SLUG, message: err.message });
         }
         throw err;
       }
