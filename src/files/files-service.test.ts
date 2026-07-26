@@ -129,6 +129,83 @@ describe("FilesService.presignDownload — render keys", () => {
   });
 });
 
+// -------------------------------------------------------- presignPublicKey (Task #39)
+
+// `GET /v1/gallery/:id/stream-url` is the first presign this process issues to a caller
+// who owns NOTHING, so `presignPublicKey` performs NO ownership lookup (plan D13).
+//
+// Why a separate method rather than teaching `assertOwnership` about gallery visibility:
+// publication is a DIFFERENT authorization fact from ownership. Folding it in would make
+// one function answer two unrelated questions and risk the gallery rule leaking onto
+// `GET /v1/files/presign-download`. What is preserved is the pair of invariants that
+// matter — `parseS3Key` still runs (a malformed key never reaches S3) and the SAME
+// `S3Role="presign"` client signs, so the design's "the API is the only S3 URL signer"
+// rule still holds with exactly ONE signer in the process.
+//
+// The AUTHORIZATION lives in GalleryService: the item must exist, and the route never
+// accepts a key — it recomputes `buildRenderOutputKey(item.renderJobId)`.
+describe("FilesService.presignPublicKey — the public (ownership-free) signer", () => {
+  it("signs without ANY database lookup, against the PUBLIC endpoint", async () => {
+    const now = () => new Date("2026-07-26T12:00:00.000Z");
+    // Both tables are populated with rows owned by someone else entirely: if this method
+    // consulted either, the fake would record it AND the "ownership" would not match.
+    const { service, calls } = makeService(
+      { project: { ownerId: "someone-else" }, renderJob: { userId: "someone-else" } },
+      { now },
+    );
+    const key = buildRenderOutputKey("rj-1");
+
+    const res = await service.presignPublicKey(key, 120);
+
+    const url = new URL(res.url);
+    expect(url.host).toBe("localhost:9000");
+    expect(url.pathname).toBe(`/supagloo-dev/${key}`);
+    expect(res.url).toContain("X-Amz-Signature");
+    // No ownership query at all — that is the whole point of the method.
+    expect(calls).toEqual([]);
+  });
+
+  it("honours an explicit short TTL (the gallery's 120 s) and reports the matching expiresAt", async () => {
+    const now = () => new Date("2026-07-26T12:00:00.000Z");
+    const { service } = makeService({}, { now, expiresInSeconds: 300 });
+
+    const res = await service.presignPublicKey(buildRenderOutputKey("rj-1"), 120);
+
+    // The URL IS the credential for an unauthenticated caller, so the caller's TTL must
+    // win over the service's 300 s default rather than being silently widened.
+    expect(new URL(res.url).searchParams.get("X-Amz-Expires")).toBe("120");
+    expect(res.expiresAt.toISOString()).toBe("2026-07-26T12:02:00.000Z");
+  });
+
+  it("falls back to the service's configured TTL when none is given", async () => {
+    const now = () => new Date("2026-07-26T12:00:00.000Z");
+    const { service } = makeService({}, { now, expiresInSeconds: 300 });
+    const res = await service.presignPublicKey(buildRenderThumbnailKey("rj-1"));
+    expect(new URL(res.url).searchParams.get("X-Amz-Expires")).toBe("300");
+    expect(res.expiresAt.toISOString()).toBe("2026-07-26T12:05:00.000Z");
+  });
+
+  it("STILL rejects a malformed key with 404, before touching S3 or the database", async () => {
+    for (const bad of [
+      "",
+      "foo",
+      "renders/rj/evil.exe",
+      "projects/../assets/a1",
+      "/renders/rj-1/output.mp4",
+      "renders/rj-1/output.mp4/extra",
+    ]) {
+      const { service, calls } = makeService({
+        project: { ownerId: "u1" },
+        renderJob: { userId: "u1" },
+      });
+      await expect(service.presignPublicKey(bad, 120), bad).rejects.toBeInstanceOf(
+        FileAccessDeniedError,
+      );
+      expect(calls, bad).toEqual([]);
+    }
+  });
+});
+
 describe("FilesService.presignDownload — malformed keys", () => {
   const malformed = [
     "",
