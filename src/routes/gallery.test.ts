@@ -578,6 +578,162 @@ describe("POST/DELETE /gallery/:id/upvote — row 40", () => {
   });
 });
 
+// ------------------------------------------- the :id param + body gate (N2, task 39/40)
+
+describe("the request-string gate at the SCHEMA boundary", () => {
+  /** Every gallery route that takes an `:id`, with the auth it needs to get PAST auth. */
+  const ID_ROUTES: Array<[string, (id: string) => string, string, Record<string, string>]> = [
+    ["GET /gallery/:id", (id) => `/gallery/${id}`, "GET", {}],
+    ["GET /gallery/:id (authed)", (id) => `/gallery/${id}`, "GET", BEARER],
+    ["GET /gallery/:id/stream-url", (id) => `/gallery/${id}/stream-url`, "GET", {}],
+    ["POST /gallery/:id/upvote", (id) => `/gallery/${id}/upvote`, "POST", BEARER],
+    ["DELETE /gallery/:id/upvote", (id) => `/gallery/${id}/upvote`, "DELETE", BEARER],
+    ["DELETE /gallery/:id", (id) => `/gallery/${id}`, "DELETE", BEARER],
+  ];
+
+  it("U-GR12: a hostile `:id` is a 400 at the SCHEMA and the service is never called", async () => {
+    // N2. `GalleryIdParamSchema` is `z.string().min(1)` in db-lib, so a NUL in the path
+    // reached `prisma.galleryItem.findFirst` and answered an UNAUTHENTICATED 500 on both
+    // anonymous item routes (and an authenticated one on the other three). db-lib may not be
+    // edited from here, so the gate is an api-side refinement of the SAME schema — which
+    // keeps db-lib's `min(1)` and adds the shared text rule, rather than re-declaring the
+    // contract.
+    //
+    // The service seam is asserted UNCALLED because a 400 alone cannot distinguish "rejected
+    // at the schema" from "the service happened to throw something that maps to 400".
+    const NUL = String.fromCodePoint(0);
+    for (const [label, url, method, headers] of ID_ROUTES) {
+      for (const id of [NUL, `a${NUL}b`, `a${NUL}`, String.fromCodePoint(0x0b)]) {
+        let called = false;
+        const { service } = makeService({
+          getItem: async () => {
+            called = true;
+            return { ...ITEM };
+          },
+          presignGalleryStream: async () => {
+            called = true;
+            return { url: "https://s3.test/x", expiresAt: EXPIRES };
+          },
+          upvote: async () => {
+            called = true;
+            return { ...ITEM };
+          },
+          removeUpvote: async () => {
+            called = true;
+            return { ...ITEM };
+          },
+          deleteItem: async () => {
+            called = true;
+          },
+        });
+        const built = await buildTestApp(service);
+        const res = await built.app.inject({
+          method: method as any,
+          url: url(encodeURIComponent(id)),
+          headers,
+        });
+        const tag = `${label} id=U+${id.codePointAt(0)!.toString(16)}`;
+        expect(res.statusCode, `${tag} → ${res.body}`).toBe(400);
+        expect(called, `${tag} reached the service`).toBe(false);
+        await built.app.close();
+      }
+    }
+  });
+
+  it("U-GR12b: an ordinary unknown `:id` is still a 404, not a 400 — the gate is about what Postgres can carry, not what an id looks like", async () => {
+    // Uniform denial must survive the new gate: an unknown id and a foreign id stay
+    // indistinguishable. A cuid-shaped regex here would have made `no-such-item` a 400 and
+    // coupled every route to the id GENERATOR.
+    const { service } = makeService({
+      getItem: async () => {
+        throw new GalleryItemNotFoundError();
+      },
+    });
+    const built = await buildTestApp(service);
+    app = built.app;
+    for (const id of ["no-such-item", "gal-1", "a-b_c.d~e", "100%25", "caf%C3%A9"]) {
+      const res = await app.inject({ method: "GET", url: `/gallery/${id}` });
+      expect(res.statusCode, id).toBe(404);
+      expect(res.json().error, id).toBe("not_found");
+    }
+  });
+
+  it("U-GR12c: a hostile publish BODY string is a 400 at the schema and never reaches the service", async () => {
+    // The same class on the write path: `title`, `description` and `translation` all went
+    // straight into the INSERT, so a NUL in any of them was a 500 for an AUTHENTICATED
+    // caller. (`scriptureReference` was only accidentally protected — `deriveScriptureBook`
+    // fails on garbage and 422s — which stops being true the moment the NUL is appended to a
+    // reference that DOES derive, e.g. "Psalm 91:1 ".)
+    const NUL = String.fromCodePoint(0);
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["title", { title: `He Who Dwells${NUL}` }],
+      ["description", { description: `nine scenes${NUL}` }],
+      ["scriptureReference", { scriptureReference: `Psalm 91:1${NUL}` }],
+      ["translation", { translation: `BSB${NUL}` }],
+      ["title VT", { title: `He${String.fromCodePoint(0x0b)}Dwells` }],
+      ["description lone surrogate", { description: String.fromCodePoint(0xd800) }],
+    ];
+    for (const [label, over] of cases) {
+      let called = false;
+      const { service } = makeService({
+        publish: async () => {
+          called = true;
+          return { ...ITEM };
+        },
+      });
+      const built = await buildTestApp(service);
+      const res = await built.app.inject({
+        method: "POST",
+        url: "/renders/render-1/gallery",
+        headers: BEARER,
+        payload: { ...PUBLISH_BODY, ...over },
+      });
+      expect(res.statusCode, `${label} → ${res.body}`).toBe(400);
+      expect(called, `${label} reached the service`).toBe(false);
+      await built.app.close();
+    }
+  });
+
+  it("U-GR12d: the publish route's own `:id` (a RenderJob id) is gated too", async () => {
+    const NUL = String.fromCodePoint(0);
+    let called = false;
+    const { service } = makeService({
+      publish: async () => {
+        called = true;
+        return { ...ITEM };
+      },
+    });
+    const built = await buildTestApp(service);
+    app = built.app;
+    const res = await app.inject({
+      method: "POST",
+      url: `/renders/${encodeURIComponent(`render${NUL}`)}/gallery`,
+      headers: BEARER,
+      payload: PUBLISH_BODY,
+    });
+    expect(res.statusCode, res.body).toBe(400);
+    expect(called).toBe(false);
+  });
+
+  it("U-GR12e: a wholly ordinary publish still succeeds — the gate is not over-tight", async () => {
+    const { service, seen } = makeService();
+    const built = await buildTestApp(service);
+    app = built.app;
+    const res = await app.inject({
+      method: "POST",
+      url: "/renders/render-1/gallery",
+      headers: BEARER,
+      payload: {
+        ...PUBLISH_BODY,
+        title: "Café 100% — “He Who Dwells” 🙏",
+        description: "line one\nline two\tindented\r\nand a % and an _",
+      },
+    });
+    expect(res.statusCode, res.body).toBe(201);
+    expect(seen.publishUser).toBe("u1");
+  });
+});
+
 // ------------------------------------------------------------ registration contract
 
 describe("gallery route registration", () => {
@@ -585,14 +741,17 @@ describe("gallery route registration", () => {
     const built = await buildTestApp(makeService().service);
     app = built.app;
 
+    // Every `:id` route now HAS a 400 (the schema-level text gate), so every one declares
+    // it — an undeclared status would be serialized against no schema at all, which is the
+    // one thing U-GR11 exists to prevent.
     const expected: Record<string, number[]> = {
       "POST /renders/:id/gallery": [201, 400, 401, 404, 409, 422],
       "GET /gallery": [200, 400],
-      "GET /gallery/:id/stream-url": [200, 404],
-      "POST /gallery/:id/upvote": [200, 401, 404],
-      "DELETE /gallery/:id/upvote": [200, 401, 404],
-      "GET /gallery/:id": [200, 404],
-      "DELETE /gallery/:id": [200, 401, 404],
+      "GET /gallery/:id/stream-url": [200, 400, 404],
+      "POST /gallery/:id/upvote": [200, 400, 401, 404],
+      "DELETE /gallery/:id/upvote": [200, 400, 401, 404],
+      "GET /gallery/:id": [200, 400, 404],
+      "DELETE /gallery/:id": [200, 400, 401, 404],
     };
 
     // Explicitly `Map<string, …>`: inferring the key from the template literal gives

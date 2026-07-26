@@ -3,6 +3,7 @@ import {
   Prisma,
   type GallerySort,
 } from "@supagloo/database-lib";
+import { findPostgresTextViolation } from "../postgres-text";
 import { TRENDING } from "./trending";
 
 /**
@@ -30,10 +31,18 @@ import { TRENDING } from "./trending";
  *   3. `Prisma.raw` is used ONLY on the three numeric constants in {@link TRENDING}.
  *      Held by U-GQ4 + U-GQ5 together.
  *
- * A FOURTH rule, learned the hard way: being parameterised is not the same as being SAFE. A
- * bound parameter still has to be a value the column's type accepts, or Postgres raises and
- * the reply is a 500 carrying the SQLSTATE and the literal to an anonymous caller. That is
- * what {@link isStrictIsoInstant} and {@link parseSearchTerm} are for.
+ * A FOURTH rule, learned the hard way TWICE: being parameterised is not the same as being
+ * SAFE. A bound parameter still has to be a value the column's type accepts, or Postgres
+ * raises and the reply is a 500 carrying the SQLSTATE and the literal to an anonymous caller.
+ * Two kinds of gate enforce it, and the split matters:
+ *   - a VALUE GRAMMAR, where the parameter's type has one: {@link isStrictIsoInstant} for the
+ *     `newest` key and the trending epoch, `Number.isInteger` + int4 bounds for the `popular`
+ *     key, `Number.isSafeInteger` + {@link GALLERY_MAX_ORDINAL} for the ordinal;
+ *   - the SHARED TEXT RULE (`../postgres-text`) for every free string — the cursor's `i`, `q`,
+ *     the `:id` params and the publish body. It lives in one module, applied at each value's
+ *     own boundary, because the first attempt at this wrote a separate check per field and
+ *     LEFT ONE OUT: `i` stayed an unauthenticated 500 on all three sorts while a test claimed
+ *     the class was closed. One rule, many boundaries, no per-field re-derivation.
  *
  * Deliberately NOT here: any `book` predicate. The `book=` query parameter was cut on
  * 2026-07-26 — which books exist is a property of the TRANSLATION, with the YouVersion API
@@ -297,6 +306,14 @@ export function decodeCursor(raw: string): DecodedCursor {
   if (typeof c.i !== "string" || c.i.length === 0) {
     return reject("cursor id is missing or empty");
   }
+  // `i` IS A BOUND PARAMETER IN THE SAME KEYSET PREDICATE rule 2 above names, and until
+  // 2026-07-26 it was the only one of the cursor's four values with no VALUE gate — only a
+  // typeof/emptiness check. `{"s":"newest","k":"…","i":"\\u0000","n":1}` therefore reached
+  // `$queryRaw` and answered `500` (P2010 → SQLSTATE 22021) to an anonymous caller, on ALL
+  // THREE sorts. The gate is the shared rule, not a local check, because a local check here
+  // is what produced the gap: `k`, `t` and `n` each got one and `i` was overlooked.
+  const idViolation = findPostgresTextViolation(c.i);
+  if (idViolation !== null) return reject(`cursor id ${idViolation}`);
   if (
     typeof c.n !== "number" ||
     !Number.isSafeInteger(c.n) ||
@@ -313,11 +330,21 @@ export function decodeCursor(raw: string): DecodedCursor {
     }
   } else if (typeof k !== "number" || !Number.isFinite(k)) {
     return reject(`${s} cursor key is not a finite number`);
-  } else if (
-    s === "popular" &&
-    (!Number.isSafeInteger(k) || k < INT4_MIN || k > INT4_MAX)
-  ) {
-    return reject("popular cursor key is out of range for upvoteCount");
+  } else if (s === "popular") {
+    // TWO rejections, not one, because they are two different faults and the client fixes
+    // them differently. Until 2026-07-26 both said "out of range for upvoteCount", so a
+    // `k` of `1.5` — rejected because `upvoteCount` is an INTEGER column, and comfortably
+    // inside int4 — sent the reader hunting for a bound that was never the problem.
+    if (!Number.isInteger(k)) {
+      return reject(
+        "popular cursor key is not an integer (upvoteCount is an integer column)",
+      );
+    }
+    if (k < INT4_MIN || k > INT4_MAX) {
+      return reject(
+        "popular cursor key is out of range for upvoteCount (int4: -2147483648…2147483647)",
+      );
+    }
   }
 
   // A trending cursor without an epoch is MEANINGLESS: every row's key would drift every
@@ -378,19 +405,6 @@ export function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
-/**
- * C0 + DEL control characters, EXCEPT the three whitespace ones (`\t` `\n` `\r`).
- *
- * `U+0000` is the one that actually breaks: Postgres cannot carry a NUL in a `text`
- * parameter and answers `22021 invalid byte sequence for encoding "UTF8": 0x00`, which made
- * `GET /v1/gallery?q=%00` the cheapest 500 on the whole surface — no cursor, no session, one
- * query parameter. The rest of the class is refused with it because none of them carry search
- * meaning, and a single checkable predicate is a better rule than a one-character carve-out
- * the next control character walks around. `\t`/`\n`/`\r` are exempted because they are
- * whitespace, they are plausible in a paste, and Postgres carries them fine.
- */
-const FORBIDDEN_CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
-
 export type ParsedSearchTerm =
   | { ok: true; q: string | undefined }
   | { ok: false; reason: string };
@@ -413,11 +427,20 @@ export type ParsedSearchTerm =
  */
 export function parseSearchTerm(raw: string | undefined): ParsedSearchTerm {
   if (raw === undefined) return { ok: true, q: undefined };
+
+  // ORDER IS LOAD-BEARING: the text rule is tested on the RAW string, BEFORE any trimming.
+  // `String.prototype.trim()` treats five C0 characters as whitespace — tab, LF, **VT
+  // (U+000B)**, **FF (U+000C)** and CR — while only three are exempt, so trimming first
+  // DELETED THE EVIDENCE for the other two: `?q=%0B` and `?q=%0C` became a blank `q` and
+  // were answered with a 200 MATCH-EVERYTHING LISTING, which is exactly the "answer a
+  // hostile input with everything" outcome the reject-don't-repair rule below exists to
+  // prevent. (`?q=a%0Bb` was already rejected, because trim cannot reach the middle of a
+  // string — which is why the test that existed passed while the bug lived.)
+  const violation = findPostgresTextViolation(raw);
+  if (violation !== null) return reject(`q ${violation}`);
+
   const trimmed = raw.trim();
   if (trimmed.length === 0) return { ok: true, q: undefined };
-  if (FORBIDDEN_CONTROL_CHARS.test(trimmed)) {
-    return reject("q contains a control character");
-  }
   if (trimmed.length > GALLERY_MAX_Q_LENGTH) {
     return reject(`q is longer than ${GALLERY_MAX_Q_LENGTH} characters`);
   }

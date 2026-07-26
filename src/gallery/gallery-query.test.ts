@@ -14,6 +14,10 @@ import {
   parseSearchTerm,
   type GalleryCursor,
 } from "./gallery-query";
+import {
+  POSTGRES_TEXT_EXEMPT_CONTROL_CODES,
+  isPostgresSafeText,
+} from "../postgres-text";
 
 // Unit tests for the gallery listing's raw-SQL builder + cursor codec (Task #39, plan
 // D4/D5/D9). This is the FIRST `$queryRaw` in the api, so what is asserted here is
@@ -40,6 +44,9 @@ import {
 const NOW = new Date("2026-07-26T12:00:00.000Z");
 const EPOCH = new Date("2026-07-26T09:30:00.000Z");
 const SORTS: GallerySort[] = ["popular", "newest", "trending"];
+
+/** C0 (U+0000–U+001F) + DEL — the 33 code points the shared text rule is about. */
+const C0_AND_DEL = [...Array.from({ length: 32 }, (_, i) => i), 0x7f];
 
 /** The STATIC SQL text of a built query — the `strings` fragments only, with a sentinel
  *  where each bound value goes. The sentinel is deliberate: joining with `""` could in
@@ -264,6 +271,87 @@ describe("gallery cursor codec", () => {
     );
   });
 
+  it("U-GQ2g: the cursor's `i` is gated by the SAME rule as every other request string — it is the FOURTH bound parameter in the keyset predicate", () => {
+    // N1. The previous pass gated `k`, `t` and `n` and left `i` checked only for
+    // typeof/emptiness — so `{"s":"newest","k":"…","i":"\u0000","n":1}` was STILL an
+    // unauthenticated 500 (P2010 → SQLSTATE 22021) on ALL THREE sorts, and the e2e test
+    // whose title claimed the class was closed hardcoded `i: "zzz"` in all eleven payloads.
+    //
+    // `i` is bound in `(<key>, "id") < ($k, $i)`. It is not a special case; it is the same
+    // rule, which is why this drives the whole class rather than one example of it.
+    //
+    // The list is enumerated LITERALLY and never filtered by the predicate under test. An
+    // earlier draft wrote `.filter(v => !isPostgresSafeText(v))` and passed VACUOUSLY against
+    // a stub that accepted everything, because the list came out EMPTY — the same failure
+    // mode as an e2e whose title claims a class it never drives.
+    const EXEMPT_CODES = [0x09, 0x0a, 0x0d];
+    const hostile = [
+      ...C0_AND_DEL.filter((code) => !EXEMPT_CODES.includes(code)).map((code) =>
+        String.fromCodePoint(code),
+      ),
+      `a${String.fromCodePoint(0)}b`,
+      `clx${String.fromCodePoint(0)}`,
+      `${String.fromCodePoint(0)}clx`,
+      String.fromCodePoint(0xd800),
+      `clx${String.fromCodePoint(0xdfff)}`,
+    ];
+    // 33 C0+DEL code points less the 3 exempt, plus 5 composite cases.
+    expect(hostile).toHaveLength(35);
+    // ...and the shared predicate agrees the whole list is unsafe, so the two gates cannot
+    // drift apart without one of these two assertions failing.
+    expect(hostile.filter((v) => isPostgresSafeText(v))).toEqual([]);
+
+    for (const sort of SORTS) {
+      for (const i of hostile) {
+        const result = decodeCursor(
+          mint({
+            s: sort,
+            k: keyFor(sort),
+            i,
+            n: 1,
+            ...(sort === "trending" ? { t: EPOCH.toISOString() } : {}),
+          }),
+        );
+        expect(
+          result.ok,
+          `expected rejection: sort=${sort} i=U+${i.codePointAt(0)!.toString(16)}`,
+        ).toBe(false);
+      }
+    }
+
+    // ...and a real cuid — plus the exempt whitespace and every LIKE metacharacter — still
+    // decodes, because ids are compared for EQUALITY and this gate is about what Postgres
+    // can carry, not about what an id looks like. (A cuid-shaped regex was rejected here on
+    // purpose: it would couple every route to the id GENERATOR, and it would turn an
+    // unknown id from a uniform 404 into a 400.)
+    for (const i of ["cms1rypc40004q2lg6gcxlivg", "no-such-item", "a\tb", "100%_\\"]) {
+      expect(decodeCursor(mint({ s: "popular", k: 42, i, n: 1 })).ok, i).toBe(true);
+    }
+  });
+
+  it("U-GQ2h: the `popular` key's rejection says WHY it was rejected — a non-integer is not 'out of range'", () => {
+    // N4. Both a fractional key and an int4 overflow used to answer "out of range for
+    // upvoteCount", which sends a client hunting for a bound when the real problem is that
+    // `upvoteCount` is an integer column. An error message that misdescribes the fault is a
+    // support cost, and it is free to fix.
+    const reasonFor = (k: unknown): string => {
+      const result = decodeCursor(mint({ s: "popular", k, i: "clx", n: 1 }));
+      if (result.ok) throw new Error(`expected rejection for k=${String(k)}`);
+      return result.reason;
+    };
+
+    for (const k of [1.5, -0.5, 1e-320, 0.1]) {
+      expect(reasonFor(k), `k=${k}`).toMatch(/integer/i);
+      expect(reasonFor(k), `k=${k}`).not.toMatch(/out of range/i);
+    }
+    for (const k of [2_147_483_648, -2_147_483_649, 1e21]) {
+      expect(reasonFor(k), `k=${k}`).toMatch(/range/i);
+    }
+    // The int4 bounds themselves are still legal keys.
+    expect(decodeCursor(mint({ s: "popular", k: 2_147_483_647, i: "x", n: 1 })).ok).toBe(true);
+    expect(decodeCursor(mint({ s: "popular", k: -2_147_483_648, i: "x", n: 1 })).ok).toBe(true);
+  });
+
   it("U-GQ3: a cursor minted under one sort is REJECTED under another — never silently reset", () => {
     const popular = encodeCursor({ s: "popular", k: 42, i: "clx", n: 24 });
 
@@ -342,6 +430,57 @@ describe("escapeLike", () => {
     // Postgres carries them fine. Only the non-whitespace controls are refused.
     for (const q of ["a\tb", "a\nb", "a\r\nb"]) {
       expect(parseSearchTerm(q).ok, JSON.stringify(q)).toBe(true);
+    }
+  });
+
+  it("U-GQ13c: the control-character check runs BEFORE `.trim()`, so VT and FF cannot collapse into a blank `q`", () => {
+    // N3. `String.prototype.trim()` strips FIVE whitespace controls — tab, LF, VT, FF, CR —
+    // but the exempt set is only THREE. Testing the forbidden class after trimming therefore
+    // deleted the evidence: `q=%0B` and `q=%0C` trimmed to "" and were answered with a
+    // 200 MATCH-EVERYTHING LISTING, which is precisely the outcome "reject, do not repair"
+    // exists to prevent. `ab` was already rejected (trim cannot reach the middle of a
+    // string), which is why the existing test passed and the bug survived.
+    const CH = (code: number) => String.fromCodePoint(code);
+    for (const [label, q] of [
+      ["a lone VT", CH(0x0b)],
+      ["a lone FF", CH(0x0c)],
+      ["a leading VT", `${CH(0x0b)}psalm`],
+      ["a trailing VT", `psalm${CH(0x0b)}`],
+      ["a leading FF", `${CH(0x0c)}psalm`],
+      ["a trailing FF", `psalm${CH(0x0c)}`],
+      ["VT and FF only", `${CH(0x0b)}${CH(0x0c)}`],
+      ["a VT behind trimmable space", `  ${CH(0x0b)}  `],
+      ["a lone NUL", CH(0x00)],
+      ["a trailing NUL", `psalm${CH(0x00)}`],
+      ["a lone DEL", CH(0x7f)],
+    ] as Array<[string, string]>) {
+      const result = parseSearchTerm(q);
+      expect(result.ok, `expected rejection: ${label}`).toBe(false);
+    }
+
+    // The exempt set is EXACTLY {tab, LF, CR} and it is the shared module's set, not a
+    // second copy of it. Anything trimmable-but-exempt still means "absent".
+    expect([...POSTGRES_TEXT_EXEMPT_CONTROL_CODES].sort((a, b) => a - b)).toEqual([
+      0x09, 0x0a, 0x0d,
+    ]);
+    for (const q of ["\t", "\n", "\r", "\r\n", " \t\n\r "]) {
+      const result = parseSearchTerm(q);
+      expect(result.ok, JSON.stringify(q)).toBe(true);
+      if (!result.ok) throw new Error("unreachable");
+      expect(result.q, JSON.stringify(q)).toBeUndefined();
+    }
+
+    // Whichever member of C0+DEL is not exempt is refused, wherever it sits in the string.
+    // The expected outcome comes from a LITERAL set, not from the module's own constant, so
+    // this cannot agree with a wrong implementation.
+    for (const code of C0_AND_DEL) {
+      const ch = String.fromCodePoint(code);
+      const exempt = [0x09, 0x0a, 0x0d].includes(code);
+      for (const q of [ch, `a${ch}`, `${ch}a`, `a${ch}b`]) {
+        expect(parseSearchTerm(q).ok, `U+${code.toString(16)} in ${JSON.stringify(q)}`).toBe(
+          exempt,
+        );
+      }
     }
   });
 

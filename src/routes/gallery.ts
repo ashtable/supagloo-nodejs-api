@@ -10,6 +10,7 @@ import {
   PublishGalleryItemRequestSchema,
   RenderIdParamSchema,
 } from "@supagloo/database-lib";
+import { withPostgresSafeStrings } from "../postgres-text";
 import type { GalleryService } from "../gallery/gallery-service";
 import {
   GalleryItemAlreadyPublishedError,
@@ -74,6 +75,28 @@ export function registerGalleryRoutes(
   const { service } = deps;
   const r = app.withTypeProvider<ZodTypeProvider>();
 
+  // ---------------------------------------------------- the request-string gate (N2)
+  //
+  // Every schema below is db-lib's, REFINED with the shared "safe to bind as Postgres text"
+  // rule (`../postgres-text`) rather than re-declared here. db-lib is not editable from this
+  // repo and `GalleryIdParamSchema` is a bare `z.string().min(1)`, so `GET /v1/gallery/%00`
+  // and `GET /v1/gallery/%00/stream-url` were UNAUTHENTICATED 500s inside Prisma, and a NUL
+  // in `title`, `description` or `translation` was an authenticated one inside the INSERT.
+  //
+  // `withPostgresSafeStrings` WALKS the parsed value instead of naming fields, which is the
+  // point: when db-lib adds a string to the publish body, it is gated with no change here.
+  // The previous pass's per-field checks are exactly what let a fourth field slip through.
+  //
+  // A 400 (not a 404): the caller sent something that is not a well-formed id at all, which
+  // is a different fact from "no such item" and is fixed by a different client change. Uniform
+  // denial is untouched — an ordinary unknown id is still an indistinguishable 404, because
+  // this gate is about what Postgres can CARRY and deliberately not about what an id LOOKS
+  // like. A cuid-shaped regex was considered and rejected: it would couple every route to the
+  // id GENERATOR (`@default(cuid())` today) and turn every unknown id into a 400.
+  const IdParam = withPostgresSafeStrings(GalleryIdParamSchema);
+  const RenderIdParam = withPostgresSafeStrings(RenderIdParamSchema);
+  const PublishBody = withPostgresSafeStrings(PublishGalleryItemRequestSchema);
+
   const notFound = (reply: FastifyReply, message: string) =>
     reply.code(404).send({ error: "not_found", message });
 
@@ -118,8 +141,8 @@ export function registerGalleryRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: RenderIdParamSchema,
-        body: PublishGalleryItemRequestSchema,
+        params: RenderIdParam,
+        body: PublishBody,
         response: {
           201: GalleryItemResponseSchema,
           400: errorResponseSchema,
@@ -175,9 +198,10 @@ export function registerGalleryRoutes(
     "/gallery/:id/stream-url",
     {
       schema: {
-        params: GalleryIdParamSchema,
+        params: IdParam,
         response: {
           200: FilePresignDownloadResponseSchema,
+          400: errorResponseSchema,
           404: errorResponseSchema,
         },
       },
@@ -203,9 +227,10 @@ export function registerGalleryRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: GalleryIdParamSchema,
+        params: IdParam,
         response: {
           200: GalleryItemResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },
@@ -226,9 +251,10 @@ export function registerGalleryRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: GalleryIdParamSchema,
+        params: IdParam,
         response: {
           200: GalleryItemResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },
@@ -250,9 +276,10 @@ export function registerGalleryRoutes(
     {
       preHandler: app.optionalAuth,
       schema: {
-        params: GalleryIdParamSchema,
+        params: IdParam,
         response: {
           200: GalleryItemResponseSchema,
+          400: errorResponseSchema,
           404: errorResponseSchema,
         },
       },
@@ -276,9 +303,10 @@ export function registerGalleryRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: GalleryIdParamSchema,
+        params: IdParam,
         response: {
           200: GalleryDeleteResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },

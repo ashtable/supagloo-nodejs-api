@@ -341,6 +341,50 @@ async function listItems(
 
 const idsOf = (items: any[]) => items.map((i) => i.id);
 
+/** The three sorts, as the wire spells them. */
+const SORT_NAMES = ["popular", "newest", "trending"] as const;
+
+/** Substrings that must NEVER appear in an error body on this surface: a Postgres SQLSTATE, a
+ *  Prisma error code or brand, the raw driver text, or an absolute source path. One list, used
+ *  by every hostile-input spec.
+ *
+ *  DELIBERATELY NOT A BLANKET `FST_ERR` BAN, and the distinction is measured. Fastify's own
+ *  CLIENT-error codes are part of its public contract and already appear on this surface:
+ *  `GET /v1/gallery/%zz` is answered by the ROUTER, before any route or schema exists, with
+ *  `400 {"error":"Bad Request","code":"FST_ERR_BAD_URL", …}`. That names Fastify, not the
+ *  database, the driver or the filesystem — nothing an attacker learns from it. What must never
+ *  appear is `FST_ERR_RESPONSE_SERIALIZATION`, which is the one Fastify code the audit found on
+ *  a **500** (a forged ordinal that broke the reply's own schema); `src/error-handler.ts`
+ *  generifies every 500, so its presence anywhere would mean that handler had regressed. */
+const LEAKS = [
+  "22007",
+  "22008",
+  "22009",
+  "22021",
+  "P2010",
+  "P2023",
+  "prisma",
+  "Prisma",
+  "timestamp with time zone",
+  "byte sequence",
+  "DriverAdapterError",
+  "FST_ERR_RESPONSE_SERIALIZATION",
+  "/Users/",
+  "src/gallery",
+] as const;
+
+/** The field names a decoded cursor actually carries, read back through the REAL codec.
+ *  E-G16's coverage self-check uses this so "the matrix covers every cursor field" is a fact
+ *  about `decodeCursor` rather than a hand-kept list that can fall behind it. */
+function decodedFieldsOf(payload: unknown): Record<string, unknown> {
+  const raw = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const decoded = decodeCursor(raw);
+  if (!decoded.ok) {
+    throw new Error(`decodedFieldsOf needs a VALID cursor: ${decoded.reason}`);
+  }
+  return decoded.cursor as unknown as Record<string, unknown>;
+}
+
 /** Seed one user + project and publish `specs.length` items sharing one `q` nonce. */
 async function seedGroup(
   tag: string,
@@ -732,83 +776,207 @@ describe("e2e: cursor pagination", () => {
     expect(ok.status).toBe(200);
   });
 
-  it("E-G16: a STRUCTURALLY VALID cursor with a hostile payload is a 400 that leaks no SQLSTATE — never an unauthenticated 500", async () => {
-    // THE CASE THIS FILE WAS MISSING, and it is the reason an adversarial audit could refute
-    // the claim that a forged cursor is always a 400. E-G9's loop sends `["zzz","","e30","%%%"]`
-    // — every one of which dies at the base64 / JSON / shape gates. NOTHING here ever sent a
-    // cursor that DECODED and then carried a payload Postgres would refuse, so four distinct
-    // unauthenticated 500s survived on this endpoint, each replying with the Prisma error code,
-    // the SQLSTATE and the offending literal.
+  it("E-G16: EVERY field of a structurally valid cursor, under EVERY sort — never a 5xx, and every unambiguously hostile value is a 400 that leaks nothing", async () => {
+    // THE TEST THAT WAS FALSIFIED, AND WHY. Its previous version claimed in its own title that
+    // "a structurally valid cursor with a hostile payload" was closed, then drove eleven
+    // payloads that varied only `k`, `t` and `n` — every one hardcoding `i: "zzz"`. The FOURTH
+    // bound value of the same keyset predicate was never driven, and a cursor carrying
+    // `"i": "<NUL>"` was still an UNAUTHENTICATED 500 (P2010 → SQLSTATE 22021) under all three
+    // sorts. A test whose title claims a CLASS has to enumerate the class.
     //
-    // Every payload below was measured against this exact app and this exact Postgres at
-    // commit d319046, with NO Authorization header, and the status recorded in the comment is
-    // what it actually answered then.
+    // It is now a MATRIX over the cursor's five fields × three sorts, in two layers, because
+    // the two questions have different answers per cell:
+    //
+    //   LAYER 1 — the invariant, over the WHOLE cross product: never a 5xx, and never an
+    //   internal detail on the wire. This is the property the audit is about and it holds for
+    //   every cell regardless of whether the value is legal.
+    //
+    //   LAYER 2 — exact status, over the values that are UNAMBIGUOUSLY hostile for that field
+    //   under that sort: 400 + `invalid_cursor`.
+    //
+    // The split is not a hedge; it is the contract. Some cells are legitimately 200 and a test
+    // demanding 400 for them would be asserting a bug:
+    //   - `k: 42` is a PERFECTLY VALID `popular` key (an integer inside int4) and a valid
+    //     `trending` key (a finite double). It is only hostile under `newest`.
+    //   - `t` is READ ONLY under `trending` (`decodeCursor` never looks at `c.t` for the two
+    //     column sorts, and drops it from the decoded cursor), so a hostile `t` on a `popular`
+    //     cursor is IGNORED, not rejected — the same as any other unknown JSON field. Layer 1
+    //     is what proves that ignoring it is safe.
     const mint = (payload: unknown) =>
       Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+    const CH = (...codes: number[]) => String.fromCodePoint(...codes);
 
-    const hostile: Array<[string, unknown]> = [
-      // F1 — `newest` keys V8's Date.parse accepts and Postgres's timestamptz parser does not.
-      ["newest k=2026 (was 500 / 22007)", { s: "newest", k: "2026", i: "zzz", n: 1 }],
-      ["newest k='Jan 2000' (was 500 / 22007)", { s: "newest", k: "Jan 2000", i: "zzz", n: 1 }],
-      [
-        "newest k=2020-02-30 (was 500 / 22008 — the very error the old JSDoc claimed fixed)",
-        { s: "newest", k: "2020-02-30T00:00:00Z", i: "zzz", n: 1 },
-      ],
-      [
-        "newest k=V8's Date#toString (was 500 / 22007)",
-        {
-          s: "newest",
-          k: "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)",
-          i: "zzz",
-          n: 1,
-        },
-      ],
-      [
-        "newest k=expanded negative year (was 500 / 22009)",
-        { s: "newest", k: "-271821-04-20T00:00:00.000Z", i: "zzz", n: 1 },
-      ],
-      // Found by sweeping the NEW grammar's own extremes against this same Postgres
-      // (`scratch/probe-grammar.ts`) — not in the audit, and 500s in waiting.
-      [
-        "newest k=year zero (22008 — Postgres's calendar has no year 0)",
-        { s: "newest", k: "0000-01-01T00:00:00Z", i: "zzz", n: 1 },
-      ],
-      [
-        "newest k=offset past ±14:00 (22009 time zone displacement out of range)",
-        { s: "newest", k: "2026-07-26T12:00:00+16:00", i: "zzz", n: 1 },
-      ],
-      // F2 — the same hole on the trending pagination epoch, which is a SECOND Date.parse.
-      [
-        "trending t=expanded negative year (was 500 / 22009)",
-        { s: "trending", k: 0.5, i: "zzz", n: 1, t: "-271821-04-20T00:00:00.000Z" },
-      ],
-      [
-        "trending t=2026",
-        { s: "trending", k: 0.5, i: "zzz", n: 1, t: "2026" },
-      ],
-      // F4 — an unsafe ordinal, which 500s at the RESPONSE SERIALIZER rather than in Postgres:
-      // `n` feeds `rank`, typed `z.number().int()` on the wire DTO.
-      [
-        "popular n=MAX_SAFE_INTEGER (was 500 / FST_ERR_RESPONSE_SERIALIZATION)",
-        { s: "popular", k: 1, i: "zzz", n: Number.MAX_SAFE_INTEGER },
-      ],
-      ["popular n=1e21 (was 500)", { s: "popular", k: 1, i: "zzz", n: 1e21 }],
+    // A REAL published item, so the positive control is a genuine 200 and `i` carries the shape
+    // a client is actually handed.
+    const group = await seedGroup("hostilecursor", [{}, {}]);
+    const realId: string = group.items[0].id;
+
+    const validKey = (sort: string): unknown =>
+      sort === "newest" ? "2026-07-26T12:00:00.000Z" : sort === "popular" ? 5 : 1.5;
+    const valid = (sort: string, over: Record<string, unknown> = {}) => ({
+      s: sort,
+      k: validKey(sort),
+      i: realId,
+      n: 1,
+      ...(sort === "trending" ? { t: "2026-07-26T12:00:00.000Z" } : {}),
+      ...over,
+    });
+
+    // ANTI-VACUITY GUARD, first: the all-valid cursor must be a 200 under every sort. Without
+    // it the whole matrix could pass because every cursor was rejected for some unrelated
+    // reason (a sort mismatch, say), proving nothing about the fields at all.
+    for (const sort of SORT_NAMES) {
+      const control = await api(
+        `/gallery?sort=${sort}&cursor=${encodeURIComponent(mint(valid(sort)))}`,
+      );
+      expect(control.status, `positive control sort=${sort} → ${await control.text()}`).toBe(
+        200,
+      );
+    }
+
+    /** Strings the shared text rule (`src/postgres-text.ts`) refuses. Hostile in ANY field. */
+    const HOSTILE_TEXT: Array<[string, unknown]> = [
+      ["NUL", CH(0)], // the 22021 case — the one value Postgres refuses outright
+      ["NUL embedded", `x${CH(0)}y`],
+      ["NUL appended to a REAL id", `${realId}${CH(0)}`], // what a client would actually forge
+      ["VT", CH(0x0b)], // VT and FF get their own cases: `trim()` hides exactly these two
+      ["FF", CH(0x0c)],
+      ["ESC", CH(0x1b)],
+      ["DEL", CH(0x7f)],
+      ["unpaired surrogate", CH(0xd800)], // never carried as sent — transcoded to U+FFFD
+    ];
+    /** Values of the wrong SHAPE for any of the five fields. */
+    const WRONG_SHAPE: Array<[string, unknown]> = [
+      ["empty string", ""],
+      ["null", null],
+      ["true", true],
+      ["object", { a: 1 }],
+      ["array", ["a"]],
+      ["numeric string", "42"],
+    ];
+    /** Timestamps V8 or a human accepts and Postgres's `timestamptz` parser does not. Every
+     *  SQLSTATE below was observed as a real unauthenticated 500 at d319046 or measured against
+     *  the real database while sweeping the grammar's own extremes. */
+    const HOSTILE_TIMESTAMPS: Array<[string, unknown]> = [
+      ["bare year (22007)", "2026"],
+      ["human month/year (22007)", "Jan 2000"],
+      ["Feb 30 (22008)", "2020-02-30T00:00:00Z"],
+      ["Feb 29 of a non-leap year", "2023-02-29T00:00:00Z"],
+      ["V8 Date#toString (22007)", "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)"],
+      ["expanded negative year (22009)", "-271821-04-20T00:00:00.000Z"],
+      ["expanded positive year", "+275760-09-13T00:00:00.000Z"],
+      ["year zero (22008)", "0000-01-01T00:00:00Z"],
+      ["offset +16:00 (22009)", "2026-07-26T12:00:00+16:00"],
+      ["offset +14:01", "2026-07-26T12:00:00+14:01"],
+      ["hour 24", "2026-01-01T24:00:00Z"],
+      ["minute 60", "2026-01-01T00:60:00Z"],
+      ["space separator", "2026-07-26 12:00:00Z"],
+      ["date only", "2026-07-26"],
+      ["Postgres literal infinity", "infinity"],
+      ["Postgres literal -infinity", "-infinity"],
+      ["Postgres literal now", "now"],
+      ["Postgres literal epoch", "epoch"],
+      ["valid instant + NUL", `2026-07-26T12:00:00Z${CH(0)}`],
+    ];
+    /** Ordinals outside "a safe integer within the page-position bound". */
+    const HOSTILE_ORDINALS: Array<[string, unknown]> = [
+      ["MAX_SAFE_INTEGER", Number.MAX_SAFE_INTEGER], // FST_ERR_RESPONSE_SERIALIZATION at d319046
+      ["MAX_SAFE_INTEGER + 2", Number.MAX_SAFE_INTEGER + 2],
+      ["1e21", 1e21],
+      ["1e308", 1e308],
+      ["negative", -1],
+      ["fractional", 1.5],
+      ["past the ordinal ceiling", 1_000_001],
+    ];
+    const HOSTILE_SORTS: Array<[string, unknown]> = [
+      ["unknown sort", "hot"],
+      ["wrong case", "Popular"],
+      ["sort + NUL", `popular${CH(0)}`],
+      ["sort with SQL appended", 'popular; DROP TABLE "GalleryItem"'],
     ];
 
-    for (const [label, payload] of hostile) {
-      const sort = (payload as { s: string }).s;
-      const res = await api(
-        `/gallery?sort=${sort}&cursor=${encodeURIComponent(mint(payload))}`,
-      );
-      const body = await res.text();
-      expect(res.status, `${label} → ${res.status} ${body}`).toBe(400);
-      expect(JSON.parse(body).error, label).toBe("invalid_cursor");
-      // Nothing internal on the wire: no SQLSTATE, no Prisma code, no offending literal.
-      for (const leak of ["22007", "22008", "22009", "P2010", "prisma", "timestamp with time zone", "FST_ERR"]) {
-        expect(body, `${label} leaked ${leak}`).not.toContain(leak);
+    /** LAYER 2 — for each field, the values that MUST be a 400, and under which sorts. */
+    const MUST_REJECT: Array<[string, Array<[string, unknown]>, readonly string[]]> = [
+      // N1, the finding: `i` is the fourth bound parameter of the keyset predicate, and the
+      // whole text class must be refused under every sort.
+      ["i", [...HOSTILE_TEXT, ["empty string", ""], ["null", null], ["number", 5], ["object", { a: 1 }], ["array", ["a"]]], SORT_NAMES],
+      // `n` never has a legal value in this corpus, under any sort.
+      ["n", [...HOSTILE_ORDINALS, ...WRONG_SHAPE, ...HOSTILE_TEXT], SORT_NAMES],
+      // `s` must EQUAL the request's sort, so nothing here is ever legal.
+      ["s", [...HOSTILE_SORTS, ...WRONG_SHAPE, ...HOSTILE_TEXT], SORT_NAMES],
+      // `k` under `newest` is a STRICT ISO instant, so every hostile timestamp, every number
+      // and every non-instant string is refused.
+      ["k", [...HOSTILE_TIMESTAMPS, ...WRONG_SHAPE, ...HOSTILE_TEXT, ["a number", 42], ["a float", 1.5]], ["newest"]],
+      // `k` under `popular` is an int4 INTEGER: strings, shapes, floats and overflow are out.
+      ["k", [...HOSTILE_TIMESTAMPS, ...WRONG_SHAPE, ...HOSTILE_TEXT, ["fractional", 1.5], ["int4 overflow", 2_147_483_648], ["int4 underflow", -2_147_483_649]], ["popular"]],
+      // `k` under `trending` is any FINITE number, so only non-numbers are out.
+      ["k", [...HOSTILE_TIMESTAMPS, ...WRONG_SHAPE, ...HOSTILE_TEXT], ["trending"]],
+      // `t` is required and grammar-checked under `trending` ONLY.
+      ["t", [...HOSTILE_TIMESTAMPS, ...WRONG_SHAPE, ...HOSTILE_TEXT], ["trending"]],
+    ];
+
+    // COVERAGE SELF-CHECK: the fields exercised are exactly the fields the REAL codec returns
+    // for a valid trending cursor (the one sort carrying all five). A cursor field nobody adds
+    // here makes this fail rather than silently going untested — which is the specific way the
+    // previous version of this test became a false claim.
+    expect([...new Set(MUST_REJECT.map(([field]) => field))].sort()).toEqual(
+      Object.keys(decodedFieldsOf(valid("trending"))).sort(),
+    );
+
+    let rejected = 0;
+    for (const [field, corpus, sorts] of MUST_REJECT) {
+      for (const sort of sorts) {
+        for (const [label, value] of corpus) {
+          const res = await api(
+            `/gallery?sort=${sort}&cursor=${encodeURIComponent(mint(valid(sort, { [field]: value })))}`,
+          );
+          const body = await res.text();
+          const tag = `sort=${sort} ${field}=${label}`;
+          rejected += 1;
+          expect(res.status, `${tag} → ${res.status} ${body}`).toBe(400);
+          expect(JSON.parse(body).error, tag).toBe("invalid_cursor");
+          for (const leak of LEAKS) {
+            expect(body, `${tag} leaked ${leak}`).not.toContain(leak);
+          }
+        }
       }
     }
-  }, 120_000);
+    // The matrix is not empty and has not quietly shrunk. 293 exact-status probes at the time
+    // of writing; the floor is what guards against a corpus that silently loses entries.
+    expect(rejected).toBeGreaterThan(250);
+
+    // LAYER 1 — the invariant over the WHOLE cross product, legal cells included. This is what
+    // covers the cells layer 2 deliberately does not assert an exact status for (a `k` of 42
+    // under `popular`, a hostile `t` on a column sort), and it is the property that was
+    // violated at 5958b9f.
+    const EVERY_VALUE = [
+      ...HOSTILE_TEXT,
+      ...WRONG_SHAPE,
+      ...HOSTILE_TIMESTAMPS,
+      ...HOSTILE_ORDINALS,
+      ...HOSTILE_SORTS,
+    ];
+    let probes = 0;
+    for (const sort of SORT_NAMES) {
+      for (const field of ["s", "k", "i", "n", "t"]) {
+        for (const [label, value] of EVERY_VALUE) {
+          const res = await api(
+            `/gallery?sort=${sort}&cursor=${encodeURIComponent(mint(valid(sort, { [field]: value })))}`,
+          );
+          const body = await res.text();
+          const tag = `sort=${sort} ${field}=${label}`;
+          probes += 1;
+          expect(res.status, `${tag} → ${res.status} ${body}`).toBeLessThan(500);
+          for (const leak of LEAKS) {
+            expect(body, `${tag} leaked ${leak}`).not.toContain(leak);
+          }
+        }
+      }
+    }
+    // 3 sorts × 5 fields × the whole corpus.
+    expect(probes).toBe(SORT_NAMES.length * 5 * EVERY_VALUE.length);
+    expect(probes).toBeGreaterThan(600);
+  }, 300_000);
 
   it("E-G17: a NUL byte in `q` is a 400 — one query parameter used to be the cheapest 500 on the surface", async () => {
     // F3. No cursor, no session, one parameter: `GET /v1/gallery?q=%00` answered
@@ -838,7 +1006,221 @@ describe("e2e: cursor pagination", () => {
     // them fine, so only the non-whitespace controls are refused.
     const tabbed = await api(`/gallery?q=${encodeURIComponent("a\tb")}`);
     expect(tabbed.status).toBe(200);
+
+    // N3, and the correction to this test's own claim. VT (U+000B) and FF (U+000C) are the two
+    // control characters `String.prototype.trim()` treats as whitespace but the exempt set does
+    // NOT include, so testing the class AFTER trimming deleted the evidence for them.
+    // MEASURED at 5958b9f: `?q=%0B` and `?q=%0C` each answered **200 with 24 items — the whole
+    // first page, byte-identical to a blank `q`** — a match-everything listing handed back in
+    // answer to a hostile input, which is the exact outcome the reject-don't-repair rule exists
+    // to prevent. `?q=a%0Bb` was already a 400 (trim cannot reach the middle of a string), which
+    // is why the test that existed passed while the bug lived.
+    const CTRL = (code: number) => String.fromCodePoint(code);
+    for (const [label, raw] of [
+      ["a lone VT", CTRL(0x0b)],
+      ["a lone FF", CTRL(0x0c)],
+      ["a leading VT", `${CTRL(0x0b)}psalm`],
+      ["a trailing VT", `psalm${CTRL(0x0b)}`],
+      ["a leading FF", `${CTRL(0x0c)}psalm`],
+      ["a trailing FF", `psalm${CTRL(0x0c)}`],
+      ["a VT behind trimmable space", `  ${CTRL(0x0b)}  `],
+    ] as Array<[string, string]>) {
+      const res = await api(`/gallery?q=${encodeURIComponent(raw)}`);
+      const body = await res.text();
+      expect(res.status, `${label} → ${res.status} ${body}`).toBe(400);
+      expect(JSON.parse(body).error, label).toBe("invalid_query");
+    }
+
+    // The EXEMPT three are still whitespace and still mean "absent" — so the fix did not turn a
+    // pasted tab or newline into a 400. `%09` answers exactly what a blank `q` answers.
+    const blank = await api("/gallery");
+    const blankIds = idsOf((await blank.json()).items);
+    for (const exempt of [CTRL(0x09), CTRL(0x0a), CTRL(0x0d)]) {
+      const res = await api(`/gallery?q=${encodeURIComponent(exempt)}`);
+      expect(res.status, `U+${exempt.codePointAt(0)!.toString(16)}`).toBe(200);
+      expect(idsOf((await res.json()).items)).toEqual(blankIds);
+    }
+
   }, 120_000);
+
+  it("E-G20: a hostile `:id` PATH SEGMENT is a 400 on every gallery route — and an ordinary unknown id is still a 404", async () => {
+    // N2, the other half of the same class as E-G16. `GalleryIdParamSchema` is
+    // `z.string().min(1)` in db-lib, so `GET /v1/gallery/%00` and
+    // `GET /v1/gallery/%00/stream-url` reached Prisma and answered UNAUTHENTICATED 500s (one a
+    // `DriverAdapterError` carrying `invalid byte sequence for encoding "UTF8": 0x00`, the
+    // other a Prisma error whose raw message carried an absolute source path). Measured here
+    // across EVERY route that takes an `:id`, authed ones included — the previous claim that
+    // "the authed routes 401 first" is only true for a caller with no session, and a signed-in
+    // caller reached exactly the same 500.
+    const group = await seedGroup("hostileid", [{}]);
+    const realId: string = group.items[0].id;
+    const token = group.token;
+    const CH = (...codes: number[]) => String.fromCodePoint(...codes);
+
+    /** [label, path suffix, method, send a bearer?] — every `:id` route on the surface. */
+    const routes: Array<[string, string, string, boolean]> = [
+      ["GET /gallery/:id anonymous", "", "GET", false],
+      ["GET /gallery/:id authed", "", "GET", true],
+      ["GET /gallery/:id/stream-url", "/stream-url", "GET", false],
+      ["POST /gallery/:id/upvote", "/upvote", "POST", true],
+      ["DELETE /gallery/:id/upvote", "/upvote", "DELETE", true],
+      ["DELETE /gallery/:id", "", "DELETE", true],
+    ];
+
+    /** Path segments that must be a 400. Both the percent-encoded form and, where a client
+     *  could send it raw, the raw form. */
+    const hostile: Array<[string, string]> = [
+      ["%00", "%00"],
+      ["%00 embedded", `a${encodeURIComponent(CH(0))}b`],
+      ["%00 appended to a REAL id", `${realId}${encodeURIComponent(CH(0))}`],
+      ["%0B vertical tab", encodeURIComponent(CH(0x0b))],
+      ["%0C form feed", encodeURIComponent(CH(0x0c))],
+      ["%1B escape", encodeURIComponent(CH(0x1b))],
+      ["%7F delete", encodeURIComponent(CH(0x7f))],
+    ];
+    // `%09` is deliberately NOT in that list. Tab is one of the three EXEMPT control
+    // characters, so an id of a bare tab is safe text, reaches Prisma and is an ordinary 404 —
+    // measured. Asserting 400 for it would have pinned a rule the code does not have and does
+    // not want: the exempt set is {tab, LF, CR} and it is exempt everywhere or nowhere.
+    for (const exempt of [CH(0x09), CH(0x0a), CH(0x0d)]) {
+      const res = await api(`/gallery/${encodeURIComponent(exempt)}`);
+      expect(res.status, `exempt U+${exempt.codePointAt(0)!.toString(16)}`).toBe(404);
+    }
+
+    for (const [routeLabel, suffix, method, authed] of routes) {
+      for (const [label, segment] of hostile) {
+        const res = await api(`/gallery/${segment}${suffix}`, authed ? token : undefined, {
+          method,
+        });
+        const body = await res.text();
+        const tag = `${routeLabel} ${label}`;
+        // A 400 and not a 404: "not a well-formed id" is a different fact from "no such item",
+        // and the two are fixed by different client changes.
+        expect(res.status, `${tag} → ${res.status} ${body}`).toBe(400);
+        for (const leak of LEAKS) {
+          expect(body, `${tag} leaked ${leak}`).not.toContain(leak);
+        }
+      }
+
+      // UNIFORM DENIAL SURVIVES THE GATE, which is the thing that could most easily have been
+      // broken by tightening this schema: an unknown id, a foreign-looking id and a real id
+      // the caller does not own must all stay indistinguishable 404s. A cuid-shaped regex
+      // would have turned every one of these into a 400 and coupled the route to the id
+      // generator.
+      // (Kept inside Fastify's `maxParamLength`, which is 100 by default — see the separate
+      // over-long assertion below.)
+      for (const unknown of ["no-such-item", "gal-1", "a-b_c.d~e", "0", "x".repeat(64)]) {
+        const res = await api(`/gallery/${unknown}${suffix}`, authed ? token : undefined, {
+          method,
+        });
+        expect(res.status, `${routeLabel} ${unknown} → ${res.status}`).toBe(404);
+        expect((await res.json()).error).toBe("not_found");
+      }
+    }
+
+    // ...and the RENDER `:id` on the publish route, which is the same class on the write path.
+    const publishHostile = await api(
+      `/renders/${encodeURIComponent(`render${CH(0)}`)}/gallery`,
+      token,
+      { method: "POST", body: publishBody() },
+    );
+    expect(publishHostile.status, await publishHostile.clone().text()).toBe(400);
+
+    // AN OVER-LONG `:id` NEEDS NO GATE OF OURS, and this is why there is no length bound in the
+    // params schema: MEASURED, a 200-character segment is a **414** and an 8 000-character one
+    // likewise — the router/transport refuses it before any handler runs. (An id is compared
+    // for EQUALITY against an indexed column, so even an accepted long id costs one index
+    // probe; that is nothing like `q`, whose length bound exists because it drives three
+    // unanchored `ILIKE '%…%'` scans per row.)
+    for (const long of ["x".repeat(200), "x".repeat(8_000)]) {
+      const res = await api(`/gallery/${long}`);
+      expect(res.status, `${long.length}-char id → ${res.status}`).toBeGreaterThanOrEqual(400);
+      expect(res.status, `${long.length}-char id → ${res.status}`).toBeLessThan(500);
+    }
+
+    // THE NEW 400 IS THE SURFACE'S EXISTING 400, not a second error contract. The params gate
+    // is a Zod refinement, so its reply goes through the same `errorResponseSchema` the route
+    // already declared — which means `{error, message}` and NOT Fastify's raw
+    // `{statusCode, code, error, message}`. Asserted against the pre-existing querystring
+    // rejection so the two cannot drift.
+    const paramReject = await api(`/gallery/${encodeURIComponent(CH(0))}`);
+    const queryReject = await api("/gallery?sort=hot");
+    const paramBody = await paramReject.json();
+    const queryBody = await queryReject.json();
+    expect(Object.keys(paramBody).sort()).toEqual(Object.keys(queryBody).sort());
+    expect(paramBody.error).toBe(queryBody.error);
+    expect(paramBody.message).toContain("params/id");
+    expect(paramBody.message).toContain("control character");
+
+    // A malformed percent-escape and a non-UTF-8 byte sequence in the path must also not 5xx.
+    // MEASURED: `%zz`, `%FF`, `%C0%80` and `%ED%A0%80` are all `400 FST_ERR_BAD_URL` from the
+    // ROUTER, before any route or schema exists; `%2F` and `%25` decode to `/` and `%`, which
+    // are ordinary safe text and therefore ordinary 404s.
+    for (const segment of ["%zz", "%FF", "%C0%80", "%ED%A0%80", "%2F", "%25"]) {
+      const res = await api(`/gallery/${segment}`);
+      const body = await res.text();
+      expect(res.status, `${segment} → ${res.status} ${body}`).toBeLessThan(500);
+      for (const leak of LEAKS) {
+        expect(body, `${segment} leaked ${leak}`).not.toContain(leak);
+      }
+    }
+  }, 300_000);
+
+  it("E-G21: a hostile PUBLISH BODY string is a 400 and writes nothing — including a reference that derives and THEN carries a NUL", async () => {
+    // The write path's half of the class, and the one the audit did not report at all. `title`,
+    // `description` and `translation` went straight into the INSERT with no text gate, so a NUL
+    // in any of them was a 500 for an AUTHENTICATED caller. `scriptureReference` looked safe
+    // only because `deriveScriptureBook` 422s on garbage — which stops being true the moment
+    // the NUL is APPENDED to a reference that derives fine. Measured at 5958b9f: all four are
+    // 500s, `scriptureReference: "Psalm 91:1<NUL>"` among them.
+    const user = await seedUser("hostilebody");
+    const project = await seedProject(user.userId, "hostilebody");
+    const CH = (...codes: number[]) => String.fromCodePoint(...codes);
+
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["title + NUL", { title: `He Who Dwells${CH(0)}` }],
+      ["title NUL only", { title: CH(0) }],
+      ["title + VT", { title: `He${CH(0x0b)}Dwells` }],
+      ["title + DEL", { title: `He${CH(0x7f)}Dwells` }],
+      ["description + NUL", { description: `nine scenes${CH(0)}` }],
+      ["description unpaired surrogate", { description: CH(0xd800) }],
+      // The deriver SUCCEEDS on this one, so at 5958b9f the INSERT was attempted.
+      ["scriptureReference derives THEN NUL", { scriptureReference: `Psalm 91:1${CH(0)}` }],
+      ["translation + NUL", { translation: `BSB${CH(0)}` }],
+    ];
+
+    for (const [label, over] of cases) {
+      const renderId = await seedCompletedRender(user, project, `hb${cases.indexOf(over as any)}`);
+      const res = await publish(user.token, renderId, over);
+      const body = await res.text();
+      expect(res.status, `${label} → ${res.status} ${body}`).toBe(400);
+      for (const leak of LEAKS) {
+        expect(body, `${label} leaked ${leak}`).not.toContain(leak);
+      }
+      // NOTHING was written: the render is still publishable afterwards.
+      const rows = await prisma.galleryItem.count({ where: { renderJobId: renderId } });
+      expect(rows, `${label} wrote a row`).toBe(0);
+    }
+
+    // ...and the gate is not over-tight: a title with real punctuation, an emoji, a newline in
+    // the description and both LIKE metacharacters still publishes.
+    const okRender = await seedCompletedRender(user, project, "hbok");
+    const ok = await publish(user.token, okRender, {
+      title: "Café 100% — “He Who Dwells” 🙏",
+      description: "line one\nline two\tindented\r\nwith a % and an _",
+      scriptureReference: "Psalm 91:1",
+    });
+    expect(ok.status, await ok.clone().text()).toBe(201);
+    const item = (await ok.json()).item;
+    expect(item.title).toBe("Café 100% — “He Who Dwells” 🙏");
+    // Round-tripped through Postgres UNCHANGED — which is the whole point of rejecting the
+    // values that would not have.
+    const read = await api(`/gallery/${item.id}`);
+    expect((await read.json()).item.description).toBe(
+      "line one\nline two\tindented\r\nwith a % and an _",
+    );
+  }, 300_000);
+
 });
 
 // ----------------------------------------------------------------------- search (D9)
@@ -875,10 +1257,19 @@ describe("e2e: free-text search", () => {
 
     // THE ESCAPE TEST. Without `escapeLike`, `%` is a match-everything wildcard and `_`
     // matches any single character — a real, easily-missed bug.
+    // SCOPED, not global. These two assertions used to be `toEqual([])` — i.e. "no row in the
+    // whole database contains a literal % or _". That is an assumption about every OTHER
+    // spec's fixtures, which this file's own header forbids for exactly this reason, and
+    // E-G21 broke it the moment it published a title containing "100%" to prove the text gate
+    // is not over-tight. What "% is a LITERAL" actually means is that `%` does not match
+    // everything, so that is what is asserted: none of THIS group's items comes back.
     const percent = await listItems(`?q=${encodeURIComponent("%")}`);
-    expect(percent.items).toEqual([]);
+    expect(idsOf(percent.items).filter((id) => idsOf(items).includes(id))).toEqual([]);
     const underscore = await listItems(`?q=${encodeURIComponent("_")}`);
-    expect(underscore.items).toEqual([]);
+    expect(idsOf(underscore.items).filter((id) => idsOf(items).includes(id))).toEqual([]);
+    // ...and it is genuinely not a match-everything: a blank `q` DOES return this group.
+    const blankQ = await listItems(`?q=${groupNonce}`);
+    expect(idsOf(blankQ.items).length).toBeGreaterThan(0);
     const partial = await listItems(`?q=${encodeURIComponent(`${titleToken.slice(0, 6)}_`)}`);
     expect(partial.items).toEqual([]);
 

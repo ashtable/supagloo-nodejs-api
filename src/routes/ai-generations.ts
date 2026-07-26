@@ -8,6 +8,7 @@ import {
   CreateAiGenerationResponseSchema,
   ProjectIdParamSchema,
 } from "@supagloo/database-lib";
+import { withPostgresSafeStrings } from "../postgres-text";
 import type { AiGenerationsService } from "../ai/ai-generations-service";
 import {
   AiGenerationNotFoundError,
@@ -41,6 +42,26 @@ export function registerAiGenerationRoutes(
   app: FastifyInstance,
   deps: AiGenerationRoutesDeps,
 ): void {
+
+  // ---------------------------------------------- the path-parameter text gate (N2, widened)
+  //
+  // db-lib's `:id` param schemas are bare `z.string().min(1)`, and db-lib is not editable from
+  // this repo, so each is REFINED here with the shared "safe to bind as Postgres text" rule
+  // (`../postgres-text`). Without it a NUL in the path reached Prisma and answered a 500 to a
+  // caller holding a valid session — MEASURED on every route below before this change.
+  //
+  // Refining is deliberate rather than re-declaring: `withPostgresSafeStrings` returns a NEW
+  // schema (proven — the db-lib object is not mutated, so other consumers are unaffected) that
+  // keeps db-lib's own rules and adds one check. And it WALKS the parsed value instead of naming
+  // fields, so a route that grows a second path parameter is covered with no change here.
+  //
+  // A 400, not a 404: "not a well-formed id" is a different fact from "no such thing", and
+  // uniform denial is untouched — an ordinary unknown id is still an indistinguishable 404,
+  // because the rule is about what Postgres can CARRY and not about what an id looks like.
+  // `src/routes/path-params-gate.test.ts` holds this for EVERY parameterised route in the app,
+  // including ones not yet written.
+  const AiGenerationIdParam = withPostgresSafeStrings(AiGenerationIdParamSchema);
+  const ProjectIdParam = withPostgresSafeStrings(ProjectIdParamSchema);
   const { service } = deps;
   const r = app.withTypeProvider<ZodTypeProvider>();
 
@@ -93,9 +114,10 @@ export function registerAiGenerationRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: AiGenerationIdParamSchema,
+        params: AiGenerationIdParam,
         response: {
           200: AiGenerationResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },
@@ -123,9 +145,10 @@ export function registerAiGenerationRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: ProjectIdParamSchema,
+        params: ProjectIdParam,
         response: {
           200: AiGenerationListResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },
@@ -153,9 +176,10 @@ export function registerAiGenerationRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: AiGenerationIdParamSchema,
+        params: AiGenerationIdParam,
         response: {
           200: AiGenerationResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
           409: errorResponseSchema,
