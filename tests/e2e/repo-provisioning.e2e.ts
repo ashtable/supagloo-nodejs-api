@@ -61,14 +61,18 @@ import {
 // `{"error":"bad_verification_code"}`, and the client now raises a typed
 // `GithubUserAuthExchangeError` instead of an anonymous Zod parse failure.
 //
-// KNOWN PRODUCT GAP, NOT FIXED HERE (plan row N1): `createUserRepo` POSTs
-// `{name, private}` with **no `auto_init`**, so the created repo has NO commits and no
-// `main`. `scaffold-project.ts` then opens its base PR with `base: "main"`, which real
-// GitHub 422s. This spec does not hit that because it uses the stand-in scaffold worker
-// (it is testing the api's JIT hop, not the workflow), so the gap is REAL and remains
-// un-exercised end to end against real GitHub. The stub masked it by claiming
-// `default_branch: "main"` while a separate git-server fixture seeded an actual `main`.
-// A proper fix touches `ProjectVersion` PR-number nullability — a design decision.
+// FIXED BY PLAN ROW 63 (was: "KNOWN PRODUCT GAP"). `createUserRepo` used to POST
+// `{name, private}` with **no `auto_init`**, so the created repo had NO commits and no
+// `main`, and `scaffold-project.ts`'s base PR (`base: "main"`) 422'd against real
+// GitHub. The stub had masked it by claiming `default_branch: "main"` while a separate
+// git-server fixture seeded an actual `main`. The api half of the fix is asserted right
+// here — after the create, `GET /repos/:owner/:name/branches/main` must answer 200; the
+// workflow half (an unborn-base-ref bootstrap, which is what fixes the
+// existing-empty-repo path where there is no create call at all) is proven in
+// `supagloo-nodejs-dbos/tests/e2e/scaffold-project.e2e.ts`. No `ProjectVersion` schema
+// change was involved — `prNumber` was already nullable, and the base PR is preserved.
+// This spec still uses the stand-in scaffold worker: it tests the api's JIT hop, not
+// the workflow.
 //
 // This e2e never asserted stub counters (it predates that pattern by design), so
 // nothing here needed the task-62 D9 counter reclassification. It asserts through the
@@ -316,6 +320,24 @@ describe("e2e: POST /v1/projects/create-repo — the JIT hop → scaffold", () =
     expect(project?.repoOwner).toBe(ctx.owner);
     expect(project?.repoName).toBe(repoName);
     expect(project?.createdFrom).toBe("blank");
+
+    // ----------------------------------------------------------------- plan row 63
+    // The api owns repo SHAPE at creation (design-delta §7:1082-1093 — repo creation
+    // happens before the workflow), so the repo it just created must already have a
+    // real `main`. Without `auto_init: true` this GET is a 404 and every downstream
+    // `base: "main"` PR 422s. Read with the PAT: the installation may not have picked
+    // the brand-new repo up yet, and this assertion is about GitHub's state, not the
+    // installation's view of it.
+    const branchRes = await fetch(
+      `${githubApiBaseUrl()}/repos/${ctx.owner}/${repoName}/branches/main`,
+      {
+        headers: {
+          authorization: `token ${ctx.pat}`,
+          accept: "application/vnd.github+json",
+        },
+      },
+    );
+    expect(branchRes.status).toBe(200);
 
     // The delegated scaffold job runs to completion (stand-in worker).
     const done = await pollUntilStatus(owner.token, projectId, jobId, "succeeded");

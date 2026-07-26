@@ -13,8 +13,19 @@
  */
 export class RepoCreationError extends Error {
   readonly statusCode = 502;
-  constructor(message = "failed to create the GitHub repository", options?: { cause?: unknown }) {
+  /**
+   * The upstream GitHub HTTP status, when the cause carried one (plan row 63 / D63.5).
+   * The reply's status code (**502**) and error slug (`repo_creation_failed`) are
+   * contract-pinned and unaffected; this only lets the human-readable message name the
+   * real upstream failure instead of collapsing every cause into one opaque 502.
+   */
+  readonly upstreamStatus?: number;
+  constructor(
+    message = "failed to create the GitHub repository",
+    options?: { cause?: unknown; upstreamStatus?: number },
+  ) {
     super(message, options);
     this.name = "RepoCreationError";
+    this.upstreamStatus = options?.upstreamStatus;
   }
 }

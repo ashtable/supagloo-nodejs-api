@@ -4,7 +4,10 @@ import type {
   PrismaClient,
 } from "@supagloo/database-lib";
 import { GithubNotConnectedError } from "../connections/errors";
-import type { GithubUserAuthClient } from "../connections/github-user-auth-client";
+import {
+  GithubCreateRepoError,
+  type GithubUserAuthClient,
+} from "../connections/github-user-auth-client";
 import { RepoCreationError } from "./repo-provisioning-errors";
 
 /** The create-project+scaffold delegate (task-18 `ProjectJobsService.createProjectWithScaffold`),
@@ -103,7 +106,20 @@ export class RepoProvisioningService {
       // The user token goes out of scope here — never stored.
       return created;
     } catch (err) {
-      throw new RepoCreationError(undefined, { cause: err });
+      // Plan row 63 / D63.5: keep the reply's 502 + `repo_creation_failed` slug exactly
+      // as the contract pins them, but stop DESTROYING the upstream status. A typed
+      // `GithubCreateRepoError` carries GitHub's own status and words; every other
+      // cause (a code-exchange failure, an installation-add failure) still collapses to
+      // the generic message, as before.
+      const upstreamStatus =
+        err instanceof GithubCreateRepoError ? err.status : undefined;
+      throw new RepoCreationError(
+        upstreamStatus === undefined
+          ? undefined
+          : `failed to create the GitHub repository (GitHub returned ${upstreamStatus}): ` +
+            `${(err as Error).message}`,
+        { cause: err, upstreamStatus },
+      );
     }
   }
 }

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   makeGithubUserAuthClient,
+  GithubCreateRepoError,
   GithubUserAuthExchangeError,
 } from "./github-user-auth-client";
 
@@ -205,6 +206,83 @@ describe("makeGithubUserAuthClient.exchangeCode", () => {
   });
 });
 
+// ── plan row 66: the PUBLIC/INTERNAL user-authorization host split ────────────
+//
+// `oauthBaseUrl` served THREE call sites of two different kinds through ONE closure
+// const: `buildAuthorizeUrl` + `installUrl` are BROWSER targets (the user's own
+// machine resolves them), while `exchangeCode` is a SERVER-side POST from the api
+// process. One variable cannot be both, which is why a containerised api could never
+// have its exchange intercepted without pointing the browser at a Compose-internal
+// hostname (row 62 item (e)'s DNS_PROBE_FINISHED_NXDOMAIN).
+describe("makeGithubUserAuthClient — public/internal base split (plan row 66)", () => {
+  it("exchangeCode POSTs to the INTERNAL base while buildAuthorizeUrl uses the PUBLIC base", async () => {
+    const { fetchImpl, calls } = recordingFetch(
+      () =>
+        new Response(JSON.stringify({ access_token: "ghu_split_1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    const client = makeGithubUserAuthClient({
+      oauthBaseUrl: "https://github.com",
+      oauthInternalBaseUrl: "http://api:4000",
+      apiBaseUrl: "https://api.github.com",
+      clientId: CLIENT_ID,
+      clientSecret: CLIENT_SECRET,
+      fetchImpl,
+    });
+
+    const { token } = await client.exchangeCode("code-1");
+    expect(token).toBe("ghu_split_1");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("http://api:4000/login/oauth/access_token");
+
+    // The BROWSER-facing URL is untouched by the internal override: it must stay
+    // resolvable from the user's machine.
+    expect(
+      client.buildAuthorizeUrl({
+        redirectUri: "https://app.example/cb",
+        state: "n",
+      }),
+    ).toMatch(/^https:\/\/github\.com\/login\/oauth\/authorize\?/);
+  });
+
+  // [GUARD, not RED] D66.2's zero-config-prod property: unset ⇒ today's behaviour
+  // byte-for-byte. The GitHub base URLs default to the REAL provider precisely so
+  // "production needs zero config" (env.ts's `providerBaseUrl`), and copying S3's
+  // required-no-default posture would break every already-deployed environment.
+  it("defaults the internal base to the public base when it is not supplied", async () => {
+    const { fetchImpl, calls } = recordingFetch(
+      () =>
+        new Response(JSON.stringify({ access_token: "ghu_default_1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    await makeClient(fetchImpl).exchangeCode("code-2");
+    expect(calls[0].url).toBe("https://github.com/login/oauth/access_token");
+  });
+
+  it("normalises a trailing slash on the internal base independently of the public one", async () => {
+    const { fetchImpl, calls } = recordingFetch(
+      () =>
+        new Response(JSON.stringify({ access_token: "ghu_slash_1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    await makeGithubUserAuthClient({
+      oauthBaseUrl: "https://github.com/",
+      oauthInternalBaseUrl: "http://api:4000//",
+      apiBaseUrl: "https://api.github.com",
+      clientId: CLIENT_ID,
+      clientSecret: CLIENT_SECRET,
+      fetchImpl,
+    }).exchangeCode("code-3");
+    expect(calls[0].url).toBe("http://api:4000/login/oauth/access_token");
+  });
+});
+
 describe("makeGithubUserAuthClient.createUserRepo", () => {
   it("POSTs /user/repos with the ghu_ token and { name, private }, maps the created repo", async () => {
     const { fetchImpl, calls } = recordingFetch(
@@ -232,9 +310,13 @@ describe("makeGithubUserAuthClient.createUserRepo", () => {
     expect(calls[0].method).toBe("POST");
     expect(calls[0].url).toBe("https://api.github.com/user/repos");
     expect(calls[0].auth).toBe("token ghu_stub_user_1");
-    expect(JSON.parse(calls[0].body!)).toMatchObject({
+    // `toEqual`, deliberately NOT `toMatchObject` (plan row 63's documented red-first
+    // trap): a partial matcher would keep passing if `auto_init` were silently dropped
+    // from the body again, so the suite would claim coverage it does not have.
+    expect(JSON.parse(calls[0].body!)).toEqual({
       name: "psalm-121",
       private: true,
+      auto_init: true,
     });
     expect(repo).toMatchObject({
       id: 7,
@@ -242,6 +324,74 @@ describe("makeGithubUserAuthClient.createUserRepo", () => {
       owner: "acme",
       defaultBranch: "main",
     });
+  });
+
+  // --------------------------------------------------------------- plan row 63
+  // `auto_init: true` is the api half of row 63. Without it the created repo has ZERO
+  // commits and no `main` ref, and `scaffoldProjectWorkflow` opens its base PR with
+  // `base: "main"` — which real GitHub answers 422 (`field: base, code: invalid`). It
+  // is a field on the SAME single `POST /user/repos` the JIT user token is minted for
+  // (design-delta §2.3:181-192), so it costs no extra scope and no extra request.
+  // `private` stays caller-controlled — wireframe 12a step 1 designs a `🔒 Private ▾`
+  // toggle, so it must never be hardcoded.
+  it("createUserRepo sends auto_init:true so the created repo has a real main", async () => {
+    const { fetchImpl, calls } = recordingFetch(
+      () =>
+        new Response(
+          JSON.stringify({
+            id: 9,
+            name: "psalm-23",
+            full_name: "acme/psalm-23",
+            private: false,
+            owner: { login: "acme" },
+            default_branch: "main",
+            clone_url: "https://github.com/acme/psalm-23.git",
+          }),
+          { status: 201, headers: { "content-type": "application/json" } },
+        ),
+    );
+    await makeClient(fetchImpl).createUserRepo({
+      token: "ghu_stub_user_1",
+      name: "psalm-23",
+      private: false,
+    });
+    expect(JSON.parse(calls[0].body!)).toEqual({
+      name: "psalm-23",
+      private: false,
+      auto_init: true,
+    });
+  });
+
+  it("createUserRepo throws a typed GithubCreateRepoError carrying the HTTP status", async () => {
+    // `RepoProvisioningService` collapses every create failure into an opaque
+    // `502 repo_creation_failed`; a typed error with the upstream status is what lets
+    // the boundary say WHICH upstream failure it was (row 63 / D63.5).
+    const { fetchImpl } = recordingFetch(
+      () =>
+        new Response(
+          JSON.stringify({
+            message: "Repository creation failed.",
+            errors: [
+              {
+                resource: "Repository",
+                code: "custom",
+                field: "name",
+                message: "name already exists on this account",
+              },
+            ],
+          }),
+          { status: 422, headers: { "content-type": "application/json" } },
+        ),
+    );
+    const err = await makeClient(fetchImpl)
+      .createUserRepo({ token: "ghu_stub_user_1", name: "psalm-121", private: true })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(GithubCreateRepoError);
+    expect((err as GithubCreateRepoError).status).toBe(422);
+    // GitHub's own words survive verbatim — that is the whole point of the typed error.
+    expect((err as Error).message).toContain("name already exists on this account");
+    expect((err as Error).message).toContain("psalm-121");
   });
 
   it("throws on a non-2xx repo creation", async () => {

@@ -27,6 +27,8 @@ import {
   GITHUB_APP_CLIENT_SECRET_VAR,
   USER_AUTHORIZATION_TOKEN_EXCHANGE_URL,
   __resetGithubE2eMemoForTests,
+  githubOauthBaseUrl,
+  githubOauthInternalBaseUrl,
 } from "./github-e2e";
 
 // Unit coverage for the api's real-GitHub e2e ADAPTER (task-62 D4). Everything here
@@ -682,4 +684,35 @@ describe("resolveGithubOauthClientCreds", () => {
       );
     });
   }
+});
+
+// Plan row 66 (D66.8). The public/internal split added a SECOND host to resolve, and
+// `shimOnlyTheUserAuthorizationTokenExchange` matches by EXACT string equality against
+// `https://github.com/login/oauth/access_token`, throwing on anything else. The
+// in-process api e2e lane therefore has to keep resolving the internal base to that
+// exact literal — if the getter ever defaulted to a Compose hostname,
+// `repo-provisioning.e2e.ts` would fail inside the shim's own refusal path rather
+// than anywhere near the change that caused it.
+describe("githubOauthInternalBaseUrl (plan row 66)", () => {
+  it("defaults to githubOauthBaseUrl so the in-process shim keeps matching the exact literal", () => {
+    expect(githubOauthInternalBaseUrl({})).toBe(githubOauthBaseUrl({}));
+    expect(
+      `${githubOauthInternalBaseUrl({})}/login/oauth/access_token`,
+    ).toBe(USER_AUTHORIZATION_TOKEN_EXCHANGE_URL);
+  });
+
+  it("follows an override of the PUBLIC base when itself unset", () => {
+    expect(
+      githubOauthInternalBaseUrl({ GITHUB_OAUTH_BASE_URL: "https://ghe.example" }),
+    ).toBe("https://ghe.example");
+  });
+
+  it("prefers its own value over the public one when both are set", () => {
+    expect(
+      githubOauthInternalBaseUrl({
+        GITHUB_OAUTH_BASE_URL: "https://github.com",
+        GITHUB_OAUTH_INTERNAL_BASE_URL: "http://api:4000",
+      }),
+    ).toBe("http://api:4000");
+  });
 });

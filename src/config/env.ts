@@ -40,7 +40,21 @@ const providerBaseUrl = (defaultUrl: string) =>
     })
     .default(defaultUrl);
 
-export const envSchema = z.object({
+/**
+ * A provider base URL with NO default of its own, because its default is another
+ * variable's *resolved* value rather than a constant (plan row 66). Same http(s)
+ * validation, same override mechanism; the resolution happens after parse in
+ * `loadEnv` so an override of the public var still flows through to the internal one.
+ */
+const optionalProviderBaseUrl = z
+  .string()
+  .min(1)
+  .refine((value) => HTTP_URL.test(value), {
+    message: "must be an http:// or https:// base URL",
+  })
+  .optional();
+
+const baseEnvSchema = z.object({
   DATABASE_URL: z
     .string()
     .min(1)
@@ -67,8 +81,28 @@ export const envSchema = z.object({
 
   // GitHub splits hosts: REST API (installation tokens, repos, PRs) vs the
   // user-authorization OAuth host (create-new-repo code exchange).
+  //
+  // …and the OAuth host itself splits again, PUBLIC vs INTERNAL (plan row 66). One
+  // variable used to serve three call sites of two different KINDS:
+  //   • BROWSER — `installUrl()` and `buildAuthorizeUrl()` are URLs the USER's own
+  //     machine opens, so they must resolve from outside the Docker network;
+  //   • SERVER  — `exchangeCode()` is a POST made by this process.
+  // Because they shared one value, a containerised api could not have its exchange
+  // pointed anywhere without also moving the browser's redirect target, which is
+  // exactly plan row 62 item (e)'s DNS_PROBE_FINISHED_NXDOMAIN. GITHUB_OAUTH_BASE_URL
+  // keeps its PUBLIC meaning and GITHUB_OAUTH_INTERNAL_BASE_URL is the server-side
+  // half, used ONLY by `exchangeCode`.
+  //
+  // DELIBERATE DEVIATION from design-delta §11.4's "mirroring S3_ENDPOINT /
+  // S3_PUBLIC_ENDPOINT": under the S3 convention the UNSUFFIXED name is the internal
+  // one, which would have silently changed the meaning of a variable every deployed
+  // environment already sets. Naming the NEW one for the NEW meaning is the only
+  // direction that preserves "production needs zero config" for existing deployments.
+  // Unset ⇒ it resolves to GITHUB_OAUTH_BASE_URL ⇒ behaviour identical to before the
+  // split, which is also why it is NOT copying S3's required-no-default posture.
   GITHUB_API_BASE_URL: providerBaseUrl("https://api.github.com"),
   GITHUB_OAUTH_BASE_URL: providerBaseUrl("https://github.com"),
+  GITHUB_OAUTH_INTERNAL_BASE_URL: optionalProviderBaseUrl,
   OPENROUTER_BASE_URL: providerBaseUrl("https://openrouter.ai"),
   GLOO_BASE_URL: providerBaseUrl("https://platform.ai.gloo.com"),
   // Confirmed against https://developers.youversion.com/api-usage: base URL is
@@ -82,13 +116,30 @@ export const envSchema = z.object({
   // endpoint additionally requires NODE_ENV !== 'production'; unset in prod.
   SUPAGLOO_ENABLE_TEST_SEED: z.string().optional(),
 
+  // Plan row 66 — TEST-ONLY, and the ONE GitHub credential that ever enters a
+  // product container. It is read by exactly one place, `src/routes/test-github-oauth.ts`,
+  // which is registered only behind the SAME double gate as POST /v1/test/seed above
+  // (NODE_ENV !== 'production' AND SUPAGLOO_ENABLE_TEST_SEED === '1'). It MUST be
+  // absent in production, so it is optional here rather than required — but the route
+  // FAILS FAST naming this variable when the gates pass and the value is missing, so
+  // "optional" can never degrade into a placeholder token that 401s far from its cause.
+  //
+  // It is NOT GITHUB_E2E_PAT_TOKEN. That one is a broad classic-`repo` credential over
+  // an account holding the user's real repositories, and §11.8's "it never enters any
+  // container" property stays intact. This is a purpose-built fine-grained token with
+  // repository-CREATION rights only and deliberately no `delete_repo` (the cleanup
+  // script archives, never deletes).
+  GITHUB_E2E_EXCHANGE_TOKEN: z.string().optional(),
+
   // Task #11 GitHub App (design-delta §2.3/§9-Q1). App-LEVEL secrets/config — one
   // pair per app registration, shared by the API and DBOS, NOT per-user data — so
   // they live in env config and bypass §2.10's per-user AES-256-GCM scheme. The
   // API signs ~10-min App JWTs (`GITHUB_APP_ID` issuer + `GITHUB_APP_PRIVATE_KEY`)
   // to verify installations and mint installation tokens, and builds the hosted
   // install-picker URL `{GITHUB_OAUTH_BASE_URL}/apps/{GITHUB_APP_SLUG}/installations/new`
-  // (the slug cannot be derived from the numeric app id). Required — fail-fast at
+  // — the PUBLIC base, because the user's BROWSER opens that URL in a new tab; it is
+  // never the internal one (the slug cannot be derived from the numeric app id).
+  // Required — fail-fast at
   // boot. The private key is PKCS#1/PKCS#8 PEM; escaped `\n` is normalized at the
   // client boundary, so the raw string is carried through here unparsed.
   GITHUB_APP_ID: z.string().min(1),
@@ -98,7 +149,10 @@ export const envSchema = z.object({
   // Task #26 create-new-repo JIT hop (design-delta §2.3/§6b). The GitHub App's
   // OAuth client credentials — DISTINCT from the App's private key above. Used to
   // exchange a user-authorization `code` for a short-lived USER token
-  // (`POST {GITHUB_OAUTH_BASE_URL}/login/oauth/access_token`), which creates the new
+  // (`POST {GITHUB_OAUTH_INTERNAL_BASE_URL}/login/oauth/access_token` — the INTERNAL
+  // base since plan row 66, because this is a server-to-server POST; the browser's
+  // authorize redirect at `{GITHUB_OAUTH_BASE_URL}/login/oauth/authorize` is the
+  // public one), which creates the new
   // repo in the user's account and adds it to a `selected`-mode installation, then
   // is discarded. App-level (one pair per app registration), so like the App
   // id/key/slug they live in env config and bypass §2.10's per-user encryption.
@@ -146,6 +200,19 @@ export const envSchema = z.object({
   S3_SECRET_KEY: z.string().min(1),
   S3_REGION: z.string().min(1).default("us-east-1"),
 });
+
+/**
+ * The parsed environment, with the one derived value resolved (plan row 66):
+ * `GITHUB_OAUTH_INTERNAL_BASE_URL` falls back to the PUBLIC base rather than to a
+ * constant, so overriding only `GITHUB_OAUTH_BASE_URL` (a GitHub Enterprise host,
+ * say) still moves both halves together, and an environment that sets neither behaves
+ * exactly as it did before the split.
+ */
+export const envSchema = baseEnvSchema.transform((env) => ({
+  ...env,
+  GITHUB_OAUTH_INTERNAL_BASE_URL:
+    env.GITHUB_OAUTH_INTERNAL_BASE_URL ?? env.GITHUB_OAUTH_BASE_URL,
+}));
 
 export type Env = z.infer<typeof envSchema>;
 

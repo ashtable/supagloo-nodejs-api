@@ -7,6 +7,7 @@ import { registerHealthRoutes } from "./routes/health";
 import { bearerAuthPlugin } from "./auth/bearer-auth";
 import { registerAuthRoutes } from "./routes/auth";
 import { registerTestSeedRoute } from "./routes/test-seed";
+import { registerTestGithubOauthRoute } from "./routes/test-github-oauth";
 import {
   registerGithubConnectionRoutes,
   registerGithubRepoRoutes,
@@ -42,6 +43,22 @@ export interface AuthDeps {
   env: {
     NODE_ENV: "development" | "test" | "production";
     SUPAGLOO_ENABLE_TEST_SEED?: string;
+  };
+}
+
+/**
+ * Dependencies for the TEST-ONLY user-authorization token-exchange route (plan row
+ * 66). A carrier of its OWN, deliberately: `AuthDeps.env` is the only place the two
+ * gate values live today, and the whole `/v1` scope only exists when `auth` is
+ * supplied — but this route registers OUTSIDE `/v1` (the client requests a fixed
+ * unversioned `/login/oauth/access_token`), so inheriting that coupling would tie a
+ * GitHub seam to whether the session surface happens to be wired.
+ */
+export interface TestGithubOauthWiring {
+  env: {
+    NODE_ENV: "development" | "test" | "production";
+    SUPAGLOO_ENABLE_TEST_SEED?: string;
+    GITHUB_E2E_EXCHANGE_TOKEN?: string;
   };
 }
 
@@ -134,6 +151,13 @@ export interface BuildAppOptions {
   repoProvisioning?: RepoProvisioningDeps;
   /** Wire the `/v1` render routes. Requires `auth` (bearer). */
   renders?: RendersDeps;
+  /**
+   * Wire the TEST-ONLY `POST /login/oauth/access_token` route (plan row 66).
+   * Independent of `auth`: it lives OUTSIDE `/v1` and needs no bearer. Supplying this
+   * is not the same as enabling it — the route still hard-404s (by never registering)
+   * unless BOTH `NODE_ENV !== 'production'` and `SUPAGLOO_ENABLE_TEST_SEED === '1'`.
+   */
+  testGithubOauth?: TestGithubOauthWiring;
 }
 
 /**
@@ -149,6 +173,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.setSerializerCompiler(serializerCompiler);
 
   registerHealthRoutes(app);
+
+  // OUTSIDE the `/v1` scope, deliberately (plan row 66): `exchangeCode` requests a
+  // fixed `${base}/login/oauth/access_token` — GitHub's own URL shape, with no
+  // version prefix — so a `/v1`-scoped registration could never be reached.
+  if (options.testGithubOauth) {
+    registerTestGithubOauthRoute(app, { env: options.testGithubOauth.env });
+  }
 
   const auth = options.auth;
   const github = options.github;

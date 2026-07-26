@@ -4,7 +4,10 @@ import type { CreateRepoRequest } from "@supagloo/database-lib";
 import { RepoProvisioningService } from "./repo-provisioning-service";
 import { RepoCreationError } from "./repo-provisioning-errors";
 import { GithubNotConnectedError } from "../connections/errors";
-import type { GithubUserAuthClient } from "../connections/github-user-auth-client";
+import {
+  GithubCreateRepoError,
+  type GithubUserAuthClient,
+} from "../connections/github-user-auth-client";
 
 // The create-new-repo JIT orchestration (Task #26, design-delta §2.3/§6b): read the
 // user's installation, exchange the code for a user token, create the repo, add it to
@@ -166,5 +169,33 @@ describe("RepoProvisioningService.createRepoAndProject", () => {
       createProject,
     });
     await expect(svc.createRepoAndProject("u1", REQ)).rejects.toThrow(RepoCreationError);
+  });
+
+  // --------------------------------------------------------------- plan row 63
+  // Today every create failure collapses into the same opaque `502
+  // repo_creation_failed` — a 422 "name already exists", a 401 bad token and a 503
+  // are byte-identical to the caller. The route's status code and error slug are
+  // contract-pinned and do NOT change; what changes is that the upstream status
+  // survives on the error so the message can name it (D63.5).
+  it("preserves the upstream GitHub status on RepoCreationError", async () => {
+    const { client } = recordingUserAuthClient({
+      createUserRepo: async () => {
+        throw new GithubCreateRepoError(
+          "GitHub create-repo failed for psalm-121: 422 — name already exists on this account",
+          { status: 422 },
+        );
+      },
+    });
+    const { createProject } = recordingCreateProject();
+    const svc = new RepoProvisioningService({
+      prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
+      userAuthClient: client,
+      createProject,
+    });
+
+    const err = await svc.createRepoAndProject("u1", REQ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RepoCreationError);
+    expect((err as RepoCreationError).upstreamStatus).toBe(422);
+    expect((err as Error).message).toContain("422");
   });
 });

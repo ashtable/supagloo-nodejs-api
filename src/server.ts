@@ -129,7 +129,11 @@ async function main(): Promise<void> {
   // Create-new-repo JIT hop (design-delta §2.3/§6b): the zero-storage user-token
   // dance that creates the repo before delegating to the scaffold create path.
   const githubUserAuthClient = makeGithubUserAuthClient({
+    // PUBLIC (the browser opens it) vs INTERNAL (this process POSTs to it) — plan
+    // row 66. Unset, the internal one resolves to the public one in `loadEnv`, so
+    // production and every existing deployment are unchanged.
     oauthBaseUrl: env.GITHUB_OAUTH_BASE_URL,
+    oauthInternalBaseUrl: env.GITHUB_OAUTH_INTERNAL_BASE_URL,
     apiBaseUrl: env.GITHUB_API_BASE_URL,
     clientId: env.GITHUB_APP_CLIENT_ID,
     clientSecret: env.GITHUB_APP_CLIENT_SECRET,
@@ -148,6 +152,16 @@ async function main(): Promise<void> {
       env: {
         NODE_ENV: env.NODE_ENV,
         SUPAGLOO_ENABLE_TEST_SEED: env.SUPAGLOO_ENABLE_TEST_SEED,
+      },
+    },
+    // TEST-ONLY (plan row 66). Passing the wiring does NOT enable the route: it is
+    // registered only when NODE_ENV !== 'production' AND SUPAGLOO_ENABLE_TEST_SEED
+    // === '1', and it throws at boot rather than register without its credential.
+    testGithubOauth: {
+      env: {
+        NODE_ENV: env.NODE_ENV,
+        SUPAGLOO_ENABLE_TEST_SEED: env.SUPAGLOO_ENABLE_TEST_SEED,
+        GITHUB_E2E_EXCHANGE_TOKEN: env.GITHUB_E2E_EXCHANGE_TOKEN,
       },
     },
     github: { service: githubService },

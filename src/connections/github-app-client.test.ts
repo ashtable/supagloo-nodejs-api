@@ -1,6 +1,11 @@
 import { generateKeyPairSync } from "node:crypto";
 import { describe, it, expect } from "vitest";
-import { makeGithubAppClient } from "./github-app-client";
+import { DEFAULT_GITHUB_MAX_ATTEMPTS } from "@supagloo/database-lib";
+import {
+  makeGithubAppClient,
+  EMPTINESS_PROBE_CONCURRENCY,
+  GithubAppRequestError,
+} from "./github-app-client";
 
 // The GitHub App HTTP client (design-delta §2.3/§6a). Mirrors youversion.ts:
 // injectable fetch, unit-tested with hand-built Response objects (no mocking
@@ -77,8 +82,14 @@ describe("makeGithubAppClient.verifyInstallation", () => {
     expect(await client.verifyInstallation("999")).toBeNull();
   });
 
-  it("throws on an unexpected upstream error (5xx)", async () => {
-    const { fetchImpl } = recordingFetch(
+  it("throws on an unexpected upstream error (5xx), carrying the upstream status", async () => {
+    // plan row 64: a 5xx is retryable, so this now exercises the bounded backoff too —
+    // hence the INJECTED sleep (the unit lane must never actually wait, §10.6). The
+    // thrown error carries `upstreamStatus` so a caller can classify it without
+    // re-parsing the message; see the class doc-comment for why it is NOT named
+    // `status` (Fastify would hijack it into the reply code).
+    const sleeps: number[] = [];
+    const { fetchImpl, calls } = recordingFetch(
       () => new Response("boom", { status: 500 }),
     );
     const client = makeGithubAppClient({
@@ -86,8 +97,18 @@ describe("makeGithubAppClient.verifyInstallation", () => {
       appId: APP_ID,
       privateKey: PRIVATE_KEY,
       fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
     });
-    await expect(client.verifyInstallation("42")).rejects.toThrow();
+    const err = await client
+      .verifyInstallation("42")
+      .then(() => null, (e: unknown) => e as GithubAppRequestError);
+    expect(err).toBeInstanceOf(GithubAppRequestError);
+    expect(err?.upstreamStatus).toBe(500);
+    expect(err?.statusCode).toBe(502);
+    expect(calls).toHaveLength(DEFAULT_GITHUB_MAX_ATTEMPTS);
+    expect(sleeps).toEqual([500, 1_000, 2_000]);
   });
 
   it("normalizes an escaped-newline PEM before signing", async () => {
@@ -122,6 +143,12 @@ describe("makeGithubAppClient.listInstallationRepos", () => {
           }),
           { status: 201 },
         );
+      }
+      // plan row 65: `empty-one` is `size: 0`, so it is a probe CANDIDATE, not a
+      // verdict. One commit ⇒ still empty (the `auto_init` README shape), so the
+      // `size→empty` mapping this test names is preserved — now for the right reason.
+      if (url.endsWith("/commits?per_page=2")) {
+        return new Response(JSON.stringify([{ sha: "readme" }]), { status: 200 });
       }
       return new Response(
         JSON.stringify({
@@ -172,7 +199,24 @@ describe("makeGithubAppClient.listInstallationRepos", () => {
       "https://api.github.com/installation/repositories?per_page=100",
     );
     expect(calls[1].auth).toContain("ghs_minted_1");
-    expect(calls).toHaveLength(2);
+
+    // ENDPOINT-SCOPED counts, not a bare total (plan row 65 / D65.6). The bare
+    // `expect(calls).toHaveLength(2)` that stood here was a HARD BREAK the moment the
+    // emptiness probe landed, and a bare total tells you nothing about WHICH request
+    // moved. The budget is: 1 mint + 1 listing GET + 1 probe (for the single
+    // `size: 0` candidate) — and NOTHING else.
+    const byEndpoint = (needle: string) =>
+      calls.filter((c) => c.url.includes(needle)).length;
+    expect(byEndpoint("/access_tokens")).toBe(1);
+    expect(byEndpoint("/installation/repositories")).toBe(1);
+    expect(byEndpoint("/commits?per_page=2")).toBe(1);
+    expect(calls).toHaveLength(3);
+    // Exactly ONE probe, for `empty-one` only — `psalms-video` is `size: 512` and is
+    // short-circuited as definitively not empty without any request.
+    expect(calls[2].url).toBe(
+      "https://api.github.com/repos/acme/empty-one/commits?per_page=2",
+    );
+    expect(calls[2].auth).toContain("ghs_minted_1");
 
     expect(repos).toEqual([
       {
@@ -220,6 +264,14 @@ describe("makeGithubAppClient.listInstallationRepos", () => {
           }),
           { status: 201 },
         );
+      }
+      // plan row 65: both `size: 0` repos on page 1 are probe candidates. Answered
+      // EXPLICITLY here — without this branch the probe URL would fall through to the
+      // listing handler and be "answered" by a page-1 body, which the probe rejects as
+      // unparseable and silently falls back on. This test would still pass, for
+      // entirely the wrong reason.
+      if (url.endsWith("/commits?per_page=2")) {
+        return new Response(JSON.stringify([{ sha: "readme" }]), { status: 200 });
       }
       const page = new URL(url).searchParams.get("page") ?? "1";
       if (page === "1") {
@@ -276,6 +328,308 @@ describe("makeGithubAppClient.listInstallationRepos", () => {
     const mintCalls = calls.filter((c) => c.url.endsWith("/access_tokens"));
     expect(mintCalls).toHaveLength(1);
     for (const c of repoCalls) expect(c.auth).toContain("ghs_minted_1");
+
+    // plan row 65: the probe runs AFTER the whole page walk, over the union — two
+    // `size: 0` candidates (101, 102), never the `size: 512` one (103) — and rides
+    // the same single minted token. One request per candidate, no re-mint.
+    const probeCalls = calls.filter((c) => c.url.endsWith("/commits?per_page=2"));
+    expect(probeCalls.map((c) => c.url)).toEqual([
+      "https://api.github.com/repos/acme/empty-one/commits?per_page=2",
+      "https://api.github.com/repos/acme/empty-two/commits?per_page=2",
+    ]);
+    for (const c of probeCalls) expect(c.auth).toContain("ghs_minted_1");
+    expect(repos.map((r) => r.empty)).toEqual([true, true, false]);
+  });
+});
+
+// ===========================================================================
+// plan row 65 — the EMPTINESS PROBE (D65.2 / D65.3).
+//
+// `empty` used to be `size === 0` alone. GitHub reports `size` in KB and computes
+// it ASYNCHRONOUSLY, so it lags UPWARD: it can read 0 for a repo that already has
+// content, but it never overstates. The realistic defect is therefore a false
+// `empty: true` — the wizard offering an already-populated repo as a scaffold
+// target with its `data-disabled` gate lifted.
+//
+// The implemented rule (task-62 D16, verbatim):
+//   • `size > 0`  ⇒ definitively NOT empty, and NO probe is issued.
+//   • `size === 0` ⇒ probe `GET /repos/:o/:r/commits?per_page=2`:
+//        409 ("Git Repository is empty")  ⇒ empty
+//        200 with ≤1 commit               ⇒ empty   ← the `auto_init` README case
+//        200 with ≥2 commits              ⇒ NOT empty
+//        anything else                    ⇒ unknown ⇒ fall back to `size === 0`
+//   • the probe fan-out is bounded by EMPTINESS_PROBE_CONCURRENCY.
+//
+// The "≤1 commit ⇒ empty" half is NOT an accident: plan row 65's own wording
+// ("a non-empty REF LIST means not empty") would flip every `auto_init` fixture
+// repo in the system to `empty: false`, which breaks
+// `tests/e2e/github-connection.e2e.ts` and disables the picker row that is the
+// SOLE project-acquisition path for the whole nextjs `test:e2e:real` lane.
+// ===========================================================================
+
+const PROBE_SUFFIX = "/commits?per_page=2";
+const isProbe = (url: string) => url.endsWith(PROBE_SUFFIX);
+
+type RawRepo = {
+  id: number;
+  name: string;
+  full_name: string;
+  owner: { login: string };
+  private: boolean;
+  default_branch: string;
+  size: number;
+};
+
+const rawRepo = (id: number, name: string, size: number): RawRepo => ({
+  id,
+  name,
+  full_name: `acme/${name}`,
+  owner: { login: "acme" },
+  private: true,
+  default_branch: "main",
+  size,
+});
+
+const listingResponse = (repos: RawRepo[]) =>
+  new Response(
+    JSON.stringify({ total_count: repos.length, repositories: repos }),
+    { status: 200 },
+  );
+
+/** One element of `GET /repos/:o/:r/commits` — only the array LENGTH is read. */
+const commitEntry = (sha: string) => ({ sha, commit: { message: sha } });
+
+describe("plan row 65: listInstallationRepos emptiness probe", () => {
+  const build = (fetchImpl: typeof fetch) =>
+    makeGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+    });
+
+  it("does NOT report a size:0 repo with >=2 commits as empty", async () => {
+    // The whole point of the row: GitHub's `size` is asynchronous, so a repo with
+    // real content can still list as `size: 0` inside the async window.
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) {
+        return new Response(
+          JSON.stringify([commitEntry("aaa"), commitEntry("bbb")]),
+          { status: 200 },
+        );
+      }
+      return listingResponse([rawRepo(101, "two-commits", 0)]);
+    });
+
+    const repos = await build(fetchImpl).listInstallationRepos({
+      installationId: "42",
+    });
+
+    expect(repos.map((r) => r.name)).toEqual(["two-commits"]);
+    expect(repos[0].empty).toBe(false);
+  });
+
+  it("reports a size:0 repo as empty when the commits probe 409s with 'Git Repository is empty'", async () => {
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) {
+        return new Response(
+          JSON.stringify({
+            message: "Git Repository is empty.",
+            documentation_url:
+              "https://docs.github.com/rest/commits/commits#list-commits",
+            status: "409",
+          }),
+          { status: 409 },
+        );
+      }
+      return listingResponse([rawRepo(101, "unborn", 0)]);
+    });
+
+    const repos = await build(fetchImpl).listInstallationRepos({
+      installationId: "42",
+    });
+
+    expect(repos[0].empty).toBe(true);
+    const probes = calls.filter((c) => isProbe(c.url));
+    expect(probes).toHaveLength(1);
+    expect(probes[0].url).toBe(
+      "https://api.github.com/repos/acme/unborn/commits?per_page=2",
+    );
+    // The probe rides the ONE installation token minted for the listing — it must
+    // never re-mint (the "mint ONCE per listing" invariant + task-62 D9's budget).
+    expect(probes[0].auth).toContain("ghs_minted");
+  });
+
+  it("reports a size:0 repo with exactly ONE commit as empty (the auto_init README case)", async () => {
+    // THIS is the assertion that keeps every `auto_init` fixture repo listing as
+    // empty, and therefore keeps the whole nextjs `test:e2e:real` lane alive.
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) {
+        return new Response(JSON.stringify([commitEntry("readme")]), {
+          status: 200,
+        });
+      }
+      return listingResponse([rawRepo(101, "auto-init", 0)]);
+    });
+
+    const repos = await build(fetchImpl).listInstallationRepos({
+      installationId: "42",
+    });
+
+    expect(repos[0].empty).toBe(true);
+    expect(calls.filter((c) => isProbe(c.url))).toHaveLength(1);
+  });
+
+  it("short-circuits size > 0: exactly ONE probe is issued for a mixed page, targeting only the size:0 repo", async () => {
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) {
+        return new Response(JSON.stringify([commitEntry("readme")]), {
+          status: 200,
+        });
+      }
+      return listingResponse([
+        rawRepo(101, "ambiguous", 0),
+        rawRepo(103, "definitely-populated", 512),
+      ]);
+    });
+
+    const repos = await build(fetchImpl).listInstallationRepos({
+      installationId: "42",
+    });
+
+    expect(repos.map((r) => r.empty)).toEqual([true, false]);
+    const probes = calls.filter((c) => isProbe(c.url));
+    expect(probes).toHaveLength(1);
+    expect(probes[0].url).toContain("/repos/acme/ambiguous/commits");
+  });
+
+  it("issues NO probe at all when there are zero size:0 candidates", async () => {
+    // [GUARD, not RED] — trivially true before the probe existed, load-bearing
+    // after it: task-62 D9's `expect(total()).toBe(4)` budget assertion (two
+    // listings ⇒ exactly TWO mints and TWO listing GETs) survives ONLY on this
+    // property. Making it an explicit, named test stops that from being luck.
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) throw new Error("no probe should have been issued");
+      return listingResponse([
+        rawRepo(101, "a", 1),
+        rawRepo(102, "b", 512),
+        rawRepo(103, "c", 9000),
+      ]);
+    });
+
+    const repos = await build(fetchImpl).listInstallationRepos({
+      installationId: "42",
+    });
+
+    expect(repos.every((r) => r.empty === false)).toBe(true);
+    expect(calls.filter((c) => isProbe(c.url))).toHaveLength(0);
+    // The pre-probe request budget, unchanged: 1 mint + 1 listing GET.
+    expect(calls).toHaveLength(2);
+  });
+
+  it("falls back to the size heuristic when a probe fails for an unexpected reason", async () => {
+    // Probe-failure semantics (TDD plan §65.2a): a non-409 / non-200 answer means
+    // UNKNOWN, so the repo keeps its `size`-derived verdict. That strictly
+    // dominates the old behaviour — it can never be worse than the status quo —
+    // whereas failing closed (`empty: false`) would hide a genuinely empty repo
+    // from the picker on one transient 5xx and red-line the whole real lane.
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) {
+        return new Response(JSON.stringify({ message: "Server Error" }), {
+          status: 500,
+        });
+      }
+      return listingResponse([
+        rawRepo(101, "probe-fails", 0),
+        rawRepo(103, "populated", 512),
+      ]);
+    });
+
+    const repos = await build(fetchImpl).listInstallationRepos({
+      installationId: "42",
+    });
+
+    // Nothing thrown, nothing dropped, and the `size === 0` fallback stands.
+    expect(repos.map((r) => r.name)).toEqual(["probe-fails", "populated"]);
+    expect(repos.map((r) => r.empty)).toEqual([true, false]);
+    expect(calls.filter((c) => isProbe(c.url))).toHaveLength(1);
+  });
+
+  it("caps probe fan-out at EMPTINESS_PROBE_CONCURRENCY (8) in flight", async () => {
+    // `listInstallationRepos` runs on EVERY repo-picker page load, against a live
+    // installation that is `repository_selection: "all"` over a 563-repo account.
+    // An unbounded per-candidate fan-out would be a 563-request burst straight into
+    // GitHub's secondary rate limit. The pool is what makes the row's "at most one
+    // request per candidate" budget survivable.
+    const repos20 = Array.from({ length: 20 }, (_, i) =>
+      rawRepo(200 + i, `empty-${i}`, 0),
+    );
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let probeCount = 0;
+    const pending: (() => void)[] = [];
+
+    const fetchImpl = (async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (!isProbe(url)) return listingResponse(repos20);
+      probeCount += 1;
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // Deferred: the probe only settles when this test releases it, so the
+      // observed peak is the pool's real in-flight ceiling, not a scheduling
+      // artifact.
+      await new Promise<void>((resolve) => pending.push(resolve));
+      inFlight -= 1;
+      return new Response(JSON.stringify([commitEntry("readme")]), {
+        status: 200,
+      });
+    }) as unknown as typeof fetch;
+
+    let settled = false;
+    const listing = build(fetchImpl)
+      .listInstallationRepos({ installationId: "42" })
+      .then((r) => {
+        settled = true;
+        return r;
+      });
+
+    for (let tick = 0; tick < 200 && !settled; tick += 1) {
+      await new Promise((r) => setTimeout(r, 0));
+      while (pending.length) pending.shift()!();
+    }
+    const result = await listing;
+
+    expect(result).toHaveLength(20);
+    expect(result.every((r) => r.empty)).toBe(true);
+    expect(probeCount).toBe(20);
+    expect(EMPTINESS_PROBE_CONCURRENCY).toBe(8);
+    // Genuinely parallel (not serial) AND genuinely bounded (not 20 at once).
+    expect(maxInFlight).toBe(EMPTINESS_PROBE_CONCURRENCY);
+  });
+
+  it("a probe that REJECTS (network error) also falls back instead of failing the listing", async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) throw new TypeError("fetch failed");
+      return listingResponse([rawRepo(101, "probe-throws", 0)]);
+    }) as unknown as typeof fetch;
+
+    const repos = await build(fetchImpl).listInstallationRepos({
+      installationId: "42",
+    });
+
+    expect(repos[0].empty).toBe(true);
+    expect(calls.filter(isProbe)).toHaveLength(1);
   });
 });
 
@@ -374,7 +728,12 @@ describe("makeGithubAppClient.getRepositoryFileContents", () => {
     ).toBeNull();
   });
 
-  it("throws on an unexpected upstream error (5xx)", async () => {
+  it("throws on an unexpected upstream error (5xx), carrying the upstream status", async () => {
+    // plan row 64: the contents read is retried on a 5xx with the INJECTED sleep (the
+    // unit lane must never actually wait), then surfaces a typed error carrying the
+    // upstream status.
+    const sleeps: number[] = [];
+    let reads = 0;
     const { fetchImpl } = recordingFetch((url) => {
       if (url.endsWith("/access_tokens")) {
         return new Response(
@@ -382,6 +741,7 @@ describe("makeGithubAppClient.getRepositoryFileContents", () => {
           { status: 201 },
         );
       }
+      reads += 1;
       return new Response("boom", { status: 500 });
     });
     const client = makeGithubAppClient({
@@ -389,17 +749,27 @@ describe("makeGithubAppClient.getRepositoryFileContents", () => {
       appId: APP_ID,
       privateKey: PRIVATE_KEY,
       fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
     });
 
-    await expect(
-      client.getRepositoryFileContents({
+    const err = await client
+      .getRepositoryFileContents({
         installationId: "42",
         owner: "acme",
         repo: "psalms-video",
         path: "supagloo.project.json",
         ref: "v0.0.1",
-      }),
-    ).rejects.toThrow();
+      })
+      .then(
+        () => null,
+        (e: unknown) => e as GithubAppRequestError,
+      );
+    expect(err).toBeInstanceOf(GithubAppRequestError);
+    expect(err?.upstreamStatus).toBe(500);
+    expect(reads).toBe(DEFAULT_GITHUB_MAX_ATTEMPTS);
+    expect(sleeps).toEqual([500, 1_000, 2_000]);
   });
 });
 
@@ -467,6 +837,14 @@ describe("task-62 D9: fresh-installation-token-per-call (was a github-stub count
     expect(count("POST /app/installations/77/access_tokens")).toBe(2);
     expect(count("GET /installation/repositories")).toBe(2);
     // And nothing else was called.
+    //
+    // plan row 65 / D65.6: this `4` SURVIVES the emptiness probe only because the
+    // fixture lists ZERO repositories, so there are zero `size === 0` candidates and
+    // the probe is skipped entirely. That is a deliberate property of the client, not
+    // luck — it is pinned by its own named test, "issues NO probe at all when there
+    // are zero size:0 candidates". If this ever goes to 5 or 6, do NOT raise the
+    // number: the probe has started firing where it should not, and D9's whole
+    // request-budget assertion would be silently retired by the edit.
     expect(total()).toBe(4);
   });
 
@@ -597,28 +975,180 @@ describe("task-62 §11.6: real-GitHub failure shapes (injected fetch, zero egres
     expect(calls[0].url).toContain("/app/installations/999999/access_tokens");
   });
 
-  it("403 + Retry-After is NOT retried by the client today (deferred: task-62 D19-N2)", async () => {
-    // Deliberate, recorded scope boundary. Rate-limit backoff lives in the e2e
-    // HARNESS (task-62 D7); pushing it into the product client would touch three
-    // repos including db-lib. The contract asserted here is the CURRENT one: one
-    // attempt, then a throw that names the status. If a future task adds retry,
-    // this test is the one that must be updated deliberately.
+  it("403 + Retry-After IS retried by the client, honouring the delay (plan row 64)", async () => {
+    // TOMBSTONE REPLACED (plan row 64 / D64.8). This test used to pin the OPPOSITE
+    // contract — *"403 + Retry-After is NOT retried by the client today (deferred:
+    // task-62 D19-N2)"*, `expect(calls).toHaveLength(1)` — and its own body said "if a
+    // future task adds retry, this test is the one that must be updated deliberately".
+    // This is that update, written deliberately rather than extended or deleted.
+    //
+    // What changed: every request this client makes now runs through db-lib's
+    // `withGithubRetry` (§11.7 "one implementation, four consumers"), which honours
+    // GitHub's own `Retry-After` with a bounded, capped budget. The sleep is INJECTED,
+    // so the unit lane never actually waits (§10.6 / the egress rule) — and that
+    // injection is exactly what this test asserts, not an incidental convenience.
+    const sleeps: number[] = [];
+    let mintAttempts = 0;
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) {
+        mintAttempts += 1;
+        if (mintAttempts === 1) {
+          return new Response(
+            JSON.stringify({ message: "You have exceeded a secondary rate limit" }),
+            { status: 403, headers: { "retry-after": "17" } },
+          );
+        }
+        return mintResponse();
+      }
+      return listingResponse([]);
+    });
+
+    const repos = await makeGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
+    }).listInstallationRepos({ installationId: "77" });
+
+    // The delay GitHub asked for was honoured, once, and then the call was RETRIED
+    // rather than surfaced as a failure.
+    expect(sleeps).toEqual([17_000]);
+    expect(mintAttempts).toBe(2);
+    expect(repos).toEqual([]);
+  });
+
+  it("a 403 + Retry-After that never clears gives up after the bounded budget, surfacing the header verbatim", async () => {
+    const sleeps: number[] = [];
+    let mintAttempts = 0;
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) mintAttempts += 1;
+      return new Response(
+        JSON.stringify({ message: "You have exceeded a secondary rate limit" }),
+        { status: 403, headers: { "retry-after": "60" } },
+      );
+    });
+
+    const err = await makeGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
+    })
+      .listInstallationRepos({ installationId: "77" })
+      .then(
+        () => null,
+        (e: unknown) => e as Error,
+      );
+
+    expect(mintAttempts).toBe(DEFAULT_GITHUB_MAX_ATTEMPTS);
+    expect(sleeps).toEqual([60_000, 60_000, 60_000]);
+    expect(err?.message).toMatch(/403/);
+    // The header value is surfaced VERBATIM so an operator sees what GitHub asked
+    // for. It is deliberately never ASSERTED ON in an e2e — only here, against an
+    // injected response (§11.9).
+    expect(err?.message).toContain("Retry-After: 60");
+    // ...and never the signed App JWT (db-lib `github.test.ts` "JWT not leaked").
+    expect(err?.message).not.toContain("Bearer");
+  });
+
+  it("does NOT retry a bare permission-denial 403 (no throttle headers)", async () => {
+    // [GUARD, not RED] — §11.3:1832-1834 makes this load-bearing: the installation
+    // deliberately holds no `administration` scope, so a genuine permission-denial 403
+    // is EXPECTED behaviour of the credential split, not a rate limit. Retrying it
+    // would turn a crisp, instant failure into four attempts and three sleeps.
+    const sleeps: number[] = [];
     const { fetchImpl, calls } = recordingFetch(
       () =>
         new Response(
-          JSON.stringify({ message: "You have exceeded a secondary rate limit" }),
-          { status: 403, headers: { "retry-after": "60" } },
+          JSON.stringify({ message: "Resource not accessible by integration" }),
+          { status: 403 },
         ),
     );
     await expect(
-      client(fetchImpl).listInstallationRepos({ installationId: "77" }),
+      makeGithubAppClient({
+        apiBaseUrl: "https://api.github.com",
+        appId: APP_ID,
+        privateKey: PRIVATE_KEY,
+        fetchImpl,
+        sleepImpl: async (ms) => {
+          sleeps.push(ms);
+        },
+      }).listInstallationRepos({ installationId: "77" }),
     ).rejects.toThrow(/403/);
     expect(calls).toHaveLength(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it("429 on a mid-pagination page that CLEARS is retried, and the listing completes whole", async () => {
+    // The complement of the invariant below: backing off must actually RECOVER the
+    // page, not merely delay the same failure. Page 2 answers 429 once, then 200 —
+    // and the union of both pages is returned.
+    const sleeps: number[] = [];
+    let page2Attempts = 0;
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) {
+        return new Response(JSON.stringify([commitEntry("readme")]), { status: 200 });
+      }
+      const page = new URL(url).searchParams.get("page") ?? "1";
+      if (page === "1") {
+        return new Response(
+          JSON.stringify({ total_count: 2, repositories: [rawRepo(1, "a", 0)] }),
+          {
+            status: 200,
+            headers: {
+              link: '<https://api.github.com/installation/repositories?per_page=100&page=2>; rel="next"',
+            },
+          },
+        );
+      }
+      page2Attempts += 1;
+      if (page2Attempts === 1) {
+        return new Response(JSON.stringify({ message: "rate limited" }), {
+          status: 429,
+          headers: { "retry-after": "3", "x-ratelimit-remaining": "0" },
+        });
+      }
+      return listingResponse([rawRepo(2, "b", 512)]);
+    });
+
+    const repos = await makeGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
+    }).listInstallationRepos({ installationId: "77" });
+
+    expect(repos.map((r) => r.name)).toEqual(["a", "b"]);
+    expect(page2Attempts).toBe(2);
+    expect(sleeps).toEqual([3_000]);
   });
 
   it("429 on a mid-pagination page fails the whole listing rather than truncating it", async () => {
     // The dangerous failure mode is a SILENT partial listing: the user's repo
     // simply missing from the picker. A rate-limited page must throw.
+    //
+    // plan row 65: this test's counts are UNMOVED by the emptiness probe, and that is
+    // structural rather than incidental — the page walk throws before the probe stage
+    // is ever reached, so the `size: 0` repo already collected from page 1 is never
+    // probed. The invariant under test ("fail the listing, never truncate it") is
+    // therefore untouched. If a future change makes probes fire from inside the page
+    // loop, this count moves and that is the signal, not a nuisance.
+    //
+    // plan row 64 / D64.8: the COUNT moved (2 → 1 + DEFAULT_GITHUB_MAX_ATTEMPTS) because
+    // the client now backs off before giving up. THE INVARIANT DID NOT: a 429 that never
+    // clears still fails the whole listing. Never weaken the `rejects` half of this test
+    // to accommodate a count — a partial listing is the bug it exists to catch.
+    const sleeps: number[] = [];
     let listingCalls = 0;
     const { fetchImpl } = recordingFetch((url) => {
       if (url.endsWith("/access_tokens")) return mintResponse();
@@ -653,9 +1183,19 @@ describe("task-62 §11.6: real-GitHub failure shapes (injected fetch, zero egres
       });
     });
     await expect(
-      client(fetchImpl).listInstallationRepos({ installationId: "77" }),
+      makeGithubAppClient({
+        apiBaseUrl: "https://api.github.com",
+        appId: APP_ID,
+        privateKey: PRIVATE_KEY,
+        fetchImpl,
+        sleepImpl: async (ms) => {
+          sleeps.push(ms);
+        },
+      }).listInstallationRepos({ installationId: "77" }),
     ).rejects.toThrow(/429/);
-    expect(listingCalls).toBe(2);
+    expect(listingCalls).toBe(1 + DEFAULT_GITHUB_MAX_ATTEMPTS);
+    // No `Retry-After` and no `x-ratelimit-reset` ⇒ the blind exponential fallback.
+    expect(sleeps).toEqual([500, 1_000, 2_000]);
   });
 
   it("422 from the contents read is a throw, distinct from the 404 → null outcome", async () => {
@@ -744,5 +1284,230 @@ describe("task-62 §11.6: real-GitHub failure shapes (injected fetch, zero egres
       githubLogin: "some-org",
       repositorySelection: "all",
     });
+  });
+});
+
+// ===========================================================================
+// plan row 64 — the two-layer rate-limit rule, api half (D64.1 / D64.2).
+//
+// Every request this client issues that the caller CANNOT fall back from — the
+// installation-token exchange, the `GET /app/installations/:id` verify, the paginated
+// listing walk, the Contents read — runs through db-lib's `withGithubRetry`, honouring
+// `Retry-After` / `x-ratelimit-reset` with a bounded, capped, INJECTED-sleep backoff.
+//
+// The ONE deliberate exception is the row-65 emptiness probe, which is best-effort
+// enrichment with a documented fallback (`size === 0`), so a throttled probe degrades
+// instantly instead of stalling an interactive route. That asymmetry is a decision, so
+// it gets its own named test rather than being left to a reader's inference.
+// ===========================================================================
+
+describe("plan row 64: bounded rate-limit backoff (injected sleep, zero egress)", () => {
+  const buildWithSleep = (fetchImpl: typeof fetch, sleeps: number[]) =>
+    makeGithubAppClient({
+      apiBaseUrl: "https://api.github.com",
+      appId: APP_ID,
+      privateKey: PRIVATE_KEY,
+      fetchImpl,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+
+  it("retries a 403 + Retry-After on the LISTING GET (not just the token exchange)", async () => {
+    const sleeps: number[] = [];
+    let listingAttempts = 0;
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      listingAttempts += 1;
+      if (listingAttempts === 1) {
+        return new Response(
+          JSON.stringify({ message: "You have exceeded a secondary rate limit" }),
+          { status: 403, headers: { "retry-after": "5" } },
+        );
+      }
+      return listingResponse([rawRepo(101, "populated", 512)]);
+    });
+
+    const repos = await buildWithSleep(fetchImpl, sleeps).listInstallationRepos({
+      installationId: "77",
+    });
+
+    expect(repos.map((r) => r.name)).toEqual(["populated"]);
+    expect(listingAttempts).toBe(2);
+    expect(sleeps).toEqual([5_000]);
+  });
+
+  it("retries a 403 + x-ratelimit-remaining:0 on the CONTENTS read, then returns the file", async () => {
+    const sleeps: number[] = [];
+    let reads = 0;
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      reads += 1;
+      if (reads === 1) {
+        return new Response(JSON.stringify({ message: "API rate limit exceeded" }), {
+          status: 403,
+          // No `Retry-After`: the exhausted-quota signal is `x-ratelimit-remaining: 0`,
+          // and the delay then comes from `x-ratelimit-reset`.
+          headers: {
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 4),
+          },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          type: "file",
+          encoding: "base64",
+          content: Buffer.from('{"manifestVersion":1}', "utf8").toString("base64"),
+          sha: "abc",
+          path: "supagloo.project.json",
+        }),
+        { status: 200 },
+      );
+    });
+
+    const file = await buildWithSleep(fetchImpl, sleeps).getRepositoryFileContents({
+      installationId: "77",
+      owner: "octo",
+      repo: "widget",
+      path: "supagloo.project.json",
+      ref: "main",
+    });
+
+    expect(file?.content).toBe('{"manifestVersion":1}');
+    expect(reads).toBe(2);
+    // Derived from `x-ratelimit-reset`, so it is a wall-clock delta rather than a fixed
+    // number — assert the BAND, never the exact value (a clock-exact assertion here is a
+    // flake factory).
+    expect(sleeps).toHaveLength(1);
+    expect(sleeps[0]).toBeGreaterThan(0);
+    expect(sleeps[0]).toBeLessThanOrEqual(4_000);
+  });
+
+  it("caps a preposterous Retry-After at 60s (D64.6) rather than stalling the request", async () => {
+    // A ProjectJob that sits in `running` for an hour widens the §2.9 409 git-ops
+    // window; the cap is what bounds that.
+    const sleeps: number[] = [];
+    let mintAttempts = 0;
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) {
+        mintAttempts += 1;
+        if (mintAttempts === 1) {
+          return new Response(JSON.stringify({ message: "secondary rate limit" }), {
+            status: 403,
+            headers: { "retry-after": "3600" },
+          });
+        }
+        return mintResponse();
+      }
+      return listingResponse([]);
+    });
+
+    await buildWithSleep(fetchImpl, sleeps).listInstallationRepos({
+      installationId: "77",
+    });
+    expect(sleeps).toEqual([60_000]);
+  });
+
+  it("does NOT retry the emptiness probe — a throttled probe falls back to `size` instantly", async () => {
+    // DELIBERATE ASYMMETRY, not an oversight. The probe is the ONLY request here whose
+    // failure has a defined fallback (`size === 0`, row 65's documented UNKNOWN path), and
+    // it is the request most likely to trip a secondary limit: it fans out over every
+    // `size: 0` candidate on an INTERACTIVE per-page-load route (measured: 55 candidates
+    // on the live installation). Retrying it would turn one throttled page load into
+    // ceil(55/8) x 3 x 60s of in-request sleeping for an answer we already have a safe
+    // default for. Retry what you cannot fall back from; degrade what you can.
+    const sleeps: number[] = [];
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url.endsWith("/access_tokens")) return mintResponse();
+      if (isProbe(url)) {
+        return new Response(JSON.stringify({ message: "secondary rate limit" }), {
+          status: 403,
+          headers: { "retry-after": "60" },
+        });
+      }
+      return listingResponse([rawRepo(101, "candidate", 0)]);
+    });
+
+    const repos = await buildWithSleep(fetchImpl, sleeps).listInstallationRepos({
+      installationId: "77",
+    });
+
+    expect(calls.filter((c) => isProbe(c.url))).toHaveLength(1);
+    expect(sleeps).toEqual([]);
+    // The `size`-derived verdict stands, and nothing was thrown.
+    expect(repos.map((r) => r.empty)).toEqual([true]);
+  });
+
+  it("attaches the upstream status to all three of the client's own non-2xx throws", async () => {
+    // The three bare `new Error(...)` sites this row replaced: the installation verify,
+    // the listing walk, and the Contents read. `upstreamStatus` is GitHub's status;
+    // `statusCode` is OUR reply status — see the class doc-comment for why they are
+    // separate names.
+    const deny = (url: string) =>
+      url.endsWith("/access_tokens")
+        ? mintResponse()
+        : new Response(JSON.stringify({ message: "Resource not accessible" }), {
+            status: 403,
+          });
+
+    const sleeps: number[] = [];
+    const verifyErr = await buildWithSleep(recordingFetch(deny).fetchImpl, sleeps)
+      .verifyInstallation("77")
+      .then(
+        () => null,
+        (e: unknown) => e as GithubAppRequestError,
+      );
+    expect(verifyErr).toBeInstanceOf(GithubAppRequestError);
+    expect(verifyErr?.upstreamStatus).toBe(403);
+
+    const listErr = await buildWithSleep(recordingFetch(deny).fetchImpl, sleeps)
+      .listInstallationRepos({ installationId: "77" })
+      .then(
+        () => null,
+        (e: unknown) => e as GithubAppRequestError,
+      );
+    expect(listErr).toBeInstanceOf(GithubAppRequestError);
+    expect(listErr?.upstreamStatus).toBe(403);
+
+    const readErr = await buildWithSleep(recordingFetch(deny).fetchImpl, sleeps)
+      .getRepositoryFileContents({
+        installationId: "77",
+        owner: "octo",
+        repo: "widget",
+        path: "supagloo.project.json",
+        ref: "main",
+      })
+      .then(
+        () => null,
+        (e: unknown) => e as GithubAppRequestError,
+      );
+    expect(readErr).toBeInstanceOf(GithubAppRequestError);
+    expect(readErr?.upstreamStatus).toBe(403);
+
+    // A bare permission-denial 403 never sleeps, on ANY of the three paths.
+    expect(sleeps).toEqual([]);
+  });
+
+  it("every one of the three throws replies 502, never GitHub's own status (Fastify trap)", async () => {
+    // Fastify's default error handler prefers `error.status` over `error.statusCode`
+    // (`fastify/lib/error-handler.js` `setErrorHeaders`), so an error field literally
+    // named `status` would silently become the HTTP reply code — turning a GitHub 401
+    // into OUR 401 and logging the user out on an upstream credential fault. That is why
+    // the upstream value is `upstreamStatus` and the reply value is `statusCode = 502`.
+    // If anyone ever renames `upstreamStatus` to `status`, this test is what stops it.
+    const sleeps: number[] = [];
+    const { fetchImpl } = recordingFetch(
+      () => new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401 }),
+    );
+    const err = await buildWithSleep(fetchImpl, sleeps)
+      .verifyInstallation("77")
+      .then(
+        () => null,
+        (e: unknown) => e as GithubAppRequestError & { status?: number },
+      );
+    expect(err?.statusCode).toBe(502);
+    expect(err?.upstreamStatus).toBe(401);
+    expect(err?.status).toBeUndefined();
   });
 });
