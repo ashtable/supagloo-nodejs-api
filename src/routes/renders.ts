@@ -10,6 +10,7 @@ import {
   RenderJobResponseSchema,
   RenderListQuerySchema,
 } from "@supagloo/database-lib";
+import { withPostgresSafeStrings } from "../postgres-text";
 import type { RendersService } from "../renders/renders-service";
 import {
   RenderNotCancelableError,
@@ -45,6 +46,9 @@ export function registerRenderRoutes(
   app: FastifyInstance,
   deps: RenderRoutesDeps,
 ): void {
+  // Path params: the shared rule in ../postgres-text, held by ./path-params-gate.test.ts.
+  const ProjectIdParam = withPostgresSafeStrings(ProjectIdParamSchema);
+  const RenderIdParam = withPostgresSafeStrings(RenderIdParamSchema);
   const { service } = deps;
   const r = app.withTypeProvider<ZodTypeProvider>();
 
@@ -57,7 +61,7 @@ export function registerRenderRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: ProjectIdParamSchema,
+        params: ProjectIdParam,
         body: CreateRenderRequestSchema,
         response: {
           201: CreateRenderResponseSchema,
@@ -112,9 +116,10 @@ export function registerRenderRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: RenderIdParamSchema,
+        params: RenderIdParam,
         response: {
           200: RenderJobResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },
@@ -137,9 +142,10 @@ export function registerRenderRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: RenderIdParamSchema,
+        params: RenderIdParam,
         response: {
           200: RenderJobResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
           409: errorResponseSchema,
@@ -168,9 +174,10 @@ export function registerRenderRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: RenderIdParamSchema,
+        params: RenderIdParam,
         response: {
           200: FilePresignDownloadResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },

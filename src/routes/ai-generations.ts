@@ -8,6 +8,7 @@ import {
   CreateAiGenerationResponseSchema,
   ProjectIdParamSchema,
 } from "@supagloo/database-lib";
+import { withPostgresSafeStrings } from "../postgres-text";
 import type { AiGenerationsService } from "../ai/ai-generations-service";
 import {
   AiGenerationNotFoundError,
@@ -41,6 +42,9 @@ export function registerAiGenerationRoutes(
   app: FastifyInstance,
   deps: AiGenerationRoutesDeps,
 ): void {
+  // Path params: the shared rule in ../postgres-text, held by ./path-params-gate.test.ts.
+  const AiGenerationIdParam = withPostgresSafeStrings(AiGenerationIdParamSchema);
+  const ProjectIdParam = withPostgresSafeStrings(ProjectIdParamSchema);
   const { service } = deps;
   const r = app.withTypeProvider<ZodTypeProvider>();
 
@@ -93,9 +97,10 @@ export function registerAiGenerationRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: AiGenerationIdParamSchema,
+        params: AiGenerationIdParam,
         response: {
           200: AiGenerationResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },
@@ -123,9 +128,10 @@ export function registerAiGenerationRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: ProjectIdParamSchema,
+        params: ProjectIdParam,
         response: {
           200: AiGenerationListResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },
@@ -153,9 +159,10 @@ export function registerAiGenerationRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: AiGenerationIdParamSchema,
+        params: AiGenerationIdParam,
         response: {
           200: AiGenerationResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
           409: errorResponseSchema,

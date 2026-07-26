@@ -110,11 +110,15 @@ describe("Manifest route — auth + typed error mapping", () => {
 // `getRepositoryFileContents`, which mints a fresh installation token first; db-lib's
 // `mintInstallationToken` throws `GithubAppError` straight out of it, and neither the
 // service nor this route ever caught it. With Fastify preferring `error.status` over
-// `error.statusCode` and no `setErrorHandler` registered, a GitHub 401 on that exchange
-// was replied as OUR 401 — telling the caller to re-authenticate when its session was
-// fine and OUR credential was broken — and a GitHub 404 as a spurious "manifest not
-// found", a genuinely misleading answer on a route whose 404 has a specific, different
-// meaning.
+// `error.statusCode`, a GitHub 401 on that exchange was replied as OUR 401 — telling the
+// caller to re-authenticate when its session was fine and OUR credential was broken — and a
+// GitHub 404 as a spurious "manifest not found", a genuinely misleading answer on a route
+// whose 404 has a specific, different meaning.
+//
+// The app also registers a `setErrorHandler` now (`src/error-handler.ts`, 2026-07-26) which
+// would generify such an escape to a 500. This suite deliberately builds a BARE Fastify
+// instance without it, because what is under test here is the ROUTE's own catch — the answer
+// must be a correct 502 with a named slug, which no global fallback can produce.
 
 const { privateKey: PRIVATE_KEY } = generateKeyPairSync("rsa", {
   modulusLength: 2048,

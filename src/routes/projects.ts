@@ -8,6 +8,7 @@ import {
   ProjectResponseSchema,
   ProjectVersionListResponseSchema,
 } from "@supagloo/database-lib";
+import { withPostgresSafeStrings } from "../postgres-text";
 import type { ProjectsService } from "../projects/projects-service";
 import { ProjectNotFoundError } from "../projects/errors";
 import { toProjectDto, toProjectVersionDto } from "../projects/dto";
@@ -29,6 +30,8 @@ export function registerProjectRoutes(
   app: FastifyInstance,
   deps: ProjectRoutesDeps,
 ): void {
+  // Path params: the shared rule in ../postgres-text, held by ./path-params-gate.test.ts.
+  const ProjectIdParam = withPostgresSafeStrings(ProjectIdParamSchema);
   const { service } = deps;
   const r = app.withTypeProvider<ZodTypeProvider>();
 
@@ -59,9 +62,10 @@ export function registerProjectRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: ProjectIdParamSchema,
+        params: ProjectIdParam,
         response: {
           200: ProjectResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },
@@ -84,7 +88,7 @@ export function registerProjectRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: ProjectIdParamSchema,
+        params: ProjectIdParam,
         body: ProjectRenameRequestSchema,
         response: {
           200: ProjectResponseSchema,
@@ -115,9 +119,10 @@ export function registerProjectRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: ProjectIdParamSchema,
+        params: ProjectIdParam,
         response: {
           200: ProjectDeleteResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },
@@ -140,9 +145,10 @@ export function registerProjectRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: ProjectIdParamSchema,
+        params: ProjectIdParam,
         response: {
           200: ProjectVersionListResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },

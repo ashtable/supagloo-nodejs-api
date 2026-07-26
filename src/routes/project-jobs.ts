@@ -13,6 +13,7 @@ import {
   PublishVersionRequestSchema,
   PublishVersionResponseSchema,
 } from "@supagloo/database-lib";
+import { withPostgresSafeStrings } from "../postgres-text";
 import type { ProjectJobsService } from "../jobs/project-jobs-service";
 import {
   CommitManifestInvalidError,
@@ -51,6 +52,9 @@ export function registerProjectJobRoutes(
   app: FastifyInstance,
   deps: ProjectJobRoutesDeps,
 ): void {
+  // Path params: the shared rule in ../postgres-text, held by ./path-params-gate.test.ts.
+  const ProjectIdParam = withPostgresSafeStrings(ProjectIdParamSchema);
+  const ProjectJobParams = withPostgresSafeStrings(ProjectJobParamsSchema);
   const { service } = deps;
   const r = app.withTypeProvider<ZodTypeProvider>();
 
@@ -151,7 +155,7 @@ export function registerProjectJobRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: ProjectIdParamSchema,
+        params: ProjectIdParam,
         body: CommitVersionRequestSchema,
         response: {
           201: CommitVersionResponseSchema,
@@ -206,7 +210,7 @@ export function registerProjectJobRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: ProjectIdParamSchema,
+        params: ProjectIdParam,
         body: PublishVersionRequestSchema,
         response: {
           201: PublishVersionResponseSchema,
@@ -255,9 +259,10 @@ export function registerProjectJobRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: ProjectJobParamsSchema,
+        params: ProjectJobParams,
         response: {
           200: ProjectJobResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
         },

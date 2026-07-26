@@ -5,6 +5,7 @@ import {
   ManifestResponseSchema,
   ProjectIdParamSchema,
 } from "@supagloo/database-lib";
+import { withPostgresSafeStrings } from "../postgres-text";
 import type { ManifestService } from "../manifests/manifest-service";
 import {
   ManifestInvalidError,
@@ -37,6 +38,8 @@ export function registerManifestRoutes(
   app: FastifyInstance,
   deps: ManifestRoutesDeps,
 ): void {
+  // Path params: the shared rule in ../postgres-text, held by ./path-params-gate.test.ts.
+  const ProjectIdParam = withPostgresSafeStrings(ProjectIdParamSchema);
   const { service } = deps;
   const r = app.withTypeProvider<ZodTypeProvider>();
 
@@ -45,10 +48,11 @@ export function registerManifestRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        params: ProjectIdParamSchema,
+        params: ProjectIdParam,
         querystring: ManifestRefQuerySchema,
         response: {
           200: ManifestResponseSchema,
+          400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
           409: errorResponseSchema,

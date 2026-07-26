@@ -222,9 +222,13 @@ describe("GitHub routes — error mapping", () => {
 //
 // Fastify's default error handler derives the reply status from the thrown error:
 // `error.status` first, then `error.statusCode`
-// (`fastify/lib/error-handler.js` `setErrorHeaders`). This app registers NO
-// `setErrorHandler`, so any error escaping a handler dictates the wire status by
-// whatever fields it happens to carry.
+// (`fastify/lib/error-handler.js` `setErrorHeaders`), so any error escaping a handler
+// dictates the wire status by whatever fields it happens to carry.
+//
+// The app's own `setErrorHandler` (`src/error-handler.ts`, 2026-07-26) now ignores
+// `error.status` and generifies such an escape to a 500. This suite builds a BARE Fastify
+// instance without it on purpose: what it pins is the ROUTE's catch — a correct 502 carrying
+// `github_upstream_failed` — which no global fallback can produce.
 //
 // `GET /v1/github/repos` reaches GitHub twice — `mintInstallationToken` (db-lib) and
 // the listing walk (`GithubAppRequestError`) — and NEITHER `GithubConnectionService`
