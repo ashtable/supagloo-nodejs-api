@@ -27,12 +27,13 @@ import {
 //     rule that makes `nextCursor === null` mean GENUINELY exhausted;
 //   - stream-url + thumbnails: the injected presign seam, the recomputed output key, and
 //     the 120 s TTL;
-//   - upvote/unvote (row 40): the transaction SHAPE. This is the part with a real trap in
-//     it — a P2002 raised INSIDE a Postgres transaction aborts the whole transaction
-//     (25P02) and Prisma issues no SAVEPOINT, so `try { create } catch (P2002) {}` is
-//     BROKEN here. The tests below pin `createMany({ skipDuplicates })` /
-//     `deleteMany` — never an exception — and pin `{ increment: 1 }` rather than a
-//     read-then-write, which is what makes N concurrent votes produce exactly N.
+//   - upvote/unvote (row 40): the transaction SHAPE, plus one behavioural pin. A P2002 raised
+//     INSIDE a Postgres transaction marks it aborted (25P02) and Prisma issues no SAVEPOINT,
+//     so `try { create } catch (P2002) {}` followed by ANY further statement is broken here.
+//     U-UV2/U-UV3/U-UV7 pin `createMany({ skipDuplicates })` / `deleteMany` — never an
+//     exception — as a SHAPE; U-UV11 pins the hazard behaviourally, against a fake that models
+//     the abort. `{ increment: 1 }` rather than a read-then-write is what makes N concurrent
+//     votes produce exactly N.
 //
 // Prisma ops, the transaction boundary and the presign seam all record onto ONE shared
 // `calls` timeline (the lesson from the renders suite), so orderings are assertable as
@@ -577,6 +578,45 @@ describe("GalleryService.listGallery", () => {
     expect(second.items.map((i) => i.rank)).toEqual([25, 26, 27]);
   });
 
+  it("U-GV10b: a row that VANISHES between the two queries leaves a rank GAP, not a shift — the ordinal is the SQL's, not the survivors'", async () => {
+    // The listing is TWO queries: the raw keyset query produces the ordered ids, and a typed
+    // `findMany` fetches the rows. A concurrent `DELETE /v1/gallery/:id` landing between them
+    // makes the second return FEWER rows than the first, and the service already filters the
+    // missing ids out.
+    //
+    // What it did NOT do was keep the ordinals honest. `rank` was indexed off the SURVIVORS
+    // (`ordered`), while the next cursor's `n` advanced by the SQL page's length — so losing
+    // row 2 of 3 badged the third item "#2" and then started page two at #4. Both a lie and a
+    // gap, from one deletion.
+    //
+    // `rank` IS the position in the global ordering, so it must be derived from the position
+    // the SQL gave the row. A vanished row then leaves a truthful HOLE (1, 3) instead of
+    // renumbering the ones that survived, and `n` stays in the same coordinate system.
+    const fourRaw = [
+      { id: "a", sortKey: 9 },
+      { id: "b", sortKey: 5 },
+      { id: "c", sortKey: 1 },
+      { id: "d", sortKey: 0 }, // the pageSize+1 exhaustion probe
+    ];
+    const fake = makeFake({
+      rawRows: fourRaw,
+      // "b" was deleted after the raw query and before the typed read.
+      items: [itemRow({ id: "a", upvoteCount: 9 }), itemRow({ id: "c", upvoteCount: 1 })],
+    });
+    const page = await makeService(fake, { pageSize: 3 }).service.listGallery(null, {
+      sort: "popular",
+    });
+
+    expect(page.items.map((i) => i.id)).toEqual(["a", "c"]);
+    expect(page.items.map((i) => i.rank)).toEqual([1, 3]);
+    // A SHORT page with a non-null nextCursor is the honest answer: there really is more, and
+    // the cursor's ordinal counts positions in the ordering, not rows that survived.
+    expect(page.nextCursor).not.toBeNull();
+    expect(
+      JSON.parse(Buffer.from(page.nextCursor!, "base64url").toString("utf8")),
+    ).toEqual({ s: "popular", k: 1, i: "c", n: 3 });
+  });
+
   it("U-GV11: exhaustion — pageSize+1 is fetched, pageSize is returned, and nextCursor is minted ONLY if the extra row existed", async () => {
     // 3 raw rows with pageSize 2 ⇒ there IS a next page.
     const more = makeFake({
@@ -857,6 +897,142 @@ describe("GalleryService.upvote", () => {
       expect(has(fake.calls, "tx:galleryUpvote.create"), `count=${dup}`).toBe(false);
       expect(has(fake.calls, "galleryUpvote.create"), `count=${dup}`).toBe(false);
     }
+  });
+
+  it("U-UV11: against a fake that models POSTGRES ABORT SEMANTICS, a duplicate vote still commits — no 25P02 anywhere", async () => {
+    // U-UV2/U-UV3/U-UV7 above are MOCK-SHAPE assertions: they pin which Prisma method is
+    // called, not what Postgres does to a transaction. An adversarial audit showed that is not
+    // enough — the api e2e stayed 25/25 green against BOTH
+    //   M3   `try { create } catch (P2002) { inserted = false }` gating the increment, and
+    //   M3b  check-then-insert with a swallowed P2002,
+    // and only went red on
+    //   M3c  swallow the P2002 and then increment UNCONDITIONALLY.
+    // So M3c is the shape the design is actually defending against, and until now nothing but
+    // an expensive 8-request e2e burst held it.
+    //
+    // This fake is the missing behavioural pin. It models the ONE thing that matters and that
+    // no mock-shape assertion can see: a unique violation raised inside an interactive
+    // Postgres transaction marks the transaction ABORTED, after which EVERY further statement
+    // fails with 25P02 — Prisma issues no SAVEPOINT. Run against the shipped
+    // `createMany({ skipDuplicates })` (INSERT … ON CONFLICT DO NOTHING) nothing conflicts, so
+    // nothing aborts. Run against M3c it raises 25P02 out of the increment.
+    //
+    // HONEST LIMIT, recorded rather than papered over: this does NOT distinguish the shipped
+    // shape from M3/M3b, and nothing behavioural can — they are genuinely correct too. The
+    // reasons to prefer `createMany` are that it makes the abort STRUCTURALLY impossible
+    // instead of contingent on nobody ever adding a statement after the catch, and that it is
+    // one round trip instead of two. That preference is pinned by U-UV2/U-UV3/U-UV7's shapes,
+    // and this test says so out loud.
+    const abortingPostgres = () => {
+      const calls: Call[] = [];
+      const existing = new Set<string>(["voter-1|gal-1"]); // the user ALREADY voted
+      let aborted = false;
+      let counter = 7;
+
+      const guard = (op: string) => {
+        calls.push({ op, args: {} });
+        if (aborted) {
+          const err: any = new Error(
+            "current transaction is aborted, commands ignored until end of transaction block",
+          );
+          err.code = "25P02";
+          throw err;
+        }
+      };
+      const key = (d: { userId: string; galleryItemId: string }) =>
+        `${d.userId}|${d.galleryItemId}`;
+
+      const tx = {
+        galleryUpvote: {
+          create: (args: any) => {
+            guard("tx:galleryUpvote.create");
+            if (existing.has(key(args.data))) {
+              // Postgres raises the unique violation AND poisons the transaction.
+              aborted = true;
+              const err: any = new Error(
+                "Unique constraint failed on the fields: (`userId`,`galleryItemId`)",
+              );
+              err.code = "P2002";
+              return Promise.reject(err);
+            }
+            existing.add(key(args.data));
+            return Promise.resolve({ id: "vote-1" });
+          },
+          createMany: (args: any) => {
+            guard("tx:galleryUpvote.createMany");
+            const fresh = args.data.filter((d: any) => !existing.has(key(d)));
+            for (const d of fresh) existing.add(key(d));
+            return Promise.resolve({ count: fresh.length });
+          },
+          findFirst: (args: any) => {
+            guard("tx:galleryUpvote.findFirst");
+            return Promise.resolve(existing.has(key(args.where)) ? { id: "vote-1" } : null);
+          },
+          deleteMany: (args: any) => {
+            guard("tx:galleryUpvote.deleteMany");
+            const had = existing.delete(key(args.where));
+            return Promise.resolve({ count: had ? 1 : 0 });
+          },
+        },
+        galleryItem: {
+          update: () => {
+            guard("tx:galleryItem.update");
+            counter += 1;
+            return Promise.resolve({});
+          },
+          updateMany: () => {
+            guard("tx:galleryItem.updateMany");
+            counter -= 1;
+            return Promise.resolve({ count: 1 });
+          },
+        },
+      };
+
+      const prisma = {
+        galleryItem: {
+          findFirst: () => {
+            calls.push({ op: "galleryItem.findFirst", args: {} });
+            return Promise.resolve(itemRow({ upvoteCount: counter }));
+          },
+        },
+        galleryUpvote: {
+          findMany: () => {
+            calls.push({ op: "galleryUpvote.findMany", args: {} });
+            return Promise.resolve([{ galleryItemId: "gal-1" }]);
+          },
+        },
+        $transaction: async (fn: any) => {
+          calls.push({ op: "$transaction", args: {} });
+          return fn(tx);
+        },
+      };
+      return {
+        fake: { prisma: prisma as unknown as PrismaClient, calls },
+        counter: () => counter,
+        votes: () => existing.size,
+      };
+    };
+
+    const pg = abortingPostgres();
+    const dto = await makeService(pg.fake).service.upvote("voter-1", "gal-1");
+
+    // It commits, the count is stable, and no second vote row appeared.
+    expect(dto.upvoteCount).toBe(7);
+    expect(pg.counter()).toBe(7);
+    expect(pg.votes()).toBe(1);
+    // The proof that the abort was never triggered: `create` was not the statement used, so
+    // there was no P2002 to swallow and nothing that could poison what follows.
+    expect(has(pg.fake.calls, "tx:galleryUpvote.create")).toBe(false);
+    expect(has(pg.fake.calls, "tx:galleryUpvote.createMany")).toBe(true);
+    expect(has(pg.fake.calls, "tx:galleryItem.update")).toBe(false);
+
+    // …and a FIRST vote through the same fake still increments, so the assertion above is not
+    // passing merely because the path does nothing.
+    const fresh = abortingPostgres();
+    const first = await makeService(fresh.fake).service.upvote("voter-2", "gal-1");
+    expect(fresh.counter()).toBe(8);
+    expect(first.upvoteCount).toBe(8);
+    expect(has(fresh.fake.calls, "tx:galleryItem.update")).toBe(true);
   });
 
   it("U-UV8: voting on an unknown item 404s and NO transaction is opened", async () => {

@@ -731,6 +731,114 @@ describe("e2e: cursor pagination", () => {
     );
     expect(ok.status).toBe(200);
   });
+
+  it("E-G16: a STRUCTURALLY VALID cursor with a hostile payload is a 400 that leaks no SQLSTATE — never an unauthenticated 500", async () => {
+    // THE CASE THIS FILE WAS MISSING, and it is the reason an adversarial audit could refute
+    // the claim that a forged cursor is always a 400. E-G9's loop sends `["zzz","","e30","%%%"]`
+    // — every one of which dies at the base64 / JSON / shape gates. NOTHING here ever sent a
+    // cursor that DECODED and then carried a payload Postgres would refuse, so four distinct
+    // unauthenticated 500s survived on this endpoint, each replying with the Prisma error code,
+    // the SQLSTATE and the offending literal.
+    //
+    // Every payload below was measured against this exact app and this exact Postgres at
+    // commit d319046, with NO Authorization header, and the status recorded in the comment is
+    // what it actually answered then.
+    const mint = (payload: unknown) =>
+      Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+
+    const hostile: Array<[string, unknown]> = [
+      // F1 — `newest` keys V8's Date.parse accepts and Postgres's timestamptz parser does not.
+      ["newest k=2026 (was 500 / 22007)", { s: "newest", k: "2026", i: "zzz", n: 1 }],
+      ["newest k='Jan 2000' (was 500 / 22007)", { s: "newest", k: "Jan 2000", i: "zzz", n: 1 }],
+      [
+        "newest k=2020-02-30 (was 500 / 22008 — the very error the old JSDoc claimed fixed)",
+        { s: "newest", k: "2020-02-30T00:00:00Z", i: "zzz", n: 1 },
+      ],
+      [
+        "newest k=V8's Date#toString (was 500 / 22007)",
+        {
+          s: "newest",
+          k: "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)",
+          i: "zzz",
+          n: 1,
+        },
+      ],
+      [
+        "newest k=expanded negative year (was 500 / 22009)",
+        { s: "newest", k: "-271821-04-20T00:00:00.000Z", i: "zzz", n: 1 },
+      ],
+      // Found by sweeping the NEW grammar's own extremes against this same Postgres
+      // (`scratch/probe-grammar.ts`) — not in the audit, and 500s in waiting.
+      [
+        "newest k=year zero (22008 — Postgres's calendar has no year 0)",
+        { s: "newest", k: "0000-01-01T00:00:00Z", i: "zzz", n: 1 },
+      ],
+      [
+        "newest k=offset past ±14:00 (22009 time zone displacement out of range)",
+        { s: "newest", k: "2026-07-26T12:00:00+16:00", i: "zzz", n: 1 },
+      ],
+      // F2 — the same hole on the trending pagination epoch, which is a SECOND Date.parse.
+      [
+        "trending t=expanded negative year (was 500 / 22009)",
+        { s: "trending", k: 0.5, i: "zzz", n: 1, t: "-271821-04-20T00:00:00.000Z" },
+      ],
+      [
+        "trending t=2026",
+        { s: "trending", k: 0.5, i: "zzz", n: 1, t: "2026" },
+      ],
+      // F4 — an unsafe ordinal, which 500s at the RESPONSE SERIALIZER rather than in Postgres:
+      // `n` feeds `rank`, typed `z.number().int()` on the wire DTO.
+      [
+        "popular n=MAX_SAFE_INTEGER (was 500 / FST_ERR_RESPONSE_SERIALIZATION)",
+        { s: "popular", k: 1, i: "zzz", n: Number.MAX_SAFE_INTEGER },
+      ],
+      ["popular n=1e21 (was 500)", { s: "popular", k: 1, i: "zzz", n: 1e21 }],
+    ];
+
+    for (const [label, payload] of hostile) {
+      const sort = (payload as { s: string }).s;
+      const res = await api(
+        `/gallery?sort=${sort}&cursor=${encodeURIComponent(mint(payload))}`,
+      );
+      const body = await res.text();
+      expect(res.status, `${label} → ${res.status} ${body}`).toBe(400);
+      expect(JSON.parse(body).error, label).toBe("invalid_cursor");
+      // Nothing internal on the wire: no SQLSTATE, no Prisma code, no offending literal.
+      for (const leak of ["22007", "22008", "22009", "P2010", "prisma", "timestamp with time zone", "FST_ERR"]) {
+        expect(body, `${label} leaked ${leak}`).not.toContain(leak);
+      }
+    }
+  }, 120_000);
+
+  it("E-G17: a NUL byte in `q` is a 400 — one query parameter used to be the cheapest 500 on the surface", async () => {
+    // F3. No cursor, no session, one parameter: `GET /v1/gallery?q=%00` answered
+    // `500 … 22021 invalid byte sequence for encoding "UTF8": 0x00` because
+    // `GalleryListQuerySchema.q` is a bare `z.string().optional()` and `escapeLike` handles
+    // only `\ % _`. U-GQ6/U-GQ7/E-G10 covered `%`, `_`, `\` and blank — never a control byte.
+    for (const raw of ["\u0000", "a\u0000b", "a\u001Bb", "a\u007Fb"]) {
+      const res = await api(`/gallery?q=${encodeURIComponent(raw)}`);
+      const body = await res.text();
+      expect(res.status, `q=${JSON.stringify(raw)} → ${res.status} ${body}`).toBe(400);
+      expect(JSON.parse(body).error).toBe("invalid_query");
+      expect(body).not.toContain("22021");
+      expect(body).not.toContain("byte sequence");
+    }
+
+    // F9 — `q` was bounded only ACCIDENTALLY, by Node's 16 KB request-line limit (12 000
+    // chars answered 200; 20 000 answered 431). A 12 KB `q` meant three ILIKE '%…%'
+    // comparisons per row on a public, unauthenticated, unindexed, unrate-limited endpoint.
+    const over = await api(`/gallery?q=${"a".repeat(12_000)}`);
+    expect(over.status).toBe(400);
+    expect((await over.json()).error).toBe("invalid_query");
+
+    // …and the bound is a bound: 200 characters is still a legal search.
+    const atBound = await api(`/gallery?q=${"a".repeat(200)}`);
+    expect(atBound.status).toBe(200);
+    // Tab / newline survive — they are whitespace, plausible in a paste, and Postgres carries
+    // them fine, so only the non-whitespace controls are refused.
+    const tabbed = await api(`/gallery?q=${encodeURIComponent("a\tb")}`);
+    expect(tabbed.status).toBe(200);
+  }, 120_000);
 });
 
 // ----------------------------------------------------------------------- search (D9)
@@ -897,6 +1005,69 @@ describe("e2e: visibility", () => {
 
     // A row that does not exist is a uniform 404, never a distinguishable denial.
     expect((await api("/gallery/no-such-item")).status).toBe(404);
+  }, 120_000);
+});
+
+// ------------------------------------------------------------- optional auth (D2)
+
+describe("e2e: the optionalAuth degrade", () => {
+  it("E-G18: a PRESENT-BUT-INVALID bearer reads the gallery as ANONYMOUS (200) and is still 401 on every authed route", async () => {
+    // D2 is the ONE auth carve-out on this surface, and until now it was pinned only against a
+    // FAKE auth service (U-OA4/U-GR2/U-GR6). An adversarial audit's mutation M5 — make
+    // `optionalAuth` 401 on a present-but-invalid token — was caught by those three unit tests
+    // and the gallery e2e stayed 25/25 GREEN, because nothing here ever sent a bad bearer to
+    // the real app. That matters more than usual: the whole reason to degrade is that the BFF
+    // forwards whatever session cookie is present, so this is the behaviour a user with a
+    // stale cookie actually gets, and it was proven only against a stand-in.
+    const user = await seedUser("degrade");
+    const project = await seedProject(user.userId, "degrade");
+    const renderId = await seedCompletedRender(user, project, "degrade");
+    const token = nonce("degrade");
+    const item = await publishOk(user.token, renderId, { title: `Degrade ${token}` });
+
+    // A token with the right SHAPE that resolves to no session — i.e. exactly a stale cookie,
+    // reaching the REAL AuthService and the REAL session table.
+    const stale = "totally-invalid-token-that-is-not-in-the-session-table";
+
+    // The two `optionalAuth` reads degrade to anonymous rather than erroring…
+    const listed = await api(`/gallery?q=${token}`, stale);
+    expect(listed.status, await listed.clone().text()).toBe(200);
+    const listBody = await listed.json();
+    expect(idsOf(listBody.items)).toEqual([item.id]);
+    // Anonymous means anonymous: no personalization is invented for the bad token.
+    expect(listBody.items[0].viewerHasUpvoted).toBe(false);
+
+    const one = await api(`/gallery/${item.id}`, stale);
+    expect(one.status).toBe(200);
+    expect((await one.json()).item.viewerHasUpvoted).toBe(false);
+
+    // …and a malformed header (not even `Bearer <x>`) is the same 200, with no session lookup.
+    const malformed = await fetch(`${baseUrl}/v1/gallery?q=${token}`, {
+      headers: { authorization: "not-a-bearer-header" },
+    });
+    expect(malformed.status).toBe(200);
+
+    // The no-auth route is unaffected either way.
+    expect((await api(`/gallery/${item.id}/stream-url`, stale)).status).toBe(200);
+
+    // But the SAME token is a hard 401 on every route that needs a session — which is the
+    // other half of the contract, and what makes the degrade a carve-out rather than a hole.
+    for (const [method, path] of [
+      ["POST", `/gallery/${item.id}/upvote`],
+      ["DELETE", `/gallery/${item.id}/upvote`],
+      ["DELETE", `/gallery/${item.id}`],
+      ["POST", `/renders/${renderId}/gallery`],
+    ] as Array<[string, string]>) {
+      const res = await api(path, stale, {
+        method,
+        ...(method === "POST" && path.endsWith("/gallery") ? { body: publishBody() } : {}),
+      });
+      expect(res.status, `${method} ${path}`).toBe(401);
+      expect((await res.json()).error, `${method} ${path}`).toBe("unauthorized");
+    }
+    // No vote was cast by any of that.
+    const row = await prisma.galleryItem.findUniqueOrThrow({ where: { id: item.id } });
+    expect(row.upvoteCount).toBe(0);
   }, 120_000);
 });
 
@@ -1100,11 +1271,22 @@ describe("e2e: upvotes", () => {
   }, 180_000);
 
   it("E-U5: 8 PARALLEL duplicate votes from the SAME user give count 1, one row, and NO 5xx", async () => {
-    // THE P2002-IN-A-TRANSACTION PROOF. Catching a unique violation inside an interactive
-    // Postgres transaction does NOT save you — the transaction is marked aborted and every
-    // later statement fails with 25P02, and Prisma's $transaction issues no SAVEPOINT.
-    // `createMany({ skipDuplicates })` (INSERT … ON CONFLICT DO NOTHING) raises nothing,
-    // which is what makes this burst survive.
+    // WHAT THIS EARNS, stated honestly — an earlier version of this comment called itself
+    // "THE P2002-IN-A-TRANSACTION PROOF" and an adversarial audit was right to refute that.
+    //
+    // Measured, not assumed: this case (with E-U3) goes RED for the shape that swallows a
+    // P2002 and then increments UNCONDITIONALLY — the transaction is already aborted, so the
+    // increment raises 25P02. It stays GREEN for a `try { create } catch (P2002) { skip the
+    // increment }` and for check-then-insert, because both of those are genuinely correct
+    // too. So what this proves is the REAL invariant — a same-user burst commits, ends at
+    // exactly one vote and one row, and never 5xxes — and not the stronger claim that only
+    // `createMany({ skipDuplicates })` can do it.
+    //
+    // The 25P02 hazard itself is pinned by U-UV11, a unit test driving `upvote` against a fake
+    // that models Postgres's abort semantics; the choice of `createMany` over a correct
+    // try/catch is pinned by the shape assertions U-UV2/U-UV3/U-UV7, and its reasons are about
+    // the code (the abort becomes structurally unreachable; one round trip, not two) rather
+    // than about behaviour. See the `upvote` doc-comment.
     const users = await seedUsers("dupconc", 1);
     const project = await seedProject(users[0].userId, "dupconc");
     const renderId = await seedCompletedRender(users[0], project, "dupconc");

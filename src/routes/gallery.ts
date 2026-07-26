@@ -15,6 +15,7 @@ import {
   GalleryItemAlreadyPublishedError,
   GalleryItemNotFoundError,
   InvalidGalleryCursorError,
+  InvalidGallerySearchError,
   RenderNotPublishableError,
   ScriptureBookUnderivableError,
 } from "../gallery/errors";
@@ -59,6 +60,12 @@ export interface GalleryRoutesDeps {
  * Registration order is static-before-parameterised (`/gallery` → `/gallery/:id/stream-url`
  * → `/gallery/:id/upvote` → `/gallery/:id`), mirroring `routes/renders.ts`. Fastify's radix
  * router prefers static segments anyway; the explicit order keeps it obvious.
+ *
+ * `GET /gallery` has TWO 400 slugs — `invalid_cursor` and `invalid_query` — because its two
+ * client-supplied parameters fail for unrelated reasons and are fixed by unrelated client
+ * changes. Both are raised by the service's codec (`gallery-query.ts`) before any SQL exists,
+ * which is what keeps a hostile-but-structurally-valid cursor or search term from becoming an
+ * unauthenticated 500 inside Postgres. `src/error-handler.ts` is the layer under that.
  */
 export function registerGalleryRoutes(
   app: FastifyInstance,
@@ -79,6 +86,13 @@ export function registerGalleryRoutes(
       return reply
         .code(400)
         .send({ error: "invalid_cursor", message: err.message });
+    }
+    // A SEPARATE 400 slug from `invalid_cursor`: the two are fixed by different client
+    // changes, and pointing a caller who sent no cursor at its cursor wastes their time.
+    if (err instanceof InvalidGallerySearchError) {
+      return reply
+        .code(400)
+        .send({ error: "invalid_query", message: err.message });
     }
     if (err instanceof RenderNotPublishableError) {
       return reply

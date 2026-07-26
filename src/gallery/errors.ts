@@ -101,3 +101,28 @@ export class InvalidGalleryCursorError extends Error {
     this.name = "InvalidGalleryCursorError";
   }
 }
+
+/**
+ * The `q` search parameter carried a control character or exceeded its length bound. Maps to
+ * **400** (`invalid_query`).
+ *
+ * A SEPARATE type from {@link InvalidGalleryCursorError} even though both are 400s on the
+ * same route: the two are fixed by different client changes (drop the cursor vs. fix the
+ * search box), and `invalid_cursor` on a request that carried no cursor would send a client
+ * looking in the wrong place.
+ *
+ * WHY THIS EXISTS AT ALL. `GalleryListQuerySchema.q` is a bare `z.string().optional()` in
+ * db-lib and `escapeLike` handles only `\ % _`, so nothing stopped a `U+0000`: Postgres
+ * cannot carry a NUL in a `text` parameter and `GET /v1/gallery?q=%00` answered
+ * `500 … 22021 invalid byte sequence for encoding "UTF8": 0x00` to an anonymous caller — one
+ * query parameter, no cursor, no session. The bound is enforced HERE, in the api, because the
+ * wire schema lives in another repo; `parseSearchTerm` is its codec-side twin of
+ * `parseCursor`.
+ */
+export class InvalidGallerySearchError extends Error {
+  readonly statusCode = 400;
+  constructor(message = "invalid gallery search term") {
+    super(message);
+    this.name = "InvalidGallerySearchError";
+  }
+}

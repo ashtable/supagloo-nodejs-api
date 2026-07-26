@@ -16,14 +16,24 @@ import { TRENDING } from "./trending";
  * trending" would mean TWO cursor implementations, and keyset pagination is exactly where
  * skip/duplicate bugs live. One builder, one predicate shape, one set of tests.
  *
- * WHY IT IS SAFE, and these three rules are non-negotiable:
+ * WHY IT IS SAFE, and these three rules are non-negotiable — each names the test that HOLDS
+ * it, because until 2026-07-26 rule 1 had nothing holding it at all (an audit's mutation
+ * interpolated the request's `sort` straight into the ORDER BY clause and the whole suite,
+ * 79 unit and 25 e2e, stayed green):
  *   1. `sort` is a CLOSED enum at the Zod boundary, and the ORDER BY key expression is
  *      selected from the fixed {@link GALLERY_SORT_KEY_SQL} map — never built from the
- *      request string;
+ *      request string. Held by **U-GQ4c**: the ORDER BY key is the fixed output alias and no
+ *      sort NAME may appear anywhere in the static SQL;
  *   2. every value (`$now`/`$t`, `$q`, the cursor's `$k`/`$i`, `$limit`) is a BOUND
- *      parameter via the tagged template;
+ *      parameter via the tagged template. Held by **U-GQ5**, which drives a hostile `q` and a
+ *      hostile cursor `i` through and asserts they appear only in `values`;
  *   3. `Prisma.raw` is used ONLY on the three numeric constants in {@link TRENDING}.
- *      A unit test asserts no request value ever appears in the emitted SQL TEXT.
+ *      Held by U-GQ4 + U-GQ5 together.
+ *
+ * A FOURTH rule, learned the hard way: being parameterised is not the same as being SAFE. A
+ * bound parameter still has to be a value the column's type accepts, or Postgres raises and
+ * the reply is a 500 carrying the SQLSTATE and the literal to an anonymous caller. That is
+ * what {@link isStrictIsoInstant} and {@link parseSearchTerm} are for.
  *
  * Deliberately NOT here: any `book` predicate. The `book=` query parameter was cut on
  * 2026-07-26 — which books exist is a property of the TRANSLATION, with the YouVersion API
@@ -95,6 +105,13 @@ export const GALLERY_SORT_KEY_SQL: Record<
  * forged `newest` cursor carrying `42` must be rejected up front. `'42'::timestamptz` is a
  * Postgres error (verified 2026-07-26: `date/time field value out of range`), so accepting
  * such a cursor would turn a forged query parameter into a 500 instead of a 400.
+ *
+ * CORRECTED 2026-07-26: an earlier version of this comment implied the per-sort TYPE check
+ * was sufficient, and it was not. Rejecting a number under `newest` closes nothing about
+ * which STRINGS Postgres will take, and the old `!Number.isNaN(Date.parse(k))` guard was a
+ * proxy for that, not a test of it — `"2026"`, `"Jan 2000"` and `"2020-02-30T00:00:00Z"` all
+ * passed it and 500ed here (22007 / 22007 / 22008). What closes it is the VALUE grammar,
+ * {@link isStrictIsoInstant}, not the type check and not `Date.parse`.
  */
 const SORT_KEY_PARAM: Record<
   GallerySort,
@@ -109,6 +126,97 @@ const SORT_KEY_PARAM: Record<
  *  the codec rather than blowing up as a 500 inside Postgres's cast. */
 const INT4_MIN = -2_147_483_648;
 const INT4_MAX = 2_147_483_647;
+
+/**
+ * The deepest page position a cursor may claim.
+ *
+ * `n` is the last row's 1-based ordinal and it feeds `rank`, which the wire DTO types
+ * `z.number().int()`. A forged `n` of `Number.MAX_SAFE_INTEGER` therefore produced a
+ * `500 FST_ERR_RESPONSE_SERIALIZATION` under `sort=popular` — the reply could not be
+ * serialized against its own schema. `Number.isSafeInteger` (which the sibling popular-key
+ * check six lines below already used, while the `n` check did not) closes the float cases;
+ * this ceiling closes the rest, because an ordinal is a POSITION in a listing and 41 666
+ * pages of 24 is already far past anything a client walks. It also keeps every derived
+ * `rank` inside int4.
+ */
+export const GALLERY_MAX_ORDINAL = 1_000_000;
+
+/**
+ * Longest accepted `q`.
+ *
+ * `q` had NO bound at all. It was limited only ACCIDENTALLY, by Node's 16 KB request-line
+ * limit (12 000 chars answered 200; 20 000 answered 431) — so a 12 KB search term became
+ * three `ILIKE '%…%'` comparisons per row on a public, unauthenticated, unindexed,
+ * unrate-limited endpoint. The plan reasoned explicitly about DoS for `limit`
+ * ({@link GALLERY_PAGE_SIZE}) and not at all for this.
+ *
+ * 200 is comfortably longer than the longest title the publish schema accepts (120) and
+ * than any phrase a person types into a search box, so the bound is invisible in real use.
+ */
+export const GALLERY_MAX_Q_LENGTH = 200;
+
+/**
+ * A strict ISO-8601 INSTANT: `YYYY-MM-DDTHH:MM:SS[.f{1,6}]` plus `Z` or `±HH:MM`.
+ *
+ * Deliberately a grammar and not a call to `Date.parse`. V8's parser is FAR more permissive
+ * than Postgres's `timestamptz` parser, and the gap was reachable: `"2026"`, `"Jan 2000"`,
+ * `"2020-02-30T00:00:00Z"`, `"Thu Jan 01 1970 00:00:00 GMT+0000 (…)"` and
+ * `"-271821-04-20T00:00:00.000Z"` all satisfied `!Number.isNaN(Date.parse(k))` and then
+ * failed INSIDE Postgres (SQLSTATE 22007 / 22008 / 22009) as an UNAUTHENTICATED 500 whose
+ * body carried the SQLSTATE and the offending literal.
+ *
+ * The four-digit year is load-bearing twice over: it rejects V8's ±six-digit expanded years
+ * (`-271821-…`, `+275760-…`), which are legal JS instants and outside `timestamptz`'s range,
+ * and it keeps every accepted value inside a range Postgres parses without complaint.
+ *
+ * MEASURED against the real Compose Postgres over the whole grammar's extremes
+ * (`scratch/probe-grammar.ts`, 2026-07-26), which is how the two residual holes below were
+ * found — neither was in the audit, and both would still have been unauthenticated 500s:
+ *   - `0000-01-01T00:00:00Z` → **22008**. Postgres's proleptic calendar has NO year zero (it
+ *     numbers 1 BC, not 0), so the year floor is 1, not 0000.
+ *   - `2026-07-26T12:00:00+16:00` → **22009** `time zone displacement out of range`. Postgres
+ *     tolerates up to ±15:59; the bound here is the tighter ±14:00, which is ISO-8601's own
+ *     limit and larger than every real-world zone (Line Islands is exactly +14:00).
+ * Everything the grammar accepts now round-trips through BOTH cursor paths: bound as text and
+ * cast (`k`) and bound as a JS `Date` (`t`).
+ */
+const ISO_INSTANT =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?(?:Z|([+-])(\d{2}):(\d{2}))$/;
+
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+const isLeapYear = (y: number) => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+
+/**
+ * Is `value` a timestamp this codec will hand to Postgres?
+ *
+ * The calendar fields are checked ARITHMETICALLY rather than by round-tripping through
+ * `Date`: `Date.UTC(2020, 1, 30)` silently rolls over to March 1st, so a round-trip
+ * comparison would accept February 30th — the exact input whose 22008 the old JSDoc claimed
+ * to have fixed.
+ */
+export function isStrictIsoInstant(value: string): boolean {
+  const m = ISO_INSTANT.exec(value);
+  if (!m) return false;
+  const [year, month, day, hour, minute, second] = [m[1], m[2], m[3], m[4], m[5], m[6]].map(
+    Number,
+  );
+  // No year zero in Postgres's calendar.
+  if (year < 1) return false;
+  if (month < 1 || month > 12) return false;
+  const maxDay = month === 2 && isLeapYear(year) ? 29 : DAYS_IN_MONTH[month - 1];
+  if (day < 1 || day > maxDay) return false;
+  // No leap-second carve-out: Postgres accepts `:60` by rolling it over, but nothing in
+  // this system ever mints one, and rolling a forged value is not a behaviour worth having.
+  if (hour > 23 || minute > 59 || second > 59) return false;
+
+  // `Z` (no offset group captured) is always fine; an explicit offset must be a real one.
+  if (m[7] === undefined) return true;
+  const offsetHours = Number(m[8]);
+  const offsetMinutes = Number(m[9]);
+  if (offsetMinutes > 59) return false;
+  return offsetHours < 14 || (offsetHours === 14 && offsetMinutes === 0);
+}
 
 /**
  * The opaque pagination cursor. Base64url of this compact JSON object.
@@ -189,14 +297,19 @@ export function decodeCursor(raw: string): DecodedCursor {
   if (typeof c.i !== "string" || c.i.length === 0) {
     return reject("cursor id is missing or empty");
   }
-  if (typeof c.n !== "number" || !Number.isInteger(c.n) || c.n < 0) {
-    return reject("cursor ordinal is not a non-negative integer");
+  if (
+    typeof c.n !== "number" ||
+    !Number.isSafeInteger(c.n) ||
+    c.n < 0 ||
+    c.n > GALLERY_MAX_ORDINAL
+  ) {
+    return reject("cursor ordinal is not a safe integer within the page-position bound");
   }
 
   const k = c.k;
   if (s === "newest") {
-    if (typeof k !== "string" || Number.isNaN(Date.parse(k))) {
-      return reject("newest cursor key is not an ISO-8601 timestamp");
+    if (typeof k !== "string" || !isStrictIsoInstant(k)) {
+      return reject("newest cursor key is not a strict ISO-8601 instant");
     }
   } else if (typeof k !== "number" || !Number.isFinite(k)) {
     return reject(`${s} cursor key is not a finite number`);
@@ -211,8 +324,13 @@ export function decodeCursor(raw: string): DecodedCursor {
   // second and the drift would be unbounded (plan D5).
   let t: string | undefined;
   if (s === "trending") {
-    if (typeof c.t !== "string" || Number.isNaN(Date.parse(c.t))) {
-      return reject("trending cursor is missing its pagination epoch");
+    // Validated by the SAME grammar as `k`: the epoch is bound as a Date rather than cast in
+    // SQL, so only a JS-valid-but-Postgres-out-of-range instant broke it — and
+    // `-271821-04-20T00:00:00.000Z` is exactly that (SQLSTATE 22009).
+    if (typeof c.t !== "string" || !isStrictIsoInstant(c.t)) {
+      return reject(
+        "trending cursor is missing its pagination epoch, or the epoch is not a strict ISO-8601 instant",
+      );
     }
     t = c.t;
   }
@@ -258,6 +376,55 @@ export function parseCursor(
  */
 export function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
+/**
+ * C0 + DEL control characters, EXCEPT the three whitespace ones (`\t` `\n` `\r`).
+ *
+ * `U+0000` is the one that actually breaks: Postgres cannot carry a NUL in a `text`
+ * parameter and answers `22021 invalid byte sequence for encoding "UTF8": 0x00`, which made
+ * `GET /v1/gallery?q=%00` the cheapest 500 on the whole surface — no cursor, no session, one
+ * query parameter. The rest of the class is refused with it because none of them carry search
+ * meaning, and a single checkable predicate is a better rule than a one-character carve-out
+ * the next control character walks around. `\t`/`\n`/`\r` are exempted because they are
+ * whitespace, they are plausible in a paste, and Postgres carries them fine.
+ */
+const FORBIDDEN_CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+
+export type ParsedSearchTerm =
+  | { ok: true; q: string | undefined }
+  | { ok: false; reason: string };
+
+/**
+ * Validate the request's `q` BEFORE it can reach an `ILIKE` parameter.
+ *
+ * The `GalleryListQuerySchema` wire shape is `q: z.string().optional()` and lives in db-lib,
+ * so this is where the api bounds it. Symmetric with {@link parseCursor}: pure, total, a
+ * tagged union, and called by the service before any SQL is built.
+ *
+ * REJECT rather than repair, for both rules. Stripping the control characters would make
+ * `q=%00` behave exactly like a BLANK `q` — i.e. answer a hostile input with a
+ * match-everything listing — and truncating an over-long `q` would return hits for a prefix
+ * of what the caller sent, so the response would be a lie about what was searched. A 400
+ * names the problem instead.
+ *
+ * Blank or whitespace-only is ABSENT, not an error: a UI that always appends `q=` must not
+ * 400, and an absent `q` emits no predicate at all (never `'%%'`).
+ */
+export function parseSearchTerm(raw: string | undefined): ParsedSearchTerm {
+  if (raw === undefined) return { ok: true, q: undefined };
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return { ok: true, q: undefined };
+  if (FORBIDDEN_CONTROL_CHARS.test(trimmed)) {
+    return reject("q contains a control character");
+  }
+  if (trimmed.length > GALLERY_MAX_Q_LENGTH) {
+    return reject(`q is longer than ${GALLERY_MAX_Q_LENGTH} characters`);
+  }
+  // The ORIGINAL string, not the trimmed one: the builder trims again and the two must not
+  // disagree about what was searched. Trimming here is only how "blank means absent" and the
+  // length bound are measured.
+  return { ok: true, q: raw };
 }
 
 export interface BuildGalleryListQueryInput {

@@ -3,6 +3,7 @@ import {
   serializerCompiler,
   validatorCompiler,
 } from "fastify-type-provider-zod";
+import { registerErrorHandler } from "./error-handler";
 import { registerHealthRoutes } from "./routes/health";
 import { bearerAuthPlugin } from "./auth/bearer-auth";
 import { registerAuthRoutes } from "./routes/auth";
@@ -196,6 +197,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
 
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
+
+  // On the ROOT instance, so every scope inherits it — including `/v1`. DEFENCE IN DEPTH:
+  // every intentional reply is sent explicitly by its route handler and never reaches it; what
+  // it catches is the accidents, which until 2026-07-26 answered anonymous callers with the
+  // Prisma error code, the SQLSTATE and the offending literal. See `error-handler.ts`.
+  registerErrorHandler(app);
 
   registerHealthRoutes(app);
 

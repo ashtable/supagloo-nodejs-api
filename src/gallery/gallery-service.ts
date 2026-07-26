@@ -12,12 +12,14 @@ import {
   buildGalleryListQuery,
   encodeCursor,
   parseCursor,
+  parseSearchTerm,
   GALLERY_PAGE_SIZE,
 } from "./gallery-query";
 import {
   GalleryItemAlreadyPublishedError,
   GalleryItemNotFoundError,
   InvalidGalleryCursorError,
+  InvalidGallerySearchError,
   RenderNotPublishableError,
   ScriptureBookUnderivableError,
 } from "./errors";
@@ -217,6 +219,12 @@ export class GalleryService {
    * Raw SQL owns ordering + pagination; the rows themselves are fetched by the typed client
    * and re-ordered in JS to the id order the SQL produced — `findMany({ id: { in } })` gives
    * NO ordering guarantee.
+   *
+   * Because it IS two queries, a page may come back SHORTER than `pageSize` with a non-null
+   * `nextCursor`. That is not a bug and not exhaustion: it means a row was deleted between the
+   * ordering query and the typed read. Every coordinate the cursor carries comes from the
+   * ORDERING, so pagination continues from the right place and only that one row is missing
+   * from this page. `nextCursor === null` remains the ONLY exhaustion signal.
    */
   async listGallery(
     viewerId: string | null,
@@ -226,12 +234,18 @@ export class GalleryService {
     if (!parsed.ok) throw new InvalidGalleryCursorError(parsed.reason);
     const cursor = parsed.cursor;
 
+    // Both client-supplied parameters are validated BEFORE any SQL exists, and both are
+    // 400s: a control character in `q` is a NUL away from `22021` and an over-long `q` is
+    // three unbounded `ILIKE '%…%'` scans per row on an anonymous endpoint.
+    const search = parseSearchTerm(query.q);
+    if (!search.ok) throw new InvalidGallerySearchError(search.reason);
+
     const { sql, epoch } = buildGalleryListQuery({
       sort: query.sort,
       cursor,
       now: this.now(),
       pageSize: this.pageSize,
-      q: query.q,
+      q: search.q,
     });
 
     const raw = await this.prisma.$queryRaw<
@@ -262,12 +276,23 @@ export class GalleryService {
     // would badge the 25th item "#1". It is non-null only under `popular`, because rank is
     // a property of the GLOBAL popular ordering and a "#7" under another ordering asserts
     // something untrue.
+    //
+    // The ordinal is keyed off the position the RAW QUERY gave each id, NOT off this page's
+    // surviving rows. That difference is only visible when a row vanishes between the two
+    // queries (a concurrent `DELETE /v1/gallery/:id`), and it is the whole point: ranks are
+    // positions in the global ordering, so the survivors must keep the numbers the ordering
+    // gave them. Indexing off `ordered` instead renumbered them — losing row 2 of 3 badged
+    // the third item "#2" — while `nextCursor.n` advanced by the SQL page's length, so the
+    // next page also started one rank too high. A truthful GAP (1, 3) beats a silent shift,
+    // and it keeps `n` in one coordinate system.
     const startOrdinal = cursor?.n ?? 0;
+    const ordinalById = new Map(
+      page.map((r, index) => [r.id, startOrdinal + index + 1]),
+    );
     const items = await Promise.all(
-      ordered.map((row, index) =>
+      ordered.map((row) =>
         this.toDto(row, {
-          rank:
-            query.sort === "popular" ? startOrdinal + index + 1 : null,
+          rank: query.sort === "popular" ? (ordinalById.get(row.id) ?? null) : null,
           viewerHasUpvoted: voted.has(row.id),
         }),
       ),
@@ -358,12 +383,26 @@ export class GalleryService {
   /**
    * Cast the caller's vote. Idempotent: a duplicate is a 200 no-op with a stable count.
    *
-   * THE TRAP THIS SHAPE AVOIDS: catching a P2002 INSIDE an interactive Postgres transaction
-   * does not save you — Postgres marks the transaction aborted and every subsequent
-   * statement fails with `25P02`, and Prisma's `$transaction` issues no SAVEPOINT. So the
-   * obvious `try { create } catch (P2002) {}` is BROKEN here. `createMany({ skipDuplicates
-   * })` compiles to `INSERT … ON CONFLICT DO NOTHING`, which raises nothing at all, and the
-   * returned count is what decides whether the counter moves.
+   * THE TRAP, STATED PRECISELY (an earlier version of this comment overstated it, and an
+   * adversarial audit was right to refute it). Catching a P2002 inside an interactive Postgres
+   * transaction does not UNDO it: Postgres marks the transaction aborted and every SUBSEQUENT
+   * statement fails with `25P02`, because Prisma's `$transaction` issues no SAVEPOINT. So what
+   * is actually broken is `try { create } catch (P2002) {}` followed by ANY further statement
+   * — swallow the conflict and then increment unconditionally, and the increment raises
+   * 25P02. That shape is caught (E-U3 and E-U5 both fail on it).
+   *
+   * What is NOT true, and was claimed here before: that every `try { create } catch (P2002) }`
+   * shape is broken. One that also SKIPS the increment behaves correctly today, and no
+   * behavioural test can tell it from this code — measured, not assumed.
+   *
+   * `createMany({ skipDuplicates })` compiles to `INSERT … ON CONFLICT DO NOTHING`, which
+   * raises nothing at all, and the returned count is what decides whether the counter moves.
+   * It is preferred for two reasons that are about the CODE rather than the behaviour: it
+   * makes the aborted-transaction state structurally unreachable instead of contingent on
+   * nobody ever adding a statement after the catch, and it is one round trip instead of two.
+   * That preference is therefore pinned by the SHAPE assertions U-UV2/U-UV3/U-UV7, and the
+   * 25P02 hazard itself by U-UV11, which drives this method against a fake that models
+   * Postgres's abort semantics.
    *
    * `{ increment: 1 }` is mandatory and a read-then-write is forbidden: Prisma compiles it
    * to `SET "upvoteCount" = "upvoteCount" + 1`, which Postgres re-reads under the row lock,

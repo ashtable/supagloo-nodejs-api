@@ -164,9 +164,8 @@ export const GITHUB_UPSTREAM_ERROR_SLUG = "github_upstream_failed";
  * **The rule this predicate exists to enforce: a provider error class must never be
  * able to dictate our HTTP status.** Fastify's default error handler derives the reply
  * status from the thrown error (`error.status`, then `error.statusCode` — see
- * {@link GithubAppRequestError}'s doc-comment), and this API registers NO
- * `setErrorHandler`, so anything escaping a route handler answers the browser with
- * whatever fields it happens to carry.
+ * {@link GithubAppRequestError}'s doc-comment), so anything escaping a route handler
+ * answers the browser with whatever fields it happens to carry.
  *
  * Naming the upstream status `upstreamStatus` avoids that trap only for as long as
  * every class involved remembers to. db-lib's {@link GithubAppError} did NOT: it named
@@ -183,6 +182,12 @@ export const GITHUB_UPSTREAM_ERROR_SLUG = "github_upstream_failed";
  * depth, deliberately redundant with the field naming: the naming convention lives in
  * another repo and can be reverted by a one-word change invisible from here, whereas
  * this catch holds whatever any provider error is named.
+ *
+ * UPDATED 2026-07-26: the app now registers a `setErrorHandler` (`src/error-handler.ts`)
+ * that ignores `error.status` entirely — an error carrying its status only under that name
+ * is generified to a 500. That is a THIRD, independent layer beneath this one, and it is
+ * strictly weaker: it can only choose between "some status" and 500, whereas this predicate
+ * is what makes the reply a *correct* 502 carrying `github_upstream_failed`. Both stay.
  *
  * `RATE_LIMITED` folds in with the rest: a throttle that never cleared inside the
  * bounded retry budget is, to the caller, an upstream failure like any other.

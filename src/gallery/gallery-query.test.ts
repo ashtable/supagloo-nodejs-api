@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import { Prisma, type GallerySort } from "@supagloo/database-lib";
 import { TRENDING } from "./trending";
 import {
+  GALLERY_MAX_ORDINAL,
+  GALLERY_MAX_Q_LENGTH,
   GALLERY_PAGE_SIZE,
   GALLERY_SORT_KEY_SQL,
   buildGalleryListQuery,
@@ -9,6 +11,7 @@ import {
   encodeCursor,
   escapeLike,
   parseCursor,
+  parseSearchTerm,
   type GalleryCursor,
 } from "./gallery-query";
 
@@ -48,6 +51,11 @@ const flatText = (sql: Prisma.Sql) => sql.strings.join(" ? ");
 
 const mint = (payload: unknown) =>
   Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+
+/** A cursor key of the shape the sort's key expression binds: an ISO instant under
+ *  `newest`, a number elsewhere. */
+const keyFor = (sort: GallerySort): number | string =>
+  sort === "newest" ? "2026-07-20T08:00:00.000Z" : 42;
 
 function build(
   over: Partial<Parameters<typeof buildGalleryListQuery>[0]> = {},
@@ -134,6 +142,128 @@ describe("gallery cursor codec", () => {
     }
   });
 
+  // ---------------------------------------------------------------------------------
+  // The three cases below close an adversarial audit of commit `d319046`, which REFUTED
+  // this file's own claim that a forged cursor could only be a 400. Every payload here was
+  // driven through the real app against real Postgres with NO SESSION AT ALL and produced
+  // an UNAUTHENTICATED 500 whose body carried the Prisma error code, the SQLSTATE and the
+  // offending literal.
+  //
+  // Why the old tests missed it: U-GQ2's `"last tuesday"` is the one unparseable string V8
+  // ALSO rejects, and the e2e's forged-cursor loop only sent `["zzz","","e30","%%%"]` —
+  // every one of which dies at the base64 / JSON / shape gates. NO test ever sent a
+  // STRUCTURALLY VALID cursor with a hostile payload through to Postgres.
+
+  it("U-GQ2c: a structurally VALID `newest` cursor carrying a hostile timestamp is rejected — `Date.parse` is not Postgres's timestamptz parser", () => {
+    // Measured against the real app + real Postgres at commit d319046, anonymously:
+    const hostile: Array<[string, string]> = [
+      ["a bare year", "2026"], // 500 SQLSTATE 22007
+      ["a human month/year", "Jan 2000"], // 500 22007
+      ["a day that does not exist", "2020-02-30T00:00:00Z"], // 500 22008
+      [
+        "V8's own Date#toString format",
+        "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)",
+      ], // 500 22007
+      ["an instant outside Postgres's range", "-271821-04-20T00:00:00.000Z"], // 500 22009
+      // Not observed as a 500, but the same class of "V8 accepts, Postgres would not have
+      // to": the grammar, not the parser, is now the gate.
+      ["a date with no time at all", "2026-07-26"],
+      ["a month out of range", "2026-13-01T00:00:00Z"],
+      ["an hour out of range", "2026-07-26T24:00:00Z"],
+      ["a minute out of range", "2026-07-26T12:60:00Z"],
+      ["no zone designator", "2026-07-26T12:00:00"],
+      ["a slash-separated date", "2026/07/26 12:00:00Z"],
+      ["a six-digit positive year", "+275760-09-13T00:00:00.000Z"],
+      ["trailing junk", "2026-07-26T12:00:00.000Z; DROP TABLE x"],
+      // The two holes the FIRST strict grammar still had, found by sweeping its own extremes
+      // against real Postgres (`scratch/probe-grammar.ts`) rather than by the audit. Both were
+      // unauthenticated 500s in waiting.
+      ["year zero — Postgres's calendar has none (22008)", "0000-01-01T00:00:00Z"],
+      ["a UTC offset past ±14:00 (22009)", "2026-07-26T12:00:00+16:00"],
+      ["a nonsense offset (22009)", "2026-07-26T12:00:00+99:99"],
+      ["an offset with 60 minutes", "2026-07-26T12:00:00+05:60"],
+    ];
+
+    for (const [label, k] of hostile) {
+      const result = decodeCursor(mint({ s: "newest", k, i: "x", n: 1 }));
+      expect(result.ok, `expected rejection: ${label} (${k})`).toBe(false);
+    }
+  });
+
+  it("U-GQ2d: the trending pagination EPOCH is validated the same way — it is the second Date.parse, and it had the same hole", () => {
+    // `t` is consumed as `new Date(cursor.t)` and bound as a Date, so only a JS-valid but
+    // Postgres-out-of-range instant broke it — which is exactly what this one is (22009).
+    const hostile = [
+      "-271821-04-20T00:00:00.000Z",
+      "+275760-09-13T00:00:00.000Z",
+      "2026",
+      "Jan 2000",
+      "2020-02-30T00:00:00Z",
+    ];
+    for (const t of hostile) {
+      const result = decodeCursor(mint({ s: "trending", k: 0.5, i: "x", n: 1, t }));
+      expect(result.ok, `expected rejection: t=${t}`).toBe(false);
+    }
+  });
+
+  it("U-GQ2e: the ordinal `n` must be a SAFE integer within the ordinal ceiling — an unsafe one 500s at the response serializer", () => {
+    // `n` feeds `startOrdinal` and therefore `rank`, which the DTO types `z.number().int()`.
+    // `Number.isInteger(9007199254740991)` is true and `Number.isInteger(1e21)` is true, so
+    // the old check let both through and `sort=popular` answered
+    // 500 FST_ERR_RESPONSE_SERIALIZATION. Its sibling popular-key check six lines below
+    // already used `Number.isSafeInteger`; this is the same rule applied consistently.
+    const hostile: Array<[string, number]> = [
+      ["MAX_SAFE_INTEGER", Number.MAX_SAFE_INTEGER],
+      ["one past MAX_SAFE_INTEGER", Number.MAX_SAFE_INTEGER + 2],
+      ["1e21", 1e21],
+      ["MAX_VALUE", Number.MAX_VALUE],
+      ["one past the ordinal ceiling", GALLERY_MAX_ORDINAL + 1],
+      ["Infinity", Number.POSITIVE_INFINITY],
+    ];
+    for (const [label, n] of hostile) {
+      const result = decodeCursor(mint({ s: "popular", k: 1, i: "x", n }));
+      expect(result.ok, `expected rejection: n=${label}`).toBe(false);
+    }
+
+    // ...and the ceiling itself is still a legal position, so the bound is a bound and not
+    // an off-by-one that breaks deep pagination.
+    expect(decodeCursor(mint({ s: "popular", k: 1, i: "x", n: GALLERY_MAX_ORDINAL })).ok).toBe(
+      true,
+    );
+    expect(GALLERY_MAX_ORDINAL).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
+  });
+
+  it("U-GQ2f: the timestamps the SERVICE actually mints still decode — the strict grammar is not over-tight", () => {
+    // The service mints `k` as `Date#toISOString()` and `t` as `epoch.toISOString()`, so
+    // over-rejecting here would break pagination outright. Offsets and sub-second precision
+    // are accepted too: they are legal ISO-8601 instants and legal timestamptz literals.
+    const accepted = [
+      new Date().toISOString(),
+      "2026-07-26T12:00:00.000Z",
+      "2026-07-26T12:00:00Z",
+      "2026-07-26T12:00:00.123456Z",
+      "2028-02-29T00:00:00.000Z", // a REAL leap day
+      "2026-07-26T12:00:00+05:30",
+      "2026-07-26T12:00:00.000-08:00",
+      "2026-07-26T12:00:00+14:00", // ISO-8601's own maximum, and a real zone (Line Islands)
+      "2026-07-26T12:00:00-14:00",
+      "0001-01-01T00:00:00.000Z", // the year floor: 1, not 0000
+      "9999-12-31T23:59:59.999Z",
+    ];
+
+    for (const k of accepted) {
+      expect(decodeCursor(mint({ s: "newest", k, i: "x", n: 1 })).ok, k).toBe(true);
+      expect(
+        decodeCursor(mint({ s: "trending", k: 0.5, i: "x", n: 1, t: k })).ok,
+        `t=${k}`,
+      ).toBe(true);
+    }
+    // …and the leap-day check is real: 2026-02-29 does not exist.
+    expect(decodeCursor(mint({ s: "newest", k: "2026-02-29T00:00:00.000Z", i: "x", n: 1 })).ok).toBe(
+      false,
+    );
+  });
+
   it("U-GQ3: a cursor minted under one sort is REJECTED under another — never silently reset", () => {
     const popular = encodeCursor({ s: "popular", k: 42, i: "clx", n: 24 });
 
@@ -177,6 +307,61 @@ describe("escapeLike", () => {
     const built = build({ q: "%" });
     expect(built.sql.values).toContain("%\\%%");
     expect(flatText(built.sql)).toContain("ESCAPE");
+  });
+
+  it("U-GQ13: `q` is REJECTED for a NUL/control byte and for exceeding its length bound — never silently repaired", () => {
+    // THE CHEAPEST 500 THE AUDIT FOUND on the whole surface: no cursor, no session, one
+    // query parameter. `q` was a bare `z.string().optional()` and `escapeLike` only handles
+    // `\ % _`, so `GET /v1/gallery?q=%00` reached Postgres and answered
+    // `500 … 22021 invalid byte sequence for encoding "UTF8": 0x00` — anonymously.
+    for (const [label, q] of [
+      ["a lone NUL", "\u0000"],
+      ["an embedded NUL", "a\u0000b"],
+      ["a NUL behind trimmable space", "  \u0000  "],
+      ["a bell", "a\u0007b"],
+      ["a vertical tab", "a\u000Bb"],
+      ["an escape", "a\u001Bb"],
+      ["a DEL", "a\u007Fb"],
+    ] as Array<[string, string]>) {
+      const result = parseSearchTerm(q);
+      expect(result.ok, `expected rejection: ${label}`).toBe(false);
+    }
+
+    // REJECT, not strip. Stripping would make `q=%00` behave exactly like a BLANK `q` — a
+    // match-everything listing handed back in answer to a hostile input — and would report
+    // hits for a string the caller never sent. Truncating an over-long `q` is the same lie.
+    const tooLong = "a".repeat(GALLERY_MAX_Q_LENGTH + 1);
+    expect(parseSearchTerm(tooLong).ok).toBe(false);
+    // The bound itself is a legal query, so this is a bound and not an off-by-one.
+    expect(parseSearchTerm("a".repeat(GALLERY_MAX_Q_LENGTH)).ok).toBe(true);
+    // It has to actually BOUND the ILIKE work: today a 12 000-char `q` was accepted and
+    // bounded only ACCIDENTALLY, by Node's 16 KB request-line limit.
+    expect(GALLERY_MAX_Q_LENGTH).toBeLessThanOrEqual(1_000);
+
+    // Tab / newline / CR survive: they are whitespace, they are plausible in a paste, and
+    // Postgres carries them fine. Only the non-whitespace controls are refused.
+    for (const q of ["a\tb", "a\nb", "a\r\nb"]) {
+      expect(parseSearchTerm(q).ok, JSON.stringify(q)).toBe(true);
+    }
+  });
+
+  it("U-GQ13b: blank is ABSENT, and an accepted `q` passes through UNCHANGED", () => {
+    // A UI that always appends `q=` must not 400, and blank must not become `%%`.
+    for (const q of [undefined, "", "   ", "\t\n "]) {
+      const result = parseSearchTerm(q);
+      expect(result.ok, JSON.stringify(q)).toBe(true);
+      if (!result.ok) throw new Error("unreachable");
+      expect(result.q, JSON.stringify(q)).toBeUndefined();
+    }
+
+    // LIKE metacharacters and SQL punctuation are NOT this function's business — they are
+    // `escapeLike`'s and the binding's respectively. It must not double up as a sanitiser.
+    for (const q of ["%", "_", "\\", `'; DROP TABLE "GalleryItem"; --`, "Psalm 23:1"]) {
+      const result = parseSearchTerm(q);
+      expect(result.ok, q).toBe(true);
+      if (!result.ok) throw new Error("unreachable");
+      expect(result.q, q).toBe(q);
+    }
   });
 
   it("U-GQ7: a blank `q` emits NO search predicate at all (never a `%%` match-everything)", () => {
@@ -230,6 +415,47 @@ describe("GALLERY_SORT_KEY_SQL", () => {
     // against a different instant, which is exactly what the cursor epoch prevents.
     expect(text).not.toContain("now()");
     expect(trending.values).toEqual([EPOCH]);
+  });
+
+  it("U-GQ4c: the ORDER BY key is the FIXED output alias — the request's `sort` string never reaches the SQL TEXT", () => {
+    // THE INVARIANT THE MODULE HEADER CALLS NON-NEGOTIABLE, and until now nothing held it.
+    // An adversarial audit's mutation M1c replaced this query's `ORDER BY "sortKey"` with
+    // `ORDER BY ${Prisma.raw(String(rawOrder))}`, where `rawOrder` derives from the request's
+    // `sort` — the request string interpolated straight into SQL TEXT — and the whole suite
+    // stayed green (79/79 unit, 25/25 e2e). Not exploitable today, because `GallerySortSchema`
+    // is a closed Zod enum, but "not exploitable because a schema in another file happens to
+    // be closed" is not the same as "the ORDER BY key cannot come from the request".
+    //
+    // U-GQ5 only passes a hostile `q` and a hostile cursor `i`, both of which ARE properly
+    // bound; neither can see the ORDER BY clause at all.
+    for (const cursor of [
+      null,
+      { s: "popular" as const, k: 42, i: "clx", n: 3 },
+    ]) {
+      for (const sort of SORTS) {
+        const scoped =
+          cursor === null ? null : { ...cursor, s: sort, k: keyFor(sort) };
+        const text = staticText(build({ sort, cursor: scoped as never }).sql);
+        const where = `${sort} cursor=${cursor === null ? "none" : "yes"}`;
+
+        // The ordering key is an ALIAS the SELECT defined — a constant of this module.
+        expect(text, where).toContain('ORDER BY "sortKey" DESC, "id" DESC');
+        // …and no sort NAME appears anywhere in the static SQL. `Prisma.raw`-ing the request
+        // value in would put one there whichever clause it landed in.
+        for (const name of SORTS) {
+          expect(text.toLowerCase(), `${where} leaked the sort name ${name}`).not.toContain(
+            name,
+          );
+        }
+      }
+    }
+
+    // The map is the ONLY thing indexed by the request value, and it is total over the enum:
+    // an out-of-enum sort therefore cannot select an expression at all (it throws before any
+    // SQL exists), rather than emitting itself.
+    expect(() =>
+      build({ sort: `popular"; DROP TABLE "GalleryItem"; --` as GallerySort }),
+    ).toThrow();
   });
 
   it("U-GQ4b: every sort orders by (key DESC, id DESC) — the id tiebreak is what makes the keyset a TOTAL order", () => {

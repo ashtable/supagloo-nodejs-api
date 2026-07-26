@@ -11,6 +11,7 @@ import {
   GalleryItemAlreadyPublishedError,
   GalleryItemNotFoundError,
   InvalidGalleryCursorError,
+  InvalidGallerySearchError,
   RenderNotPublishableError,
   ScriptureBookUnderivableError,
 } from "../gallery/errors";
@@ -245,6 +246,26 @@ describe("GET /gallery — the public listing", () => {
     const res = await app.inject({ method: "GET", url: "/gallery?cursor=zzz" });
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toBe("invalid_cursor");
+  });
+
+  it("U-GR5c: a hostile `q` ⇒ 400 invalid_query — a DIFFERENT slug from invalid_cursor", async () => {
+    const { service } = makeService({
+      listGallery: async () => {
+        throw new InvalidGallerySearchError("q contains a control character");
+      },
+    });
+    const built = await buildTestApp(service);
+    app = built.app;
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/gallery?q=${encodeURIComponent("\u0000")}`,
+    });
+    expect(res.statusCode).toBe(400);
+    // Pointing a caller who sent no cursor at its cursor wastes their time, so the two 400s
+    // on this route carry distinct slugs.
+    expect(res.json().error).toBe("invalid_query");
+    expect(res.json().error).not.toBe("invalid_cursor");
   });
 
   it("U-GR5b: a blank `q` is accepted (a UI that always appends the param must not 400)", async () => {
