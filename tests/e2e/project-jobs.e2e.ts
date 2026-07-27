@@ -22,6 +22,7 @@ import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
 import {
   assertLaneRuntimeIsolated,
   assertWorkflowIsolated,
+  countLaneWorkflows,
   laneSystemSchema,
   resetLaneSchema,
 } from "../../src/testing/dbos-lane-isolation";
@@ -452,6 +453,21 @@ describe("e2e: plan row 49 — two SIMULTANEOUS creates for one repo", () => {
       createdFrom: "blank",
     };
 
+    // WATERMARK, taken BEFORE the two POSTs. The row's E2E column says "exactly one
+    // workflow enqueued", and that sentence cannot be proven by any query keyed to an id
+    // the test already holds: `assertWorkflowIsolated` and both `listWorkflows` calls below
+    // take the WINNER's id (and `jobsForProject` was already asserted to have length 1, so
+    // the second `listWorkflows` was literally the first one re-issued). A refactor that
+    // enqueued a second `scaffoldProject` under a fresh id — the exact defect the row exists
+    // to prevent — passed all of them. VERIFIED by mutation in Step 11: enqueueing on the
+    // 409 path with a fresh uuid left this whole spec green. Counting by workflow NAME in
+    // the lane schema is what makes the sentence checkable.
+    const scaffoldsBefore = await countLaneWorkflows({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowName: SCAFFOLD_PROJECT_WORKFLOW_NAME,
+    });
+
     // Fired together, awaited together — the two requests interleave on the same event
     // loop, which is exactly the window the application-level `findFirst` cannot see.
     const [a, b] = await Promise.all([
@@ -503,8 +519,19 @@ describe("e2e: plan row 49 — two SIMULTANEOUS creates for one repo", () => {
       workflowID: won.body.jobId,
     });
     expect(await DBOS.listWorkflows({ workflowIDs: [won.body.jobId] })).toHaveLength(1);
-    // The loser enqueued nothing at all: its `jobId` was never issued to a caller, and the
-    // winner's is the only git-ops workflow this project ever produced.
+
+    // THE "EXACTLY ONE" ASSERTION, and the only one of these that can fail if a second
+    // workflow appears under an id this test was never told about. Counted by NAME, so it
+    // sees the loser's enqueue whatever id it used; scoped to the lane schema, so it is not
+    // reading the shared `dbos` namespace where a count would be vacuously zero.
+    const scaffoldsAfter = await countLaneWorkflows({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowName: SCAFFOLD_PROJECT_WORKFLOW_NAME,
+    });
+    expect(scaffoldsAfter - scaffoldsBefore).toBe(1);
+
+    // …and the one that exists is the winner's, still keyed to the id the caller received.
     const allForProject = await DBOS.listWorkflows({
       workflowIDs: jobsForProject.map((j) => j.id),
     });

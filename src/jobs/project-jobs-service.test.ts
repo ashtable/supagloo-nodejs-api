@@ -162,9 +162,12 @@ const COMMIT_PROJECT = {
   currentBranch: "v0.0.1",
 };
 
+type WarnCall = { fields: Record<string, unknown>; message: string };
+
 function makeService(
   prisma: PrismaClient,
   enqueueRecorder: { calls: { opts: EnqueueOptions; payload: any }[] },
+  warnRecorder?: WarnCall[],
 ) {
   return new ProjectJobsService({
     prisma,
@@ -173,6 +176,11 @@ function makeService(
     },
     now: () => new Date("2026-07-19T00:00:00.000Z"),
     generateJobId: () => "job-fixed",
+    // Optional in production too (see `ProjectJobsServiceOptions.warn`); every case that
+    // omits it is also the assertion that the service still works without a logger.
+    warn: warnRecorder
+      ? (fields, message) => warnRecorder.push({ fields, message })
+      : undefined,
   });
 }
 
@@ -780,8 +788,19 @@ describe("plan row 49 — the partial unique index maps to the existing 409", ()
     expect(PROJECT_ACTIVE_REPO_UNIQUE_INDEX).toBe(
       "Project_ownerId_repoOwner_repoName_active_key",
     );
-    // …and db-lib's extractor really recovers it from the measured adapter shape. If this
-    // ever goes red, every catch below is matching on a value that no longer arrives.
+    // WHAT THIS DOES AND DOES NOT COVER — stated precisely, because the earlier wording
+    // ("every catch below is matching on a value that no longer arrives") described
+    // coverage the api does not have and never wanted. NO catch below matches on a value:
+    // `asDuplicateCreate` reads `err.code === "P2002"` and nothing else, deliberately
+    // (D49.1 — both `Project_ownerId_slug_key` and the repo index are reachable, so a
+    // narrowed catch would rethrow the common case and 500). What this case pins is the
+    // CROSS-REPO CONTRACT in two halves:
+    //   (a) the index NAME db-lib publishes, so a rename over there is visible over here;
+    //   (b) that db-lib's extractor still recovers that name from the measured adapter
+    //       shape — which the api now genuinely depends on, because `asDuplicateCreate`
+    //       calls `uniqueViolationIndexName(err)` to LOG which unique actually fired
+    //       (U-R49-11/12). Before that log line the import was dead and this assertion
+    //       proved nothing about api behaviour.
     expect(uniqueViolationIndexName(p2002(PROJECT_ACTIVE_REPO_UNIQUE_INDEX))).toBe(
       PROJECT_ACTIVE_REPO_UNIQUE_INDEX,
     );
@@ -806,7 +825,12 @@ describe("plan row 49 — the partial unique index maps to the existing 409", ()
     expect((err as any).statusCode).toBe(409);
   });
 
-  it("U-R49-2: create — P2002 on the SLUG index (the one that actually fires) is also a 409", async () => {
+  it("U-R49-2: create — the ANTI-NARROWING guard: the SLUG index is also a 409", async () => {
+    // THIS IS THE LOAD-BEARING ONE. It is not "U-R49-1 with a different string" — it is the
+    // regression test that fails the moment anyone "tightens" the catch to
+    // `isUniqueViolationOn(err, PROJECT_ACTIVE_REPO_UNIQUE_INDEX)`, which reads like an
+    // improvement and would 500 on roughly half of all real races (measured: both index
+    // names fire non-deterministically on the same test, four runs, Postgres logs).
     const { prisma } = makeFake({
       connection: { installationId: "42" },
       transactionError: p2002(SLUG_INDEX),
@@ -903,6 +927,77 @@ describe("plan row 49 — the partial unique index maps to the existing 409", ()
       .catch(() => {});
     expect(enqueued.calls).toHaveLength(0);
     expect(has(calls, "project.create")).toBe(false);
+  });
+
+  // ------------------------------------------------------ Step-11 item 27 (R49-2)
+  // The unconditional map is correct (D49.1, measured) but it was SILENT, and silence is
+  // what makes two different faults indistinguishable:
+  //
+  //   1. A currently-reachable wrong message. Owner `u` has connections to `alice/my-app`
+  //      and `bob/my-app` and fires both creates at once. Both slugify to `my-app`, neither
+  //      sees the other's project for its own triple, both derive the SAME slug; the loser
+  //      violates `Project_ownerId_slug_key` and is told "a project already exists for this
+  //      repository", which is false for `bob/my-app`. (Transient — a retry succeeds — and
+  //      still far better than the pre-fix 500, so the 409 stays; only the diagnostic was
+  //      missing.)
+  //   2. A permanent data fault with no symptom. If `nextFreeSlug` ever regresses and
+  //      returns a taken slug, every create for that owner answers a clean 409 forever.
+  //      `error-handler.ts` logs only what it generifies into a 500, so this path produced
+  //      ZERO log lines and ZERO 500s: a green dashboard over permanently broken creates.
+  //
+  // One warn line carrying the index name distinguishes them — and it is what finally gives
+  // the api a PRODUCTION consumer for db-lib's `uniqueViolationIndexName` (see U-R49-10).
+  it("U-R49-11: create — the losing race is LOGGED with the index that actually fired", async () => {
+    const { prisma } = makeFake({
+      connection: { installationId: "42" },
+      transactionError: p2002(SLUG_INDEX),
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const warns: WarnCall[] = [];
+
+    const err = await makeService(prisma, enqueued, warns)
+      .createProjectWithScaffold("u1", CREATE_REQ)
+      .then(
+        () => undefined,
+        (e) => e as Error,
+      );
+
+    // D49.1's unconditional 409 is UNCHANGED — the log is additive, not a new branch.
+    expect(err).toBeInstanceOf(ProjectAlreadyExistsError);
+    expect((err as any).statusCode).toBe(409);
+
+    expect(warns).toHaveLength(1);
+    // The slug index, not the repo index: the whole point is that the operator can tell
+    // which unique fired, because the 409's message is only true for one of them.
+    expect(warns[0].fields.index).toBe(SLUG_INDEX);
+    expect(warns[0].message).toContain("unique-violation race");
+  });
+
+  it("U-R49-12: import logs it too, and a non-P2002 failure logs NOTHING", async () => {
+    const { prisma } = makeFake({
+      connection: { installationId: "42" },
+      transactionError: p2002(PROJECT_ACTIVE_REPO_UNIQUE_INDEX),
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const warns: WarnCall[] = [];
+    await makeService(prisma, enqueued, warns)
+      .createProjectFromImport("u1", IMPORT_REQ)
+      .catch(() => {});
+    expect(warns).toHaveLength(1);
+    expect(warns[0].fields.index).toBe(PROJECT_ACTIVE_REPO_UNIQUE_INDEX);
+
+    // Narrowness matters as much as breadth here too: a warn on every transaction failure
+    // would train the operator to ignore the line that means "a real unique fired".
+    const other = Object.assign(new Error("Raw query failed"), { code: "P2010" });
+    const second = makeFake({
+      connection: { installationId: "42" },
+      transactionError: other,
+    });
+    const warns2: WarnCall[] = [];
+    await makeService(second.prisma, enqueued, warns2)
+      .createProjectWithScaffold("u1", CREATE_REQ)
+      .catch(() => {});
+    expect(warns2).toEqual([]);
   });
 
   it("U-R49-9: the pre-transaction guard is UNCHANGED — the constraint is a backstop", async () => {

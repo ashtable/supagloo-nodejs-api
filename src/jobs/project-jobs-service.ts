@@ -8,6 +8,7 @@ import {
   SCAFFOLD_STAGES,
   buildBlankManifest,
   buildInitialStages,
+  uniqueViolationIndexName,
   type CommitVersionPayload,
   type CommitVersionRequest,
   type CreateProjectRequest,
@@ -92,17 +93,51 @@ const IN_FLIGHT_STATUSES = ["queued", "running"] as const;
  * database-lib is a nested `file:` dependency, so the class a consumer imports need not be
  * the class that threw. `auth-service.ts:214-222` and `gallery-service.ts:127-140` document
  * the same rule and use the same predicate.
+ *
+ * IT LOGS ONCE BEFORE THROWING, and the unconditional map is exactly why: two different
+ * faults arrive here wearing the same 409.
+ *
+ *  - A slug collision between two DIFFERENT repos under one owner (both slugify to the same
+ *    string, so the loser violates `Project_ownerId_slug_key`) is answered with "a project
+ *    already exists for this repository" — which is FALSE for the second repo. Transient, a
+ *    retry succeeds because the winner's slug is now visible to `nextFreeSlug`, and still
+ *    far better than the raw-Prisma 500; so the answer stays. What was missing was any way
+ *    to know it had happened.
+ *  - A `nextFreeSlug` regression that returned an already-taken slug would answer a clean
+ *    409 for that owner FOREVER. `error-handler.ts` logs only what it generifies into a 500,
+ *    so this path produced zero log lines and zero 500s: a green dashboard over permanently
+ *    broken creates.
+ *
+ * The index name is what distinguishes them, and reading it is also what finally gives this
+ * repo a PRODUCTION consumer for db-lib's `uniqueViolationIndexName` (until now imported by
+ * tests only — the extractor was a cross-repo contract nothing here depended on).
  */
-function asDuplicateCreate(err: unknown): unknown {
+function asDuplicateCreate(err: unknown, warn?: JobsWarnLogger): unknown {
   if (
     typeof err === "object" &&
     err !== null &&
     (err as { code?: unknown }).code === "P2002"
   ) {
+    warn?.(
+      { index: uniqueViolationIndexName(err) },
+      "create lost a unique-violation race — answering 409 project_exists",
+    );
     return new ProjectAlreadyExistsError();
   }
   return err;
 }
+
+/**
+ * Warn-level log seam — a function, not a pino instance, so the service stays DB- and
+ * framework-free and a unit test can record calls without building an app.
+ *
+ * Optional: omitted, the service behaves exactly as before (the log is a diagnostic, never
+ * part of a response contract). `server.ts` binds it to the Fastify logger.
+ */
+export type JobsWarnLogger = (
+  fields: Record<string, unknown>,
+  message: string,
+) => void;
 
 export interface ProjectJobsServiceOptions {
   prisma: PrismaClient;
@@ -112,6 +147,8 @@ export interface ProjectJobsServiceOptions {
   now?: () => Date;
   /** Injectable id generator for `ProjectJob.id` (= workflow id); defaults to uuid. */
   generateJobId?: () => string;
+  /** See {@link JobsWarnLogger}. Currently used only by {@link asDuplicateCreate}. */
+  warn?: JobsWarnLogger;
 }
 
 /**
@@ -140,12 +177,14 @@ export class ProjectJobsService {
   private readonly enqueue: JobEnqueue;
   private readonly now: () => Date;
   private readonly generateJobId: () => string;
+  private readonly warn?: JobsWarnLogger;
 
   constructor(opts: ProjectJobsServiceOptions) {
     this.prisma = opts.prisma;
     this.enqueue = opts.enqueue;
     this.now = opts.now ?? (() => new Date());
     this.generateJobId = opts.generateJobId ?? (() => randomUUID());
+    this.warn = opts.warn;
   }
 
   async createProjectWithScaffold(
@@ -224,7 +263,7 @@ export class ProjectJobsService {
         return { projectId: project.id };
       })
       .catch((err: unknown) => {
-        throw asDuplicateCreate(err);
+        throw asDuplicateCreate(err, this.warn);
       });
 
     const { workflowName, queueName } = resolveGitOpsWorkflow("scaffold");
@@ -327,7 +366,7 @@ export class ProjectJobsService {
         return { projectId: project.id };
       })
       .catch((err: unknown) => {
-        throw asDuplicateCreate(err);
+        throw asDuplicateCreate(err, this.warn);
       });
 
     const { workflowName, queueName } = resolveGitOpsWorkflow("import_verify");
