@@ -252,6 +252,28 @@ export class GalleryService {
       Math.round(render.framesTotal / render.fps),
     );
 
+    // The LAST gate, and the reason it is a SELECT rather than "let the insert tell us".
+    //
+    // `renderJobId` is @unique, so a re-publish was always going to be refused — but the
+    // insert only refuses it AFTER `captureMakingOf` has already minted an installation
+    // token and pulled a file from GitHub. That made the one refusal a caller can trigger
+    // repeatedly, with a valid session and no state change, the one refusal that costs
+    // egress. Reading the row first restores the rule the next line states.
+    //
+    // It does NOT replace the P2002 catch below: two concurrent publishes of the same
+    // render both see "not published" here, and the unique index is what actually decides
+    // between them. This is a cheap common-case gate; the constraint is the correctness
+    // boundary. (U-GS-MO4b covers the gate, U-GS-MO4c the race backstop.)
+    //
+    // Scoped to the RENDER, not to the caller: a render belonging to someone else already
+    // 404'd at the owner-scoped resolve above, so adding `ownerId` here would only make a
+    // genuine duplicate look publishable to a second user.
+    const existing = await this.prisma.galleryItem.findUnique({
+      where: { renderJobId: render.id },
+      select: { id: true },
+    });
+    if (existing) throw new GalleryItemAlreadyPublishedError();
+
     // LAST, after every gate: a 404/409/422 must cost no GitHub round trip at all.
     const makingOf = await this.captureMakingOf(userId, render.projectId);
 
@@ -287,7 +309,10 @@ export class GalleryService {
         include: OWNER_INCLUDE,
       })) as GalleryItemRow;
     } catch (err) {
-      // `renderJobId` is @unique, so a second publish of the same render lands here.
+      // The RACE backstop, not the primary gate: the pre-check above catches every
+      // sequential re-publish, and this catches the two-concurrent-requests case that no
+      // read-then-write can. Still narrow — an unrelated failure must never be reported
+      // as already_published.
       if (isUniqueViolation(err)) throw new GalleryItemAlreadyPublishedError();
       throw err;
     }

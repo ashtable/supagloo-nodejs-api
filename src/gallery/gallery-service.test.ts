@@ -60,6 +60,9 @@ interface FakeConfig {
   render?: unknown;
   /** galleryItem.findFirst result (first call). */
   item?: unknown;
+  /** galleryItem.findUnique result — publish's `renderJobId` dedupe pre-check. `null`
+   *  (or omitted) means "this render has not been published", the happy path. */
+  publishedItem?: unknown;
   /** galleryItem.findFirst result from the SECOND call onward (post-transaction re-read). */
   reReadItem?: unknown;
   /** galleryItem.findMany result (the listing's typed row fetch). */
@@ -136,6 +139,7 @@ function makeFake(config: FakeConfig) {
         return Promise.resolve(config.item ?? null);
       },
       findMany: rec("galleryItem.findMany", config.items ?? []),
+      findUnique: rec("galleryItem.findUnique", config.publishedItem ?? null),
       create: (args: any) => {
         calls.push({ op: "galleryItem.create", args });
         if (config.createError !== undefined) {
@@ -1432,7 +1436,54 @@ describe("GalleryService.publish — the best-effort making-of snapshot", () => 
       GalleryItemNotFoundError,
     );
 
+    // ALREADY PUBLISHED — the case the title claimed and the code did not deliver. The
+    // render passes every gate, so the old implementation reached `captureMakingOf` and
+    // only THEN discovered the duplicate via the insert's P2002. A second POST of an
+    // already-published render therefore paid a real, token-minting GitHub round trip to
+    // produce a 409 — the exact cost this test says a refusal never pays, and one an
+    // unauthenticated-adjacent retry loop could repeat for free.
+    const already = makeFake({
+      render: renderRow(),
+      publishedItem: itemRow(),
+      // Present so a regression that skips the pre-check still ENDS in the right error
+      // (it just gets there expensively) — this case must fail on the READ COUNT, not on
+      // the error type, or it would be measuring the wrong thing.
+      createError: { code: "P2002", name: "PrismaClientKnownRequestError" },
+    });
+    await expect(
+      svc(already).publish(USER_ID, RENDER_ID, PUBLISH_REQ),
+    ).rejects.toBeInstanceOf(GalleryItemAlreadyPublishedError);
+    expect(
+      reads,
+      "an already-published render must be refused BEFORE the manifest read",
+    ).toBe(0);
+    // …and it never even attempted the insert.
+    expect(has(already.calls, "galleryItem.create")).toBe(false);
+
     expect(reads).toBe(0);
+  });
+
+  it("U-GS-MO4c: the pre-check is a NARROW dedupe, not a replacement for the P2002 backstop", async () => {
+    // The race is real and unavoidable: two concurrent publishes of the same render both
+    // read "not published" and both insert. The unique index on `renderJobId` is what
+    // actually decides, so the catch must survive — a pre-check that returns nothing must
+    // still leave the loser of the race with a 409 rather than a 500.
+    const racing = makeFake({
+      render: renderRow(),
+      publishedItem: null,
+      createError: { code: "P2002", name: "PrismaClientKnownRequestError" },
+    });
+    await expect(
+      makeService(racing).service.publish(USER_ID, RENDER_ID, PUBLISH_REQ),
+    ).rejects.toBeInstanceOf(GalleryItemAlreadyPublishedError);
+    expect(has(racing.calls, "galleryItem.create")).toBe(true);
+
+    // The pre-check is scoped to the RENDER, never to the caller: publishing someone
+    // else's render is already a 404 from the owner-scoped resolve above, so adding an
+    // ownerId here would only make a genuine duplicate look publishable.
+    expect(find(racing.calls, "galleryItem.findUnique").args.where).toEqual({
+      renderJobId: RENDER_ID,
+    });
   });
 });
 
