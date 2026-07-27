@@ -5,6 +5,7 @@ import {
   type ProjectManifest,
 } from "@supagloo/database-lib";
 import { buildMakingOfSnapshot, MAX_SNAPSHOT_SCENES } from "./making-of";
+import { POSTGRES_TEXT_EXEMPT_CONTROL_CODES } from "../postgres-text";
 
 // Unit tests for the PURE manifest -> `GalleryItem.makingOf` snapshot builder (plan
 // slice C3, Turn 16a). No I/O, no DB, no clock of its own — `now` is injected, so
@@ -351,5 +352,36 @@ describe("buildMakingOfSnapshot — the whole-output property", () => {
       manifest({ scenes: [scene({ id: "a", scriptText: "line one\nline two" })] }),
     );
     expect(snap.scriptureText).toBe("line one\nline two");
+  });
+
+  it("U-MOB16b: the stripped class is EXACTLY C0+DEL less the api's ONE exempt list — enumerated, not sampled", () => {
+    // U-MOB8 samples two forbidden control characters and U-MOB16 samples one exempt
+    // one; neither could tell you whether this module's notion of "exempt" still MATCHES
+    // the list `postgres-text.ts` publishes. It no longer keeps a copy — it imports that
+    // list — and this test is what makes the import load-bearing rather than cosmetic:
+    // mutate `POSTGRES_TEXT_EXEMPT_CONTROL_CODES` and this assertion moves with it.
+    //
+    // The probe character sits BETWEEN two letters on purpose. `sanitize` trims, and
+    // `trim()` treats five C0 characters as whitespace (tab, LF, VT, FF, CR) — so a
+    // probe at either end would destroy the evidence for VT and FF, the exact pair that
+    // once walked through `?q=`.
+    const allC0AndDel = [...Array.from({ length: 32 }, (_, i) => i), 0x7f];
+    const survived: number[] = [];
+
+    for (const code of allC0AndDel) {
+      const ch = String.fromCharCode(code);
+      const label = `U+${code.toString(16).padStart(4, "0").toUpperCase()}`;
+      const name = build(
+        manifest({ scenes: [scene({ id: "a", name: `x${ch}y` })] }),
+      ).scenes[0].name;
+
+      if (name === `x${ch}y`) {
+        survived.push(code);
+      } else {
+        expect(name, `${label} must be REMOVED, not mangled`).toBe("xy");
+      }
+    }
+
+    expect(survived).toEqual([...POSTGRES_TEXT_EXEMPT_CONTROL_CODES]);
   });
 });

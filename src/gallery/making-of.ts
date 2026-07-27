@@ -5,6 +5,7 @@ import {
   type ManifestScene,
   type ProjectManifest,
 } from "@supagloo/database-lib";
+import { POSTGRES_TEXT_EXEMPT_CONTROL_CODES } from "../postgres-text";
 
 /**
  * The PURE manifest → `GalleryItem.makingOf` snapshot builder (Turn 16a, plan slice C3).
@@ -45,16 +46,24 @@ const MAX_LABEL_CHARS = 120;
 const MAX_SCRIPTURE_CHARS = 20_000;
 
 /**
- * C0 (U+0000–U+001F) + DEL (U+007F) LESS tab/LF/CR, as a GLOBAL matcher.
+ * C0 (U+0000–U+001F) + DEL (U+007F) LESS the exempt codes, as a GLOBAL matcher.
  *
  * The class is deliberately identical to db-lib's `jsonbSafeText` and to this api's
  * `src/postgres-text.ts` — one rule, three boundaries. The difference here is the verb:
  * those two REFUSE, this one REMOVES, because refusing at capture time would cost a
  * publish its whole "HOW IT WAS MADE" section over one unprintable byte.
+ *
+ * The EXEMPT SET is IMPORTED, not re-typed. This module and `postgres-text.ts` ship in
+ * the same package, so a second hand-maintained copy of the list buys nothing — and that
+ * module's own header records what one copy already cost: its JSDoc said `\t \n \r` while
+ * the effective behaviour exempted five characters, and `?q=%0B` came back as a
+ * match-everything listing. One list, two verbs. (db-lib keeps a third copy only because
+ * it cannot import from a consumer; that one is fenced by both suites enumerating the
+ * class.)
  */
 const FORBIDDEN_CONTROL_CHARS = new RegExp(
   `[${[...Array.from({ length: 32 }, (_, i) => i), 0x7f]
-    .filter((code) => ![0x09, 0x0a, 0x0d].includes(code))
+    .filter((code) => !POSTGRES_TEXT_EXEMPT_CONTROL_CODES.includes(code))
     .map((code) => `\\u${code.toString(16).padStart(4, "0")}`)
     .join("")}]`,
   "g",
