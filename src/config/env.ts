@@ -73,6 +73,21 @@ const baseEnvSchema = z.object({
       message:
         "DBOS_DATABASE_URL must be a postgres:// or postgresql:// connection string",
     }),
+  // OPTIONAL. The SCHEMA inside DBOS_DATABASE_URL's database that holds DBOS's own
+  // checkpoints/queues (the SDK's `systemDatabaseSchemaName`; its default is "dbos").
+  //
+  // Exists for the designed single-database deployment fallback: where the platform
+  // exposes only one Postgres database, DBOS's schema-level isolation inside that
+  // database stands in for the two-logical-database topology. UNSET in every Compose
+  // file — api and dbos must agree on the same value or they stop seeing each other's
+  // work, so leaving both unset (the SDK default) is the shipped configuration.
+  DBOS_SYSTEM_DATABASE_SCHEMA: z
+    .string()
+    .regex(/^[a-z_][a-z0-9_]*$/, {
+      message:
+        "DBOS_SYSTEM_DATABASE_SCHEMA must be a lowercase Postgres identifier (letters, digits, underscore; not starting with a digit)",
+    })
+    .optional(),
   PORT: z.coerce.number().int().positive().default(4000),
   HOST: z.string().min(1).default("0.0.0.0"),
   NODE_ENV: z

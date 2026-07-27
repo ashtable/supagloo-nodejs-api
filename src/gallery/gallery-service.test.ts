@@ -3,9 +3,16 @@ import {
   buildRenderOutputKey,
   buildRenderThumbnailKey,
   deriveScriptureBook,
+  GalleryItemDetailDtoSchema,
+  GalleryItemDtoSchema,
+  Prisma,
   type PrismaClient,
+  type ProjectManifest,
 } from "@supagloo/database-lib";
-import { GalleryService } from "./gallery-service";
+import {
+  GalleryService,
+  type GalleryServiceOptions,
+} from "./gallery-service";
 import { GALLERY_PAGE_SIZE, encodeCursor } from "./gallery-query";
 import {
   GalleryItemAlreadyPublishedError,
@@ -53,6 +60,9 @@ interface FakeConfig {
   render?: unknown;
   /** galleryItem.findFirst result (first call). */
   item?: unknown;
+  /** galleryItem.findUnique result — publish's `renderJobId` dedupe pre-check. `null`
+   *  (or omitted) means "this render has not been published", the happy path. */
+  publishedItem?: unknown;
   /** galleryItem.findFirst result from the SECOND call onward (post-transaction re-read). */
   reReadItem?: unknown;
   /** galleryItem.findMany result (the listing's typed row fetch). */
@@ -69,6 +79,8 @@ interface FakeConfig {
   deleteVoteCount?: number;
   /** galleryItem.create throws this instead of returning. */
   createError?: unknown;
+  /** galleryItem.count result — the detail read's `owner.publicVideoCount`. */
+  publicVideoCount?: number;
 }
 
 function makeFake(config: FakeConfig) {
@@ -127,6 +139,7 @@ function makeFake(config: FakeConfig) {
         return Promise.resolve(config.item ?? null);
       },
       findMany: rec("galleryItem.findMany", config.items ?? []),
+      findUnique: rec("galleryItem.findUnique", config.publishedItem ?? null),
       create: (args: any) => {
         calls.push({ op: "galleryItem.create", args });
         if (config.createError !== undefined) {
@@ -148,6 +161,10 @@ function makeFake(config: FakeConfig) {
       deleteMany: (args: any) => {
         calls.push({ op: "galleryItem.deleteMany", args });
         return Promise.resolve({ count: config.deletedCount ?? 1 });
+      },
+      count: (args: any) => {
+        calls.push({ op: "galleryItem.count", args });
+        return Promise.resolve(config.publicVideoCount ?? 0);
       },
       // Root-client counterparts, present so "the write landed on the ROOT client, not
       // the transaction" is observable rather than invisible.
@@ -230,6 +247,10 @@ function makeService(
     pageSize?: number;
     presignFails?: boolean;
     streamUrlTtlSeconds?: number;
+    /** The OPTIONAL publish-time manifest seam. Omitted, publish must behave exactly
+     *  as it did before the snapshot existed (U-GS-MO4). */
+    readManifestForSnapshot?: GalleryServiceOptions["readManifestForSnapshot"];
+    manifestSnapshotTimeoutMs?: number;
   } = {},
 ) {
   const pre = makePresignRecorder(fake.calls, { fail: opts.presignFails });
@@ -239,6 +260,8 @@ function makeService(
     now: () => NOW,
     pageSize: opts.pageSize,
     streamUrlTtlSeconds: opts.streamUrlTtlSeconds,
+    readManifestForSnapshot: opts.readManifestForSnapshot,
+    manifestSnapshotTimeoutMs: opts.manifestSnapshotTimeoutMs,
   });
   return { service, presigned: pre.presigned };
 }
@@ -297,6 +320,9 @@ function itemRow(over: Record<string, unknown> = {}) {
     publishedAt: PUBLISHED_AT,
     upvoteCount: 7,
     viewCount: 0,
+    // Turn 16a: `Json?` makes the KEY required and the VALUE nullable, so every row
+    // literal must state it. "No snapshot" is a decision, not a forgettable field.
+    makingOf: null,
     owner: { displayName: "Mary K", avatarInitials: "MK" },
     ...over,
   };
@@ -522,6 +548,26 @@ describe("GalleryService.listGallery", () => {
     expect(find(fake.calls, "galleryItem.findMany").args.where).toMatchObject({
       id: { in: ["a", "b", "c"] },
     });
+  });
+
+  it("U-GV7c: the listing's typed read OMITS `makingOf`, while the detail read still selects it", async () => {
+    // THREE docblocks state that the listing deliberately does not pay for the snapshot
+    // jsonb — `gallery-service.ts`'s `getItem`, `routes/gallery.ts` and db-lib's
+    // `GalleryItemDtoSchema`. Nothing enforced it: `findMany` carrying only `include`
+    // selects EVERY scalar column, so a 24-row page dragged back up to 24 snapshots (each
+    // bounded at ~20 000 characters of scripture plus 64 scene tiles) for
+    // `toGalleryItemDto` to discard. This test is what turns those three claims into
+    // behaviour.
+    const fake = makeFake({ rawRows: threeRaw, items: threeRows });
+    await makeService(fake).service.listGallery(null, { sort: "popular" });
+    expect(find(fake.calls, "galleryItem.findMany").args.omit).toEqual({
+      makingOf: true,
+    });
+
+    // The DETAIL read must NOT omit it — that read is the whole reason the column exists.
+    const one = makeFake({ item: itemRow() });
+    await makeService(one).service.getItem(null, "gal-1");
+    expect(find(one.calls, "galleryItem.findFirst").args.omit).toBeUndefined();
   });
 
   it("U-GV8: the viewer's votes are resolved with ONE batched query for the whole page (the N+1 guard)", async () => {
@@ -1039,6 +1085,13 @@ describe("GalleryService.upvote", () => {
             calls.push({ op: "galleryItem.findFirst", args: {} });
             return Promise.resolve(itemRow({ upvoteCount: counter }));
           },
+          // The post-transaction re-read goes through `getItem`, which since Turn 16a
+          // also counts the owner's public items. Recorded like everything else, so the
+          // guard below still sees the WHOLE statement sequence.
+          count: () => {
+            calls.push({ op: "galleryItem.count", args: {} });
+            return Promise.resolve(1);
+          },
         },
         galleryUpvote: {
           findMany: () => {
@@ -1175,5 +1228,360 @@ describe("GalleryService.removeUpvote", () => {
     expect(has(fake.calls, "tx:galleryItem.updateMany")).toBe(true);
     expect(has(fake.calls, "galleryUpvote.deleteMany")).toBe(false);
     expect(has(fake.calls, "galleryItem.updateMany")).toBe(false);
+  });
+});
+
+// ============================================ Turn 16a — the making-of snapshot (C3)
+//
+// Publish gains ONE optional extra: a bounded, best-effort read of the project's
+// `supagloo.project.json`, snapshotted onto the row. The REQUIRED columns still come
+// only from the request body, and the whole point of these cases is that the snapshot
+// can never be the reason a publish fails — a rejecting seam, a hanging seam and a
+// missing seam are all 201s.
+//
+// `getItem` widens to the DETAIL DTO (`makingOf` + `owner.publicVideoCount`), which is
+// what `GET /v1/gallery/:id` serves. The stored jsonb is UNTRUSTED on the way out too:
+// it was written by an older/newer version of this code, so it is re-validated and a
+// value that fails degrades to `null` rather than reaching the response serializer.
+
+/** A schema-valid manifest whose scenes carry the text the snapshot must join. */
+function snapshotManifest(): ProjectManifest {
+  return {
+    manifestVersion: 1,
+    composition: { width: 1080, height: 1920, fps: 30, aspectRatio: "9:16" },
+    scenes: [
+      {
+        id: "sc-1",
+        name: "The Shelter",
+        scriptText: "He who dwells in the shelter of the Most High",
+        reference: "Psalm 91:1",
+        translation: "BSB",
+        visualPrompt: "a wide desert at dawn",
+        durationSeconds: 4,
+        captions: true,
+      },
+      {
+        id: "sc-2",
+        name: "His Feathers",
+        scriptText: "will rest in the shadow of the Almighty.",
+        reference: "Psalm 91:1",
+        translation: "BSB",
+        visualPrompt: "wings over a valley",
+        durationSeconds: 6,
+        captions: true,
+      },
+    ],
+    narratorVoice: { description: "Calm, measured narrator", label: "LOW AND STEADY" },
+    music: { style: "Ambient strings" },
+  };
+}
+
+/**
+ * "No snapshot was written", asserted at the level that actually reaches Postgres.
+ *
+ * The INSERT must carry the key with `Prisma.DbNull` — SQL NULL. The two near-misses are
+ * both wrong in ways a `toBeNull()` would wave through:
+ *   - a bare `null`, which a nullable `Json` field REJECTS at the type level and which
+ *     Prisma refuses at runtime; and
+ *   - `Prisma.JsonNull`, which writes the jsonb SCALAR `null` — it reads back as `null`
+ *     through the client, so it looks identical from JS, while making
+ *     `WHERE "makingOf" IS NULL` skip the row and splitting "we could not capture one"
+ *     from "published before the column existed" into two different stored values.
+ */
+function expectNoSnapshotWritten(fake: ReturnType<typeof makeFake>) {
+  const data = find(fake.calls, "galleryItem.create").args.data;
+  expect(Object.prototype.hasOwnProperty.call(data, "makingOf")).toBe(true);
+  expect(data.makingOf).toBe(Prisma.DbNull);
+  expect(data.makingOf).not.toBe(Prisma.JsonNull);
+}
+
+describe("GalleryService.publish — the best-effort making-of snapshot", () => {
+  it("U-GS-MO1: publish persists the snapshot built from readManifestForSnapshot's manifest", async () => {
+    const fake = makeFake({ render: renderRow() });
+    const seen: Array<{ userId: string; projectId: string }> = [];
+    const { service } = makeService(fake, {
+      readManifestForSnapshot: async (userId, projectId) => {
+        seen.push({ userId, projectId });
+        return snapshotManifest();
+      },
+    });
+
+    await service.publish(USER_ID, RENDER_ID, PUBLISH_REQ);
+
+    // Read OWNER-SCOPED, for the render's OWN project — never a client-supplied id.
+    expect(seen).toEqual([{ userId: USER_ID, projectId: "proj-1" }]);
+
+    const data = find(fake.calls, "galleryItem.create").args.data;
+    expect(data.makingOf).toEqual({
+      version: 1,
+      capturedAt: NOW.toISOString(),
+      scriptureText:
+        "He who dwells in the shelter of the Most High will rest in the shadow of the Almighty.",
+      narratorVoiceLabel: "LOW AND STEADY",
+      musicStyle: "Ambient strings",
+      captionsOn: true,
+      scenes: [
+        { index: 1, name: "The Shelter", durationSeconds: 4 },
+        { index: 2, name: "His Feathers", durationSeconds: 6 },
+      ],
+    });
+    // The REQUIRED columns are still body-only — the snapshot changed nothing there.
+    expect(data.scriptureReference).toBe(PUBLISH_REQ.scriptureReference);
+    expect(data.translation).toBe(PUBLISH_REQ.translation);
+  });
+
+  it("U-GS-MO2: a readManifestForSnapshot that REJECTS still yields a 201 and makingOf: null", async () => {
+    const fake = makeFake({ render: renderRow() });
+    const { service } = makeService(fake, {
+      readManifestForSnapshot: async () => {
+        // The real seam throws for a missing connection (409), a missing file (404) and
+        // a corrupt manifest (422). Every one of them must cost a section, not a publish.
+        throw new Error("github said no");
+      },
+    });
+
+    const dto = await service.publish(USER_ID, RENDER_ID, PUBLISH_REQ);
+
+    expect(dto.id).toBe("gal-created");
+    expectNoSnapshotWritten(fake);
+  });
+
+  it("U-GS-MO2b: a readManifestForSnapshot that resolves null yields a 201 and makingOf: null", async () => {
+    const fake = makeFake({ render: renderRow() });
+    const { service } = makeService(fake, {
+      readManifestForSnapshot: async () => null,
+    });
+
+    await service.publish(USER_ID, RENDER_ID, PUBLISH_REQ);
+    expectNoSnapshotWritten(fake);
+  });
+
+  it("U-GS-MO3: a readManifestForSnapshot that never resolves is abandoned at the timeout and the publish still returns 201", async () => {
+    const fake = makeFake({ render: renderRow() });
+    let settle: ((m: ProjectManifest) => void) | undefined;
+    const { service } = makeService(fake, {
+      manifestSnapshotTimeoutMs: 20,
+      readManifestForSnapshot: () =>
+        new Promise<ProjectManifest>((resolve) => {
+          settle = resolve;
+        }),
+    });
+
+    const started = Date.now();
+    const dto = await service.publish(USER_ID, RENDER_ID, PUBLISH_REQ);
+    const elapsed = Date.now() - started;
+
+    expect(dto.id).toBe("gal-created");
+    expectNoSnapshotWritten(fake);
+    // The bound is a BEHAVIOUR, not a comment: a publish that waited for the hung read
+    // would sit here until the test timeout.
+    expect(elapsed).toBeLessThan(2_000);
+
+    // The abandoned promise settling later must not blow up as an unhandled rejection
+    // or write anything; the insert already happened.
+    settle?.(snapshotManifest());
+    await new Promise((r) => setTimeout(r, 5));
+    expect(count(fake.calls, "galleryItem.create")).toBe(1);
+  });
+
+  // A REGRESSION FENCE AGAINST A SHAPE, not against a line. `Promise.race` attaches a
+  // reaction to every entrant, so today's implementation cannot produce this failure — and
+  // this test is stated that way rather than pretending to guard the explicit `.catch`.
+  // What it DOES catch, verified by mutation on 2026-07-26, is the obvious alternative
+  // implementation: kick the read off with `.then()` and sleep for the timeout. That shape
+  // leaves a late failure unobserved, and an `unhandledRejection` can kill the process
+  // minutes after the 201 went out — from the one code path whose contract is "this cannot
+  // break publish".
+  it("U-GS-MO3b: a timed-out read is abandoned and its LATER REJECTION does not surface as an unhandled rejection", async () => {
+    const fake = makeFake({ render: renderRow() });
+    let boom: ((e: unknown) => void) | undefined;
+    const { service } = makeService(fake, {
+      manifestSnapshotTimeoutMs: 20,
+      readManifestForSnapshot: () =>
+        new Promise<ProjectManifest>((_, reject) => {
+          boom = reject;
+        }),
+    });
+
+    await service.publish(USER_ID, RENDER_ID, PUBLISH_REQ);
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    boom?.(new Error("late github failure"));
+    await new Promise((r) => setTimeout(r, 20));
+    process.off("unhandledRejection", onUnhandled);
+
+    expect(unhandled).toEqual([]);
+  });
+
+  it("U-GS-MO4: with NO readManifestForSnapshot configured, publish behaves exactly as before", async () => {
+    const fake = makeFake({ render: renderRow() });
+    const { service } = makeService(fake);
+
+    const dto = await service.publish(USER_ID, RENDER_ID, PUBLISH_REQ);
+
+    expect(dto.id).toBe("gal-created");
+    expectNoSnapshotWritten(fake);
+  });
+
+  it("U-GS-MO4b: the manifest read happens ONLY after every publish precondition passes — a 409/422/404 costs no GitHub round trip", async () => {
+    // Not publishable: the render is still running.
+    const running = makeFake({ render: renderRow({ status: "running" }) });
+    let reads = 0;
+    const svc = (fake: ReturnType<typeof makeFake>) =>
+      makeService(fake, {
+        readManifestForSnapshot: async () => {
+          reads += 1;
+          return snapshotManifest();
+        },
+      }).service;
+
+    await expect(svc(running).publish(USER_ID, RENDER_ID, PUBLISH_REQ)).rejects.toBeInstanceOf(
+      RenderNotPublishableError,
+    );
+
+    // Underivable scripture book: a 422 raised before any write.
+    const underivable = makeFake({ render: renderRow() });
+    await expect(
+      svc(underivable).publish(USER_ID, RENDER_ID, {
+        ...PUBLISH_REQ,
+        scriptureReference: "no book here",
+      }),
+    ).rejects.toBeInstanceOf(ScriptureBookUnderivableError);
+
+    // Unknown render: a 404 before anything at all.
+    const missing = makeFake({ render: null });
+    await expect(svc(missing).publish(USER_ID, RENDER_ID, PUBLISH_REQ)).rejects.toBeInstanceOf(
+      GalleryItemNotFoundError,
+    );
+
+    // ALREADY PUBLISHED — the case the title claimed and the code did not deliver. The
+    // render passes every gate, so the old implementation reached `captureMakingOf` and
+    // only THEN discovered the duplicate via the insert's P2002. A second POST of an
+    // already-published render therefore paid a real, token-minting GitHub round trip to
+    // produce a 409 — the exact cost this test says a refusal never pays, and one an
+    // unauthenticated-adjacent retry loop could repeat for free.
+    const already = makeFake({
+      render: renderRow(),
+      publishedItem: itemRow(),
+      // Present so a regression that skips the pre-check still ENDS in the right error
+      // (it just gets there expensively) — this case must fail on the READ COUNT, not on
+      // the error type, or it would be measuring the wrong thing.
+      createError: { code: "P2002", name: "PrismaClientKnownRequestError" },
+    });
+    await expect(
+      svc(already).publish(USER_ID, RENDER_ID, PUBLISH_REQ),
+    ).rejects.toBeInstanceOf(GalleryItemAlreadyPublishedError);
+    expect(
+      reads,
+      "an already-published render must be refused BEFORE the manifest read",
+    ).toBe(0);
+    // …and it never even attempted the insert.
+    expect(has(already.calls, "galleryItem.create")).toBe(false);
+
+    expect(reads).toBe(0);
+  });
+
+  it("U-GS-MO4c: the pre-check is a NARROW dedupe, not a replacement for the P2002 backstop", async () => {
+    // The race is real and unavoidable: two concurrent publishes of the same render both
+    // read "not published" and both insert. The unique index on `renderJobId` is what
+    // actually decides, so the catch must survive — a pre-check that returns nothing must
+    // still leave the loser of the race with a 409 rather than a 500.
+    const racing = makeFake({
+      render: renderRow(),
+      publishedItem: null,
+      createError: { code: "P2002", name: "PrismaClientKnownRequestError" },
+    });
+    await expect(
+      makeService(racing).service.publish(USER_ID, RENDER_ID, PUBLISH_REQ),
+    ).rejects.toBeInstanceOf(GalleryItemAlreadyPublishedError);
+    expect(has(racing.calls, "galleryItem.create")).toBe(true);
+
+    // The pre-check is scoped to the RENDER, never to the caller: publishing someone
+    // else's render is already a 404 from the owner-scoped resolve above, so adding an
+    // ownerId here would only make a genuine duplicate look publishable.
+    expect(find(racing.calls, "galleryItem.findUnique").args.where).toEqual({
+      renderJobId: RENDER_ID,
+    });
+  });
+});
+
+describe("GalleryService.getItem — the DETAIL read (Turn 16a)", () => {
+  const SNAPSHOT = {
+    version: 1,
+    capturedAt: "2026-07-20T08:00:00.000Z",
+    scriptureText: "He who dwells in the shelter of the Most High",
+    narratorVoiceLabel: "LOW AND STEADY",
+    musicStyle: "Ambient strings",
+    captionsOn: true,
+    scenes: [{ index: 1, name: "The Shelter", durationSeconds: 4 }],
+  };
+
+  it("U-GS-MO5: getItem on a row whose stored makingOf is malformed returns makingOf: null, never throws", async () => {
+    // Every one of these is reachable: a v2 snapshot written by a NEWER api (the literal
+    // `version` refuses to half-read it), a hand-edited row, and a legacy shape.
+    const malformed = [
+      { ...SNAPSHOT, version: 2 },
+      { nonsense: true },
+      "a bare string",
+      42,
+      [],
+    ];
+
+    for (const stored of malformed) {
+      const fake = makeFake({ item: itemRow({ makingOf: stored }) });
+      const dto = await makeService(fake).service.getItem(null, "gal-1");
+      expect(dto.makingOf, `stored=${JSON.stringify(stored)}`).toBeNull();
+    }
+  });
+
+  it("U-GS-MO5b: a WELL-FORMED stored snapshot is returned intact", async () => {
+    const fake = makeFake({ item: itemRow({ makingOf: SNAPSHOT }) });
+    const dto = await makeService(fake).service.getItem(null, "gal-1");
+    expect(dto.makingOf).toEqual(SNAPSHOT);
+  });
+
+  it("U-GS-MO6: getItem's owner.publicVideoCount counts that owner's PUBLIC items only", async () => {
+    const fake = makeFake({ item: itemRow(), publicVideoCount: 14 });
+    const dto = await makeService(fake).service.getItem(null, "gal-1");
+
+    expect(dto.owner.publicVideoCount).toBe(14);
+    const args = find(fake.calls, "galleryItem.count").args;
+    expect(args.where).toEqual({ ownerId: USER_ID, visibility: "public" });
+  });
+
+  it("U-GS-MO6b: an owner with only UNLISTED items reads back 0, not 1", async () => {
+    // The row being read is itself unlisted; the count must not include it.
+    const fake = makeFake({
+      item: itemRow({ visibility: "unlisted" }),
+      publicVideoCount: 0,
+    });
+    const dto = await makeService(fake).service.getItem(null, "gal-1");
+    expect(dto.owner.publicVideoCount).toBe(0);
+    expect(dto.visibility).toBe("unlisted");
+  });
+
+  it("U-GS-MO7: a pre-existing row with makingOf = NULL reads back as makingOf: null", async () => {
+    const fake = makeFake({ item: itemRow({ makingOf: null }) });
+    const dto = await makeService(fake).service.getItem(null, "gal-1");
+
+    // REQUIRED-but-nullable: the key must be present, so a UI cannot confuse "no
+    // snapshot" with "the mapper forgot".
+    expect(dto).toHaveProperty("makingOf", null);
+    expect(dto.owner.displayName).toBe("Mary K");
+  });
+
+  it("U-GS-MO8: the detail DTO is a strict WIDENING — every card field is still present and unchanged", async () => {
+    const fake = makeFake({ item: itemRow({ makingOf: SNAPSHOT }), publicVideoCount: 3 });
+    const dto = await makeService(fake).service.getItem(null, "gal-1");
+
+    const parsed = GalleryItemDetailDtoSchema.safeParse(dto);
+    expect(
+      parsed.success,
+      parsed.success ? "" : JSON.stringify(parsed.error.issues),
+    ).toBe(true);
+    // ...and it still satisfies the CARD contract, so nothing a card renders was lost.
+    expect(GalleryItemDtoSchema.safeParse(dto).success).toBe(true);
   });
 });

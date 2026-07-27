@@ -18,6 +18,8 @@ import { AuthService } from "../../src/auth/auth-service";
 import { SESSION_TTL_MS } from "../../src/auth/tokens";
 import { makeS3Client, type S3EnvConfig } from "../../src/files/s3-client";
 import { FilesService } from "../../src/files/files-service";
+import { ProjectsService } from "../../src/projects/projects-service";
+import { ManifestService } from "../../src/manifests/manifest-service";
 import { GalleryService } from "../../src/gallery/gallery-service";
 import { decodeCursor } from "../../src/gallery/gallery-query";
 import { sortByTrendingDesc } from "../../src/gallery/trending";
@@ -30,16 +32,28 @@ import { sortByTrendingDesc } from "../../src/gallery/trending";
 // `POST /v1/renders/:id/gallery`. No stub anywhere, and no extension of the seed route
 // (§9-Q9 round 2 keeps it at users + sessions only).
 //
-// ZERO PROVIDER EGRESS, AND THEREFORE ZERO CREDENTIALS. The whole gallery surface makes
-// no GitHub, OpenRouter, Gloo or YouVersion call — publish is "a single Postgres insert"
-// (design-delta §7) and the listing is one query plus local URL signing. Three things
-// make that a VERIFIED claim rather than an assertion:
+// ZERO PROVIDER EGRESS, AND THEREFORE ZERO CREDENTIALS — still true after Turn 16a, but
+// no longer true BY CONSTRUCTION, so the claim is re-argued here rather than inherited.
+//
+// Publish is no longer only "a single Postgres insert" (design-delta §7): it now attempts
+// a BEST-EFFORT read of the owner's project manifest for the `makingOf` snapshot, and in
+// production that read is real GitHub egress. This spec keeps its no-egress property
+// because none of its fixtures has a `GithubConnection` row, so `ManifestService` raises
+// `GithubNotConnectedError` before a socket is opened. E-G22 is that branch, asserted
+// rather than assumed. The real-GitHub happy path lives in a SEPARATE spec,
+// `tests/e2e/gallery-making-of.e2e.ts` — the split is the whole point, so that a gallery
+// spec never acquires a GitHub credential (the 34-E8 lesson).
+//
+// FOUR things make the claim VERIFIED rather than an assertion:
 //   1. `buildApp` here is wired with `auth` + `files` + `gallery` ONLY, so the github /
 //      connections / ai-generation routes are not even registered and no provider client
 //      is constructed;
 //   2. the AuthService gets a THROWING YouVersion verifier, so any accidental sign-in
 //      egress is a loud, immediate failure (the auth.e2e.ts idiom);
-//   3. `getSignedUrl` signs LOCALLY — no S3 round trip — so even the presigning is
+//   3. the ManifestService behind the snapshot seam gets a THROWING `getFileContents` —
+//      the same idiom, one layer in. If the publish path ever reached the GitHub Contents
+//      client, that would be a NAMED failure here instead of a silent network call;
+//   4. `getSignedUrl` signs LOCALLY — no S3 round trip — so even the presigning is
 //      offline.
 // Coupling a gallery spec to GitHub credentials is exactly the mistake the 34-E8
 // decision warns against, so this file needs `postgres minio minio-init` and nothing
@@ -143,11 +157,33 @@ beforeAll(async () => {
   });
   const filesService = new FilesService({ prisma, s3, bucket: S3_CFG.bucket });
 
+  // The REAL ManifestService behind the snapshot seam — the same object `server.ts`
+  // wires — so E-G22 exercises the product's own short-circuit rather than a stand-in
+  // that merely resolves null. Its Contents client THROWS: no fixture here has a
+  // `GithubConnection`, so `readManifest` must raise `GithubNotConnectedError` and never
+  // reach it. If publish ever DID reach GitHub from this spec, this is where it fails,
+  // loudly and by name, instead of quietly opening a socket.
+  const projectsService = new ProjectsService({ prisma });
+  const manifestService = new ManifestService({
+    getProject: (userId, id) => projectsService.getProject(userId, id),
+    prisma,
+    getFileContents: async () => {
+      throw new Error(
+        "gallery.e2e.ts must make ZERO provider calls: the publish-time makingOf " +
+          "snapshot is BEST EFFORT and must short-circuit at the missing GithubConnection " +
+          "before any GitHub Contents read. The real-GitHub path belongs in " +
+          "tests/e2e/gallery-making-of.e2e.ts.",
+      );
+    },
+  });
+
   const makeGallery = (pageSize?: number) =>
     new GalleryService({
       prisma,
       presignPublic: (key, ttl) => filesService.presignPublicKey(key, ttl),
       pageSize,
+      readManifestForSnapshot: (userId, projectId) =>
+        manifestService.readManifest(userId, projectId),
     });
 
   const authDeps = {
@@ -1598,6 +1634,85 @@ describe("e2e: visibility", () => {
 
     // A row that does not exist is a uniform 404, never a distinguishable denial.
     expect((await api("/gallery/no-such-item")).status).toBe(404);
+  }, 120_000);
+});
+
+// ------------------------------------------- the making-of snapshot, ZERO-EGRESS half
+
+describe("e2e: the making-of snapshot — the best-effort NULL branch (Turn 16a)", () => {
+  it("E-G22: publishing a render whose owner has NO GitHub connection returns 201 with makingOf: null", async () => {
+    const user = await seedUser("mo-null");
+    const project = await seedProject(user.userId, "mo-null");
+    const render = await seedCompletedRender(user, project, "mo-null");
+
+    // No `GithubConnection` row exists for this user — none of this file's fixtures ever
+    // creates one — so `ManifestService.readManifest` raises `GithubNotConnectedError`
+    // inside the api, BEFORE the (throwing) Contents client is reached. If that ordering
+    // ever changed, the beforeAll's `getFileContents` would fail this test by name.
+    const item = await publishOk(user.token, render, {
+      title: `No connection ${nonce("mo")}`,
+    });
+
+    // 201, and the item is complete in every other respect: the snapshot is the ONE
+    // optional extra, and its absence must cost a section, never a publish.
+    expect(item.id).toBeTruthy();
+    expect(item.durationSeconds).toBe(30);
+
+    const res = await api(`/gallery/${item.id}`);
+    expect(res.status).toBe(200);
+    const detail = (await res.json()).item;
+    // REQUIRED-but-nullable on the wire: the key is present and null, so a client can
+    // tell "no snapshot" from "the api forgot".
+    expect(detail).toHaveProperty("makingOf", null);
+  }, 120_000);
+
+  it("E-G23: GET /v1/gallery/:id returns owner.publicVideoCount, counting only that owner's PUBLIC items", async () => {
+    const user = await seedUser("mo-count");
+    const other = await seedUser("mo-count-other");
+    const project = await seedProject(user.userId, "mo-count");
+    const otherProject = await seedProject(other.userId, "mo-count-other");
+    const token = nonce("mocount");
+
+    const publicRender = await seedCompletedRender(user, project, "mo-c-pub");
+    const unlistedRender = await seedCompletedRender(user, project, "mo-c-unl");
+    // A SECOND owner's public item, so a count that forgot its `ownerId` predicate — and
+    // simply counted every public row — is red rather than accidentally right.
+    const foreignRender = await seedCompletedRender(
+      other,
+      otherProject,
+      "mo-c-foreign",
+    );
+
+    const shown = await publishOk(user.token, publicRender, {
+      title: `Counted ${token}`,
+    });
+    const hidden = await publishOk(user.token, unlistedRender, {
+      title: `Uncounted ${token}`,
+      visibility: "unlisted",
+    });
+    await publishOk(other.token, foreignRender, {
+      title: `Foreign ${token}`,
+    });
+
+    const detail = async (id: string) =>
+      (await (await api(`/gallery/${id}`)).json()).item;
+
+    // ONE public item for this owner: the unlisted one is excluded (the number sits on a
+    // public page beside a creator's name, so counting items a visitor cannot reach would
+    // overstate them to everyone), and the other owner's is not theirs to count.
+    expect((await detail(shown.id)).owner.publicVideoCount).toBe(1);
+
+    // The count is a property of the OWNER, not of the item being read, so reading the
+    // unlisted item reports the same 1 rather than 0 or 2.
+    expect((await detail(hidden.id)).owner.publicVideoCount).toBe(1);
+
+    // ...and it MOVES with reality: publish a second public item and it becomes 2.
+    const secondRender = await seedCompletedRender(user, project, "mo-c-pub2");
+    const second = await publishOk(user.token, secondRender, {
+      title: `Counted again ${token}`,
+    });
+    expect((await detail(second.id)).owner.publicVideoCount).toBe(2);
+    expect((await detail(shown.id)).owner.publicVideoCount).toBe(2);
   }, 120_000);
 });
 

@@ -24,6 +24,12 @@ import { RendersService } from "../../src/renders/renders-service";
 import { makeS3Client, type S3EnvConfig } from "../../src/files/s3-client";
 import { FilesService } from "../../src/files/files-service";
 import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
+import {
+  assertLaneRuntimeIsolated,
+  assertWorkflowIsolated,
+  laneSystemSchema,
+  resetLaneSchema,
+} from "../../src/testing/dbos-lane-isolation";
 
 // Non-UI e2e for the Task #37 render surface (design-delta §2.7/§6c/§8). Boots the REAL
 // Fastify app in-process (real listen + real fetch), a REAL DBOSClient enqueuer (its
@@ -46,8 +52,15 @@ import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
 // github-stub + git-server fixtures; this spec is UNAFFECTED because it never needed
 // either, and it needs no GitHub credential for the same reason.
 //
-// Assumes the root Compose `dbos` container is NOT running (no competing render worker) —
-// the same standing assumption ai-generations.e2e.ts and project-jobs.e2e.ts make.
+// ISOLATION, NOT A PRECONDITION. This spec registers a STAND-IN workflow under the REAL
+// shared name on the REAL shared queue, so it used to require the Compose `dbos` container
+// to be stopped — a precondition that is unsatisfiable across a full sweep (root's e2e lane
+// and nextjs's render lane both bring `dbos` UP and leave it up). Instead the in-process
+// runtime AND the enqueuer share a per-lane DBOS system SCHEMA inside the same
+// `supagloo_dbos` database (SDK `systemDatabaseSchemaName`), so the two executors cannot
+// see each other's rows in EITHER direction. The container may be up or down; both pass.
+// The queue and workflow names are unchanged and deliberately still the real ones —
+// exercising the real API↔DBOS name contract is the point of this spec.
 
 const APP_URL =
   process.env.DATABASE_URL ??
@@ -57,6 +70,8 @@ const DBOS_URL =
   "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos";
 const YOUVERSION_BASE =
   process.env.YOUVERSION_BASE_URL ?? "https://api.youversion.com";
+/** This lane's private DBOS system schema inside `supagloo_dbos` (see the header note). */
+const SYSTEM_SCHEMA = laneSystemSchema("api_render");
 
 const S3_CFG: S3EnvConfig = {
   internalEndpoint: process.env.S3_ENDPOINT ?? "http://minio:9000",
@@ -229,11 +244,28 @@ beforeAll(async () => {
   s3 = makeS3Client(S3_CFG, "presign");
   await s3.send(new CreateBucketCommand({ Bucket: S3_CFG.bucket })).catch(() => {});
 
-  DBOS.setConfig({ name: "supagloo-api-render-e2e", systemDatabaseUrl: DBOS_URL });
+  // Self-heal a crashed previous run BEFORE launch, so no stale PENDING row is adopted
+  // by DBOS's recovery sweep (same executor_id "local", same auto-computed app version).
+  await resetLaneSchema({ systemDatabaseUrl: DBOS_URL, schema: SYSTEM_SCHEMA });
+
+  DBOS.setConfig({
+    name: "supagloo-api-render-e2e",
+    systemDatabaseUrl: DBOS_URL,
+    systemDatabaseSchemaName: SYSTEM_SCHEMA, // ← the runtime half
+  });
   await DBOS.launch();
   await DBOS.registerQueue(RENDER_QUEUE_NAME, { workerConcurrency: 1 });
 
-  enqueuer = makeDbosEnqueuer({ systemDatabaseUrl: DBOS_URL });
+  // Fail FAST and LOUD if the config did not take. Never a warn, never a skip.
+  await assertLaneRuntimeIsolated({
+    systemDatabaseUrl: DBOS_URL,
+    schema: SYSTEM_SCHEMA,
+  });
+
+  enqueuer = makeDbosEnqueuer({
+    systemDatabaseUrl: DBOS_URL,
+    systemDatabaseSchemaName: SYSTEM_SCHEMA, // ← the enqueuer half
+  });
 
   const authService = new AuthService({
     prisma,
@@ -397,6 +429,14 @@ async function waitFor(fn: () => Promise<boolean>, timeoutMs: number): Promise<v
 // ---------------------------------------------------------------------- specs
 
 describe("e2e: render creation + durable enqueue", () => {
+  it("E-R0: the render lane runs on its own DBOS system schema, so the Compose worker cannot see its work", async () => {
+    expect(SYSTEM_SCHEMA).not.toBe("dbos");
+    await assertLaneRuntimeIsolated({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+    });
+  });
+
   it("E-R1: POST /projects/:id/renders creates a queued row, mirrors the spec, sets Project.lastRenderJobId, and durably enqueues under workflowID = renderJobId", async () => {
     armEncodeGate();
     const user = await seedUser("create");
@@ -425,6 +465,21 @@ describe("e2e: render creation + durable enqueue", () => {
     // D3 — the project points at its latest render job
     const project = await prisma.project.findUnique({ where: { id: projectId } });
     expect(project!.lastRenderJobId).toBe(renderJobId);
+
+    // The ENQUEUER half of the isolation is real: the row landed in this lane's schema
+    // and is absent from the shared one the Compose worker polls.
+    //
+    // ORDERING IS LOAD-BEARING — this runs BEFORE the listWorkflows wait below, not
+    // after. `POST /renders` awaits the enqueue before it answers 201, so the row is
+    // committed by now and this assertion needs no polling. Placed after the wait, a
+    // dropped `systemDatabaseSchemaName` on the enqueuer surfaces as a bare 20 s
+    // "waitFor timed out" (measured), which names neither the cause nor the remedy;
+    // placed here it fails in milliseconds with both.
+    await assertWorkflowIsolated({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowID: renderJobId,
+    });
 
     // durably enqueued under the render job id
     await waitFor(async () => {

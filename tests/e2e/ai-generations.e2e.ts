@@ -18,6 +18,12 @@ import { SESSION_TTL_MS } from "../../src/auth/tokens";
 import { ProjectsService } from "../../src/projects/projects-service";
 import { AiGenerationsService } from "../../src/ai/ai-generations-service";
 import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
+import {
+  assertLaneRuntimeIsolated,
+  assertWorkflowIsolated,
+  laneSystemSchema,
+  resetLaneSchema,
+} from "../../src/testing/dbos-lane-isolation";
 
 // Non-UI e2e for the Task #31 AI-generation surface (design-delta §2.8/§7/§8). Boots the
 // REAL Fastify app in-process (real listen + fetch), a REAL DBOSClient enqueuer (its
@@ -27,8 +33,16 @@ import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
 // so the whole enqueue→dispatch→execute→poll→cancel loop is proven within the api repo.
 // The REAL generateScript workflow's LLM/repair behaviour is proven separately by the
 // dbos repo's generate-script.e2e.ts. In-process per the in-flight-dblib constraint.
-// Assumes the root Compose `dbos` container is NOT running (no competing ai-generation
-// worker) — the same assumption project-jobs.e2e.ts makes. Infra via global-setup.
+// ISOLATION, NOT A PRECONDITION. This spec registers STAND-IN workflows under the REAL
+// shared names on the REAL shared queue, so it used to require the Compose `dbos` container
+// to be stopped — a precondition that is unsatisfiable across a full sweep (root's e2e lane
+// and nextjs's render lane both bring `dbos` UP and leave it up). Instead the in-process
+// runtime AND the enqueuer share a per-lane DBOS system SCHEMA inside the same
+// `supagloo_dbos` database (SDK `systemDatabaseSchemaName`), so the two executors cannot
+// see each other's rows in EITHER direction. The container may be up or down; both pass.
+// The queue and workflow names are unchanged and deliberately still the real ones —
+// exercising the real API↔DBOS name contract is the point of this spec.
+// Infra via global-setup.
 
 const APP_URL =
   process.env.DATABASE_URL ??
@@ -38,6 +52,8 @@ const DBOS_URL =
   "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos";
 const YOUVERSION_BASE =
   process.env.YOUVERSION_BASE_URL ?? "https://api.youversion.com";
+/** This lane's private DBOS system schema inside `supagloo_dbos` (see the header note). */
+const SYSTEM_SCHEMA = laneSystemSchema("api_ai");
 
 const stamp = () => `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -197,11 +213,28 @@ let enqueuer: {
 };
 
 beforeAll(async () => {
-  DBOS.setConfig({ name: "supagloo-api-ai-e2e", systemDatabaseUrl: DBOS_URL });
+  // Self-heal a crashed previous run BEFORE launch, so no stale PENDING row is adopted
+  // by DBOS's recovery sweep (same executor_id "local", same auto-computed app version).
+  await resetLaneSchema({ systemDatabaseUrl: DBOS_URL, schema: SYSTEM_SCHEMA });
+
+  DBOS.setConfig({
+    name: "supagloo-api-ai-e2e",
+    systemDatabaseUrl: DBOS_URL,
+    systemDatabaseSchemaName: SYSTEM_SCHEMA, // ← the runtime half
+  });
   await DBOS.launch();
   await DBOS.registerQueue(AI_GENERATION_QUEUE_NAME, { workerConcurrency: 8 });
 
-  enqueuer = makeDbosEnqueuer({ systemDatabaseUrl: DBOS_URL });
+  // Fail FAST and LOUD if the config did not take. Never a warn, never a skip.
+  await assertLaneRuntimeIsolated({
+    systemDatabaseUrl: DBOS_URL,
+    schema: SYSTEM_SCHEMA,
+  });
+
+  enqueuer = makeDbosEnqueuer({
+    systemDatabaseUrl: DBOS_URL,
+    systemDatabaseSchemaName: SYSTEM_SCHEMA, // ← the enqueuer half
+  });
 
   const authService = new AuthService({
     prisma,
@@ -366,6 +399,14 @@ function videoBody(overrides: Record<string, unknown> = {}) {
 }
 
 describe("e2e: POST /v1/ai/generations + poll — full round trip", () => {
+  it("E-AI0: the ai-generation lane runs on its own DBOS system schema, so the Compose worker cannot see its work", async () => {
+    expect(SYSTEM_SCHEMA).not.toBe("dbos");
+    await assertLaneRuntimeIsolated({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+    });
+  });
+
   it("creates + enqueues, polls queued→running→succeeded, surfaces resultJson", async () => {
     armGates();
     const owner = await seedUser("flow");
@@ -377,6 +418,21 @@ describe("e2e: POST /v1/ai/generations + poll — full round trip", () => {
     expect(created.status).toBe(201);
     const { generationId } = await created.json();
     expect(generationId).toBeTruthy();
+
+    // The ENQUEUER half of the isolation is real: the row landed in this lane's schema
+    // and is absent from the shared one the Compose worker polls.
+    //
+    // ORDERING IS LOAD-BEARING — this runs BEFORE the listWorkflows wait below, not
+    // after. `POST /ai/generations` awaits the enqueue before it answers 201, so the row
+    // is committed by now and this assertion needs no polling. Placed after the wait, a
+    // dropped `systemDatabaseSchemaName` on the enqueuer surfaces as a bare 10 s
+    // "waitFor timed out" (measured), which names neither the cause nor the remedy;
+    // placed here it fails in milliseconds with both.
+    await assertWorkflowIsolated({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowID: generationId,
+    });
 
     // Durably enqueued under workflowID = generationId (exactly one).
     await waitFor(

@@ -17,6 +17,12 @@ import { SESSION_TTL_MS } from "../../src/auth/tokens";
 import { ProjectsService } from "../../src/projects/projects-service";
 import { ProjectJobsService } from "../../src/jobs/project-jobs-service";
 import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
+import {
+  assertLaneRuntimeIsolated,
+  assertWorkflowIsolated,
+  laneSystemSchema,
+  resetLaneSchema,
+} from "../../src/testing/dbos-lane-isolation";
 
 // Non-UI e2e for the Task #18 job-creation + polling surface (design-delta
 // §5.1/§6b/§7/§8). Boots the REAL Fastify app in-process (real listen + fetch), a
@@ -27,10 +33,20 @@ import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
 // enqueue→dispatch→execute→poll loop entirely within the api repo — the REAL scaffold
 // workflow's git behaviour is proven separately by the dbos repo's
 // scaffold-project.e2e.ts. In-process per the in-flight-dblib constraint (the
-// containerized api/dbos can't yet see the uncommitted db-lib exports). Assumes the
-// root Compose `dbos` container is NOT running (global-setup never starts it), so
-// there is no competing git-ops worker — the same assumption the dbos repo's e2e
-// makes. Infra ensured by tests/e2e/global-setup.ts (reuse-or-spawn postgres+stubs).
+// containerized api/dbos can't yet see the uncommitted db-lib exports).
+// Infra ensured by tests/e2e/global-setup.ts (reuse-or-spawn postgres+stubs).
+//
+// ISOLATION, NOT A PRECONDITION. This spec registers a STAND-IN workflow under the REAL
+// shared name on the REAL shared queue, so it used to demand an idle Compose `dbos`
+// service — a precondition that is unsatisfiable across a full sweep (root's e2e lane
+// and nextjs's render lane both bring `dbos` UP and leave it up), and whose stated
+// justification here was itself false: root `tests/e2e/global-setup.ts` DOES start that
+// service, and did at the time the claim was written. Instead the in-process runtime
+// AND the enqueuer share a per-lane DBOS system SCHEMA inside the same `supagloo_dbos`
+// database (SDK `systemDatabaseSchemaName`), so the two executors cannot see each other's
+// rows in EITHER direction. The container may be up or down; both pass. The queue and
+// workflow names are unchanged and deliberately still the real ones — exercising the real
+// API↔DBOS name contract is the point of this spec.
 
 const APP_URL =
   process.env.DATABASE_URL ??
@@ -38,6 +54,8 @@ const APP_URL =
 const DBOS_URL =
   process.env.DBOS_DATABASE_URL ??
   "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos";
+/** This lane's private DBOS system schema inside `supagloo_dbos` (see the header note). */
+const SYSTEM_SCHEMA = laneSystemSchema("api_jobs");
 const YOUVERSION_BASE =
   process.env.YOUVERSION_BASE_URL ?? "https://api.youversion.com";
 
@@ -107,11 +125,28 @@ let baseUrl: string;
 let enqueuer: { enqueue: (o: any, p: unknown) => Promise<void>; close: () => Promise<void> };
 
 beforeAll(async () => {
-  DBOS.setConfig({ name: "supagloo-api-e2e", systemDatabaseUrl: DBOS_URL });
+  // Self-heal a crashed previous run BEFORE launch, so no stale PENDING row is adopted
+  // by DBOS's recovery sweep (same executor_id "local", same auto-computed app version).
+  await resetLaneSchema({ systemDatabaseUrl: DBOS_URL, schema: SYSTEM_SCHEMA });
+
+  DBOS.setConfig({
+    name: "supagloo-api-e2e",
+    systemDatabaseUrl: DBOS_URL,
+    systemDatabaseSchemaName: SYSTEM_SCHEMA, // ← the runtime half
+  });
   await DBOS.launch();
   await DBOS.registerQueue(GIT_OPS_QUEUE_NAME, { workerConcurrency: 4 });
 
-  enqueuer = makeDbosEnqueuer({ systemDatabaseUrl: DBOS_URL });
+  // Fail FAST and LOUD if the config did not take. Never a warn, never a skip.
+  await assertLaneRuntimeIsolated({
+    systemDatabaseUrl: DBOS_URL,
+    schema: SYSTEM_SCHEMA,
+  });
+
+  enqueuer = makeDbosEnqueuer({
+    systemDatabaseUrl: DBOS_URL,
+    systemDatabaseSchemaName: SYSTEM_SCHEMA, // ← the enqueuer half
+  });
 
   const authService = new AuthService({
     prisma,
@@ -223,6 +258,14 @@ async function waitFor(fn: () => Promise<boolean>, timeoutMs: number): Promise<v
 }
 
 describe("e2e: POST /v1/projects + GET job polling — full round trip", () => {
+  it("E-PJ0: the git-ops lane runs on its own DBOS system schema, so the Compose worker cannot see its work", async () => {
+    expect(SYSTEM_SCHEMA).not.toBe("dbos");
+    await assertLaneRuntimeIsolated({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+    });
+  });
+
   it("creates + enqueues, polls queued→running→succeeded, and blocks concurrent + duplicate creates", async () => {
     armGates();
     const owner = await seedUser("flow");
@@ -244,6 +287,21 @@ describe("e2e: POST /v1/projects + GET job polling — full round trip", () => {
     const { projectId, jobId } = await created.json();
     expect(projectId).toBeTruthy();
     expect(jobId).toBeTruthy();
+
+    // The ENQUEUER half of the isolation is real: the row landed in this lane's schema
+    // and is absent from the shared one the Compose worker polls.
+    //
+    // ORDERING IS LOAD-BEARING — this runs BEFORE the listWorkflows wait below, not
+    // after. `POST /projects` awaits the enqueue before it answers 201
+    // (project-jobs-service.ts:187), so the row is committed by now and this assertion
+    // needs no polling. Placed after the wait, a dropped `systemDatabaseSchemaName` on
+    // the enqueuer surfaces as a bare 10 s "waitFor timed out" (measured), which names
+    // neither the cause nor the remedy; placed here it fails in milliseconds with both.
+    await assertWorkflowIsolated({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowID: jobId,
+    });
 
     // Durably enqueued in the DBOS system DB under workflowID = jobId (exactly one).
     await waitFor(

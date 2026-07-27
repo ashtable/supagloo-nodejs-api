@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { loadEnv } from "./env";
 
 const VALID_DB_URL = "postgres://supagloo:supagloo@localhost:5432/supagloo";
@@ -296,6 +298,58 @@ describe("loadEnv", () => {
       expect(() =>
         loadEnv(validEnv({ S3_PUBLIC_ENDPOINT: "ftp://nope" })),
       ).toThrow(/S3_PUBLIC_ENDPOINT/);
+    });
+  });
+
+  describe("DBOS_SYSTEM_DATABASE_SCHEMA (the optional system-schema knob)", () => {
+    it("U-ENV-DS1: DBOS_SYSTEM_DATABASE_SCHEMA is OPTIONAL — a valid env without it parses and the value is undefined", () => {
+      const env = loadEnv(validEnv());
+      // The pin that shipped behaviour is unchanged: unset ⇒ undefined ⇒ the enqueuer
+      // forwards `undefined` ⇒ the SDK's own default schema "dbos" stands.
+      expect(env.DBOS_SYSTEM_DATABASE_SCHEMA).toBeUndefined();
+
+      const set = loadEnv(
+        validEnv({ DBOS_SYSTEM_DATABASE_SCHEMA: "dbos_e2e_api_render" }),
+      );
+      expect(set.DBOS_SYSTEM_DATABASE_SCHEMA).toBe("dbos_e2e_api_render");
+    });
+
+    it("U-ENV-DS2: a non-identifier DBOS_SYSTEM_DATABASE_SCHEMA is rejected with a message naming the var", () => {
+      for (const bad of ['a"b', "a;b", "a b", "Dbos", "1abc", "a-b"]) {
+        expect(
+          () => loadEnv(validEnv({ DBOS_SYSTEM_DATABASE_SCHEMA: bad })),
+          bad,
+        ).toThrow(/DBOS_SYSTEM_DATABASE_SCHEMA/);
+      }
+    });
+
+    it("U-ENV-DS3: .env.example documents BOTH system-DB keys, ships the schema key UNSET, and states the api↔dbos agreement rule", () => {
+      // The fifth reader of a config key is the operator, and `.env.example` is the only
+      // place they meet it. A key that exists in the schema and nowhere in the example
+      // file is undiscoverable — so this asserts the doc, not a source comment.
+      const example = readFileSync(
+        join(__dirname, "..", "..", ".env.example"),
+        "utf8",
+      );
+
+      // DBOS_DATABASE_URL was itself undocumented here until 2026-07-26, even though it
+      // is REQUIRED and the loader rejects a missing value. The schema key is meaningless
+      // without it: the schema lives INSIDE that database.
+      expect(example).toMatch(/^DBOS_DATABASE_URL=\S+/m);
+
+      // Documented…
+      expect(example).toContain("DBOS_SYSTEM_DATABASE_SCHEMA");
+      // …and shipped UNSET. A live value here would silently repartition a developer's
+      // whole stack, so the key may appear only as a commented-out example.
+      expect(example).not.toMatch(/^DBOS_SYSTEM_DATABASE_SCHEMA=/m);
+      expect(example).toMatch(/^#\s*DBOS_SYSTEM_DATABASE_SCHEMA=/m);
+
+      // …with the ONE fact an operator cannot recover from the schema itself: the two
+      // services must carry the SAME value, or the api enqueues where nothing polls.
+      const at = example.indexOf("DBOS_SYSTEM_DATABASE_SCHEMA");
+      const section = example.slice(Math.max(0, at - 1400), at + 500);
+      expect(section).toMatch(/same value/i);
+      expect(section).toMatch(/nothing polls|never polls|no worker polls/i);
     });
   });
 

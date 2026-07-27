@@ -35,7 +35,11 @@ const fakeAuthService = {
     token === "valid" ? { user: { id: "u1" }, session: { id: "s1" } } : null,
 };
 
-/** A complete, schema-valid GalleryItemDto — the response serializer validates it. */
+/** A complete, schema-valid GalleryItemDto — the response serializer validates it.
+ *
+ *  This is the CARD shape, which is what `POST /renders/:id/gallery`, the listing and both
+ *  vote routes serve. `GET /gallery/:id` serves the strictly wider
+ *  `GalleryItemDetailResponseSchema` and therefore uses {@link DETAIL_ITEM}. */
 const ITEM = {
   id: "gal-1",
   renderJobId: "render-1",
@@ -53,6 +57,24 @@ const ITEM = {
   rank: 1,
   viewerHasUpvoted: false,
   owner: { displayName: "Mary K", avatarInitials: "MK" },
+};
+
+/** Turn 16a: what `GalleryService.getItem` now returns, and what only
+ *  `GET /gallery/:id` serializes in full. */
+const MAKING_OF = {
+  version: 1 as const,
+  capturedAt: "2026-07-20T08:00:00.000Z",
+  scriptureText: "He who dwells in the shelter of the Most High",
+  narratorVoiceLabel: "LOW AND STEADY",
+  musicStyle: "Ambient strings",
+  captionsOn: true,
+  scenes: [{ index: 1, name: "The Shelter", durationSeconds: 4 }],
+};
+
+const DETAIL_ITEM = {
+  ...ITEM,
+  makingOf: MAKING_OF,
+  owner: { ...ITEM.owner, publicVideoCount: 14 },
 };
 
 const EXPIRES = new Date("2026-07-26T12:02:00.000Z");
@@ -95,7 +117,7 @@ function makeService(overrides: Record<string, any> = {}) {
     },
     getItem: async (viewerId: string | null) => {
       seen.getViewer = viewerId;
-      return { ...ITEM };
+      return { ...DETAIL_ITEM };
     },
     presignGalleryStream: async (id: string) => {
       seen.streamId = id;
@@ -106,11 +128,14 @@ function makeService(overrides: Record<string, any> = {}) {
     },
     upvote: async (userId: string) => {
       seen.voteUser = userId;
-      return { ...ITEM, upvoteCount: 8, viewerHasUpvoted: true };
+      // The REAL service re-reads through `getItem`, so a vote genuinely returns the
+      // DETAIL shape. Modelling that here is what lets U-GR14 prove the card schema
+      // strips the two extra fields rather than assuming it.
+      return { ...DETAIL_ITEM, upvoteCount: 8, viewerHasUpvoted: true };
     },
     removeUpvote: async (userId: string) => {
       seen.unvoteUser = userId;
-      return { ...ITEM, upvoteCount: 7, viewerHasUpvoted: false };
+      return { ...DETAIL_ITEM, upvoteCount: 7, viewerHasUpvoted: false };
     },
     ...overrides,
   } as any;
@@ -311,6 +336,65 @@ describe("GET /gallery/:id and /gallery/:id/stream-url", () => {
       headers: BAD_BEARER,
     });
     expect(stale.statusCode).toBe(200);
+  });
+
+  it("U-GR13b: GET /gallery/:id serializes the DETAIL contract — makingOf and owner.publicVideoCount survive the response schema", async () => {
+    const { service } = makeService();
+    const built = await buildTestApp(service);
+    app = built.app;
+
+    const res = await app.inject({ method: "GET", url: "/gallery/gal-1" });
+    expect(res.statusCode).toBe(200);
+
+    const body = res.json();
+    // Through the REAL Fastify serializer, so this proves the route's response schema is
+    // the wide one. Under the old schema both keys are silently stripped and the page
+    // renders no "HOW IT WAS MADE" section with no error anywhere.
+    expect(body.item.makingOf).toEqual(MAKING_OF);
+    expect(body.item.owner.publicVideoCount).toBe(14);
+    // ...and the card fields are untouched: the widening is ADDITIVE.
+    expect(body.item).toMatchObject({
+      id: "gal-1",
+      title: "He Who Dwells",
+      upvoteCount: 7,
+      owner: { displayName: "Mary K", avatarInitials: "MK" },
+    });
+
+    // A pre-existing row (published before the column existed) serializes as an explicit
+    // null rather than a missing key — the UI's "no snapshot" branch needs the key.
+    await app.close();
+    const legacy = await buildTestApp(
+      makeService({
+        getItem: async () => ({ ...DETAIL_ITEM, makingOf: null }),
+      }).service,
+    );
+    app = legacy.app;
+    const old = await app.inject({ method: "GET", url: "/gallery/gal-1" });
+    expect(old.statusCode).toBe(200);
+    expect(old.json().item).toHaveProperty("makingOf", null);
+  });
+
+  it("U-GR14: the VOTE routes keep the narrow card contract — the detail fields are stripped, not leaked", async () => {
+    const { service } = makeService();
+    const built = await buildTestApp(service);
+    app = built.app;
+
+    // The real service re-reads through `getItem`, so the handler genuinely holds a
+    // detail DTO here. The response SCHEMA is what keeps the vote wire contract narrow —
+    // and a client must therefore MERGE a vote response into a watch page's state rather
+    // than replace it, which is only safe if this stays asserted.
+    for (const method of ["POST", "DELETE"] as const) {
+      const res = await app.inject({
+        method,
+        url: "/gallery/gal-1/upvote",
+        headers: BEARER,
+      });
+      expect(res.statusCode).toBe(200);
+      const item = res.json().item;
+      expect(item).not.toHaveProperty("makingOf");
+      expect(item.owner).not.toHaveProperty("publicVideoCount");
+      expect(item.owner).toEqual({ displayName: "Mary K", avatarInitials: "MK" });
+    }
   });
 
   it("U-GR7: stream-url is reachable with NO auth header; an unknown item 404s", async () => {

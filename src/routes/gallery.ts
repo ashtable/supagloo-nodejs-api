@@ -4,6 +4,7 @@ import {
   FilePresignDownloadResponseSchema,
   GalleryDeleteResponseSchema,
   GalleryIdParamSchema,
+  GalleryItemDetailResponseSchema,
   GalleryItemResponseSchema,
   GalleryListQuerySchema,
   GalleryListResponseSchema,
@@ -271,6 +272,15 @@ export function registerGalleryRoutes(
   );
 
   // ------------------------------------------------------------------- one item (D12)
+  //
+  // The ONE route that serves `GalleryItemDetailResponseSchema` (Turn 16a): the card DTO
+  // plus the publish-time `makingOf` snapshot and `owner.publicVideoCount`. The listing
+  // and the two vote routes deliberately keep the narrower `GalleryItemResponseSchema` —
+  // both extras are per-ITEM costs (a jsonb blob and a `COUNT(*)`) that a 24-card page
+  // must not pay for numbers no card renders.
+  //
+  // The widening is ADDITIVE, so every existing consumer of this route is unaffected:
+  // `GalleryItemDetailDtoSchema` extends `GalleryItemDtoSchema` field for field.
   r.get(
     "/gallery/:id",
     {
@@ -278,7 +288,7 @@ export function registerGalleryRoutes(
       schema: {
         params: IdParam,
         response: {
-          200: GalleryItemResponseSchema,
+          200: GalleryItemDetailResponseSchema,
           400: errorResponseSchema,
           404: errorResponseSchema,
         },
