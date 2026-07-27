@@ -15,6 +15,18 @@ export interface GalleryItemRow extends GalleryItem {
   owner: { displayName: string; avatarInitials: string };
 }
 
+/**
+ * What the LISTING actually reads: every card column, and NOT the `makingOf` snapshot —
+ * `listGallery` passes `omit: { makingOf: true }`, so the column is absent from those rows
+ * at runtime.
+ *
+ * Saying so in the type is the point. The card mapper takes THIS shape, so a future edit
+ * that reaches for `row.makingOf` while rendering a card is a compile error rather than a
+ * silent `undefined` — and re-adding the per-page jsonb read would have to be a deliberate
+ * change to the query, which is exactly the decision three docblocks claim was made.
+ */
+export type GalleryCardRow = Omit<GalleryItemRow, "makingOf">;
+
 /** The three facts that are NOT on the row — they are per-request, per-viewer, or signed
  *  at read time — so they are supplied by the service rather than derived here. */
 export interface GalleryItemDtoExtras {
@@ -54,7 +66,7 @@ export interface GalleryItemDtoExtras {
  * or groups by it — it is an internal column that is free to keep and leaves the door open.
  */
 export function toGalleryItemDto(
-  row: GalleryItemRow,
+  row: GalleryCardRow,
   extras: GalleryItemDtoExtras,
 ): GalleryItemDto {
   return {
@@ -124,7 +136,12 @@ export function toGalleryItemDetailDto(
   const base = toGalleryItemDto(row, extras);
   return {
     ...base,
-    makingOf: parseStoredMakingOf((row as { makingOf?: unknown }).makingOf),
+    // No cast. `GalleryItemRow extends GalleryItem`, whose `makingOf` is already
+    // `Prisma.JsonValue | null` — exactly the untrusted, `unknown`-shaped value
+    // `parseStoredMakingOf` exists to gate. The cast that used to stand here widened a
+    // type that was never narrow, and would have gone on compiling if the column were
+    // renamed or dropped.
+    makingOf: parseStoredMakingOf(row.makingOf),
     owner: { ...base.owner, publicVideoCount: extras.publicVideoCount },
   };
 }

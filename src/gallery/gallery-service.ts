@@ -14,6 +14,7 @@ import {
 import {
   toGalleryItemDetailDto,
   toGalleryItemDto,
+  type GalleryCardRow,
   type GalleryItemRow,
 } from "./dto";
 import { buildMakingOfSnapshot } from "./making-of";
@@ -375,12 +376,19 @@ export class GalleryService {
     const ids = page.map((r) => r.id);
     const rows = (await this.prisma.galleryItem.findMany({
       where: { id: { in: ids } },
+      // `omit` is what makes the "the listing does not pay for the snapshot" claim TRUE.
+      // Three docblocks asserted it — `getItem`'s below, `routes/gallery.ts`'s and
+      // db-lib's `GalleryItemDtoSchema`'s — while `include` alone selects every scalar
+      // column, so each page was reading up to 24 `makingOf` blobs (≤20 000 characters of
+      // scripture plus 64 scene tiles apiece) for `toGalleryItemDto` to throw away.
+      // `include` and `omit` compose: the owner relation still comes back.
+      omit: { makingOf: true },
       include: OWNER_INCLUDE,
-    })) as GalleryItemRow[];
+    })) as GalleryCardRow[];
     const byId = new Map(rows.map((r) => [r.id, r]));
     const ordered = ids
       .map((id) => byId.get(id))
-      .filter((r): r is GalleryItemRow => r !== undefined);
+      .filter((r): r is GalleryCardRow => r !== undefined);
 
     const voted = await this.resolveViewerVotes(viewerId, ids);
 
@@ -715,7 +723,7 @@ export class GalleryService {
   }
 
   private async toDto(
-    row: GalleryItemRow,
+    row: GalleryCardRow,
     extras: { rank: number | null; viewerHasUpvoted: boolean },
   ): Promise<GalleryItemDto> {
     return toGalleryItemDto(row, {

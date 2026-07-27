@@ -550,6 +550,26 @@ describe("GalleryService.listGallery", () => {
     });
   });
 
+  it("U-GV7c: the listing's typed read OMITS `makingOf`, while the detail read still selects it", async () => {
+    // THREE docblocks state that the listing deliberately does not pay for the snapshot
+    // jsonb — `gallery-service.ts`'s `getItem`, `routes/gallery.ts` and db-lib's
+    // `GalleryItemDtoSchema`. Nothing enforced it: `findMany` carrying only `include`
+    // selects EVERY scalar column, so a 24-row page dragged back up to 24 snapshots (each
+    // bounded at ~20 000 characters of scripture plus 64 scene tiles) for
+    // `toGalleryItemDto` to discard. This test is what turns those three claims into
+    // behaviour.
+    const fake = makeFake({ rawRows: threeRaw, items: threeRows });
+    await makeService(fake).service.listGallery(null, { sort: "popular" });
+    expect(find(fake.calls, "galleryItem.findMany").args.omit).toEqual({
+      makingOf: true,
+    });
+
+    // The DETAIL read must NOT omit it — that read is the whole reason the column exists.
+    const one = makeFake({ item: itemRow() });
+    await makeService(one).service.getItem(null, "gal-1");
+    expect(find(one.calls, "galleryItem.findFirst").args.omit).toBeUndefined();
+  });
+
   it("U-GV8: the viewer's votes are resolved with ONE batched query for the whole page (the N+1 guard)", async () => {
     const fake = makeFake({
       rawRows: threeRaw,
