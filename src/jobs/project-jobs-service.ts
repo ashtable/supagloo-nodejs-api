@@ -49,6 +49,61 @@ export type JobEnqueue = (
 /** ProjectJob statuses that block a NEW git-ops job (design-delta §7). */
 const IN_FLIGHT_STATUSES = ["queued", "running"] as const;
 
+/**
+ * Translate a create-transaction failure that is a Prisma unique violation into the 409
+ * this surface already has; return every other error untouched (plan row 49).
+ *
+ * WHY IT EXISTS. `createProjectWithScaffold` / `createProjectFromImport` enforce
+ * "one repo ↔ one project per owner" with a `findFirst` made OUTSIDE the write
+ * transaction, so two concurrent `POST /v1/projects` for the same repo both passed it and
+ * produced two `Project` rows and two `scaffoldProjectWorkflow` runs for one GitHub repo.
+ * database-lib now backs the invariant with a PARTIAL unique index
+ * (`PROJECT_ACTIVE_REPO_UNIQUE_INDEX` … `WHERE "deletedAt" IS NULL`). Without this
+ * mapper the loser of that race gets the raw Prisma error, which carries no `statusCode`,
+ * so `error-handler.ts`'s `carriesIntentionalStatus` generifies it into a **500** — a
+ * worse answer than the one the race produced before the index existed.
+ *
+ * WHERE THE CATCH MUST SIT — outside the whole `$transaction` call, never inside the
+ * callback. A `P2002` raised inside a Prisma interactive transaction aborts it (Postgres
+ * `25P02`; Prisma issues no SAVEPOINT), so an inner catch cannot recover and every
+ * subsequent statement fails. `gallery-service.ts:542-561` documents the same trap with
+ * its own tests (U-UV7 / U-UV11).
+ *
+ * WHY IT MAPS EVERY `P2002` RATHER THAN ONE INDEX NAME. Two facts, both measured:
+ *
+ *  - `Project` carries TWO uniques a single create can violate, and the OLDER one wins.
+ *    Postgres checks a row's indexes in OID (creation) order, and `Project_ownerId_slug_key`
+ *    (16616 on the dev DB) predates this index (69589). Two simultaneous creates for one
+ *    repo derive the SAME slug — both run `nextFreeSlug` over the same snapshot — so the
+ *    loser violates both and Postgres reports the SLUG one. A different interleaving (the
+ *    winner commits between the loser's `findFirst` and its `findMany`) yields a different
+ *    slug and the repo index instead. Narrowing to one name would rethrow the common case.
+ *  - Both names mean the same thing HERE. This transaction writes exactly two rows:
+ *    a `Project`, and a `ProjectJob` whose only unique is a freshly generated uuid primary
+ *    key. So any unique violation reaching this catch is "this owner is already creating
+ *    this", which is what `ProjectAlreadyExistsError` (409 `project_exists`) says.
+ *
+ * `GitOpsInFlightError` is deliberately NOT the answer (D49.1): it is about a SPECIFIC
+ * project's in-flight job and needs a project id the loser does not reliably have, and
+ * re-querying `assertNoInFlightGitOps` from inside the catch is another round trip that can
+ * itself race — the winner's job row may not be visible yet.
+ *
+ * Duck-typed on the error code, never `instanceof PrismaClientKnownRequestError`:
+ * database-lib is a nested `file:` dependency, so the class a consumer imports need not be
+ * the class that threw. `auth-service.ts:214-222` and `gallery-service.ts:127-140` document
+ * the same rule and use the same predicate.
+ */
+function asDuplicateCreate(err: unknown): unknown {
+  if (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { code?: unknown }).code === "P2002"
+  ) {
+    return new ProjectAlreadyExistsError();
+  }
+  return err;
+}
+
 export interface ProjectJobsServiceOptions {
   prisma: PrismaClient;
   /** Enqueue-only submission to the DBOS system DB (never runs the runtime). */
@@ -141,31 +196,36 @@ export class ProjectJobsService {
     const manifest = buildBlankManifest();
     const stages = buildInitialStages(SCAFFOLD_STAGES);
 
-    const { projectId } = await this.prisma.$transaction(async (tx) => {
-      const project = await tx.project.create({
-        data: {
-          slug,
-          ownerId: userId,
-          name,
-          repoOwner: req.repoOwner,
-          repoName: req.repoName,
-          repoVisibility: req.visibility,
-          createdFrom: req.createdFrom,
-          currentBranch: "main", // pre-scaffold; the workflow advances it to v0.0.1
-        },
+    // The catch wraps the WHOLE `$transaction` call — see {@link asDuplicateCreate}.
+    const { projectId } = await this.prisma
+      .$transaction(async (tx) => {
+        const project = await tx.project.create({
+          data: {
+            slug,
+            ownerId: userId,
+            name,
+            repoOwner: req.repoOwner,
+            repoName: req.repoName,
+            repoVisibility: req.visibility,
+            createdFrom: req.createdFrom,
+            currentBranch: "main", // pre-scaffold; the workflow advances it to v0.0.1
+          },
+        });
+        await tx.projectJob.create({
+          data: {
+            id: jobId,
+            projectId: project.id,
+            userId,
+            kind: "scaffold",
+            status: "queued",
+            stages: stages as unknown as Prisma.InputJsonValue,
+          },
+        });
+        return { projectId: project.id };
+      })
+      .catch((err: unknown) => {
+        throw asDuplicateCreate(err);
       });
-      await tx.projectJob.create({
-        data: {
-          id: jobId,
-          projectId: project.id,
-          userId,
-          kind: "scaffold",
-          status: "queued",
-          stages: stages as unknown as Prisma.InputJsonValue,
-        },
-      });
-      return { projectId: project.id };
-    });
 
     const { workflowName, queueName } = resolveGitOpsWorkflow("scaffold");
     const payload: ScaffoldProjectPayload = {
@@ -238,31 +298,37 @@ export class ProjectJobsService {
     const jobId = this.generateJobId();
     const stages = buildInitialStages(IMPORT_STAGES);
 
-    const { projectId } = await this.prisma.$transaction(async (tx) => {
-      const project = await tx.project.create({
-        data: {
-          slug,
-          ownerId: userId,
-          name,
-          repoOwner: req.repoOwner,
-          repoName: req.repoName,
-          repoVisibility: req.visibility,
-          createdFrom: "import",
-          currentBranch: "main", // the workflow advances it to the resolved version branch
-        },
+    // Same race, same backstop, same catch placement as the scaffold path above — the
+    // partial unique index constrains BOTH create paths (brief finding S9).
+    const { projectId } = await this.prisma
+      .$transaction(async (tx) => {
+        const project = await tx.project.create({
+          data: {
+            slug,
+            ownerId: userId,
+            name,
+            repoOwner: req.repoOwner,
+            repoName: req.repoName,
+            repoVisibility: req.visibility,
+            createdFrom: "import",
+            currentBranch: "main", // the workflow advances it to the resolved version branch
+          },
+        });
+        await tx.projectJob.create({
+          data: {
+            id: jobId,
+            projectId: project.id,
+            userId,
+            kind: "import_verify",
+            status: "queued",
+            stages: stages as unknown as Prisma.InputJsonValue,
+          },
+        });
+        return { projectId: project.id };
+      })
+      .catch((err: unknown) => {
+        throw asDuplicateCreate(err);
       });
-      await tx.projectJob.create({
-        data: {
-          id: jobId,
-          projectId: project.id,
-          userId,
-          kind: "import_verify",
-          status: "queued",
-          stages: stages as unknown as Prisma.InputJsonValue,
-        },
-      });
-      return { projectId: project.id };
-    });
 
     const { workflowName, queueName } = resolveGitOpsWorkflow("import_verify");
     const payload: ImportProjectPayload = {

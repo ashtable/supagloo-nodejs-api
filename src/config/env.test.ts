@@ -365,3 +365,188 @@ describe("loadEnv", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------- plan row 43
+// Secrets/env BOOT HARDENING, api half (design-delta §2.10; brief §2).
+//
+// Two of the row's three claims were already true here and are PINNED, not rebuilt:
+// `SECRETS_ENCRYPTION_KEY` length/presence has been enforced since task 12 (brief finding
+// S4), and "distinct-per-env" does NOT mean per-SERVICE distinct — api and dbos must carry
+// the IDENTICAL key within an environment or `decryptSecret` fails in the worker (brief
+// finding S5, design-delta §11.7:2309-2318, root `compose-config.test.ts` PART V invariant
+// 5). What is NEW here: the all-zeros placeholder key is rejected, and every boot error
+// names the FILE as well as the variable.
+describe("plan row 43 — SECRETS_ENCRYPTION_KEY weak-key rejection", () => {
+  const thrownBy = (overrides: Record<string, string | undefined>) => {
+    try {
+      loadEnv(validEnv(overrides));
+      return undefined;
+    } catch (e) {
+      return e as Error;
+    }
+  };
+
+  it("U-ENV-R43-1: rejects the all-zeros key, naming the variable AND the file", () => {
+    const err = thrownBy({ SECRETS_ENCRYPTION_KEY: "0".repeat(64) });
+    expect(err).toBeDefined();
+    expect(err!.message).toContain("SECRETS_ENCRYPTION_KEY");
+    // design-delta §8:1414-1418 / §11.3:2034-2042 / §11.8:2392-2396: the operator must be
+    // told WHICH variable and WHERE it is read, not just that "the environment is invalid".
+    expect(err!.message).toContain("src/config/env.ts");
+    // The remedy is the same string the length check already recommends.
+    expect(err!.message).toContain("openssl rand -hex 32");
+  });
+
+  it("U-ENV-R43-2: only the literal placeholder is refused — a near-miss still loads", () => {
+    // The gate must not become a general "looks weak to me" heuristic: the only value with
+    // a recorded history of breaking decryption is the one that gets refused.
+    const almost = "0".repeat(63) + "1";
+    expect(loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: almost })).SECRETS_ENCRYPTION_KEY).toBe(
+      almost,
+    );
+    const real = "9f".repeat(32);
+    expect(loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: real })).SECRETS_ENCRYPTION_KEY).toBe(
+      real,
+    );
+  });
+
+  it("U-ENV-R43-3: the Compose dev key still boots — the gate is NOT NODE_ENV-based", () => {
+    // `docker-compose.yml:87`/`:134` hardcode exactly this value for api AND dbos, with
+    // `NODE_ENV: production`. A production-gated weak-key rejection would refuse to boot the
+    // shipped stack in every lane; this test is the standing proof that it does not.
+    const devKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    for (const nodeEnv of ["development", "test", "production"] as const) {
+      expect(
+        loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: devKey, NODE_ENV: nodeEnv }))
+          .SECRETS_ENCRYPTION_KEY,
+      ).toBe(devKey);
+    }
+  });
+
+  it("U-ENV-R43-4: no per-service-distinct rule exists (brief finding S5)", () => {
+    // Encryption is symmetric across the two services: this one encrypts a user's provider
+    // credential and the dbos worker decrypts it. A validator demanding an api-specific key
+    // would break decryption in production and turn root's PART V invariant 5 red. The
+    // ABSENCE of such a rule is the assertion — the same value the worker accepts loads here.
+    const shared = "a1b2c3d4".repeat(8);
+    expect(loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: shared })).SECRETS_ENCRYPTION_KEY).toBe(
+      shared,
+    );
+  });
+});
+
+// The row's Unit column asks for "validator matrices per service" — PLURAL, because the
+// three services' required sets are deliberately different (brief §2.2 constraint 6). This
+// is the api's matrix. Required-ness tiers are asserted AS THEY ARE, not normalised:
+// promoting an optional key to required would falsify current-design §5.3 and break every
+// Compose file (constraint 7).
+describe("plan row 43 — api required-variable matrix", () => {
+  const REQUIRED = [
+    "DATABASE_URL",
+    "DBOS_DATABASE_URL",
+    "GITHUB_APP_ID",
+    "GITHUB_APP_PRIVATE_KEY",
+    "GITHUB_APP_SLUG",
+    "GITHUB_APP_CLIENT_ID",
+    "GITHUB_APP_CLIENT_SECRET",
+    "SECRETS_ENCRYPTION_KEY",
+    "S3_ENDPOINT",
+    "S3_PUBLIC_ENDPOINT",
+    "S3_BUCKET",
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+  ] as const;
+
+  it.each(REQUIRED)(
+    "U-ENV-R43-M: a missing %s refuses to boot, naming the variable and the file",
+    (name) => {
+      let err: Error | undefined;
+      try {
+        loadEnv(validEnv({ [name]: undefined }));
+      } catch (e) {
+        err = e as Error;
+      }
+      expect(err).toBeDefined();
+      expect(err!.message).toContain(name);
+      expect(err!.message).toContain("src/config/env.ts");
+    },
+  );
+
+  it.each(REQUIRED)("U-ENV-R43-M: an EMPTY %s is refused too, not silently accepted", (name) => {
+    expect(() => loadEnv(validEnv({ [name]: "" }))).toThrow(new RegExp(name));
+  });
+
+  it("U-ENV-R43-5: every optional key stays optional, and provider URLs keep REAL defaults", () => {
+    // current-design §5.3:615-633 spends nineteen lines arguing DBOS_SYSTEM_DATABASE_SCHEMA
+    // is optional-and-unset-everywhere; the two test-only gates must be ABSENT in production;
+    // GITHUB_OAUTH_INTERNAL_BASE_URL resolves to the public host so an already-deployed
+    // environment needs no new variable (plan row 66 / D66.2).
+    const env = loadEnv(validEnv());
+    expect(env.DBOS_SYSTEM_DATABASE_SCHEMA).toBeUndefined();
+    expect(env.SUPAGLOO_ENABLE_TEST_SEED).toBeUndefined();
+    expect(env.GITHUB_E2E_EXCHANGE_TOKEN).toBeUndefined();
+    expect(env.GITHUB_API_BASE_URL).toBe("https://api.github.com");
+    expect(env.GITHUB_OAUTH_BASE_URL).toBe("https://github.com");
+    expect(env.GITHUB_OAUTH_INTERNAL_BASE_URL).toBe("https://github.com");
+    expect(env.OPENROUTER_BASE_URL).toBe("https://openrouter.ai");
+    expect(env.GLOO_BASE_URL).toBe("https://platform.ai.gloo.com");
+    expect(env.YOUVERSION_BASE_URL).toBe("https://api.youversion.com");
+    expect(env.S3_REGION).toBe("us-east-1");
+    expect(env.PORT).toBe(4000);
+    expect(env.HOST).toBe("0.0.0.0");
+  });
+
+  it("U-ENV-R43-6: the api DOES require the GitHub OAuth trio that dbos does not", () => {
+    // The asymmetry is by design (brief §2.2 constraint 6): only this service has user
+    // context, so only this service performs the hosted-install and code-for-token hops.
+    // dbos deliberately carries none of these three, and its own matrix asserts that. Both
+    // halves are needed or "per service" collapses into one copied list.
+    for (const name of [
+      "GITHUB_APP_SLUG",
+      "GITHUB_APP_CLIENT_ID",
+      "GITHUB_APP_CLIENT_SECRET",
+    ] as const) {
+      expect(() => loadEnv(validEnv({ [name]: undefined })), name).toThrow(
+        new RegExp(name),
+      );
+    }
+  });
+
+  it("U-ENV-R43-7: a multi-problem env reports EVERY offending variable at once", () => {
+    // Fail-fast at boot is only actionable if it does not make the operator play
+    // whack-a-mole one restart at a time.
+    let err: Error | undefined;
+    try {
+      loadEnv(
+        validEnv({
+          DATABASE_URL: undefined,
+          S3_BUCKET: undefined,
+          SECRETS_ENCRYPTION_KEY: "nope",
+        }),
+      );
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).toBeDefined();
+    expect(err!.message).toContain("DATABASE_URL");
+    expect(err!.message).toContain("S3_BUCKET");
+    expect(err!.message).toContain("SECRETS_ENCRYPTION_KEY");
+  });
+
+  it("U-ENV-R43-8: per-user provider credentials are NOT env (brief §2.2 constraint 8)", () => {
+    // current-design §3:373-374 — the OpenRouter key and the Gloo client secret are per-USER
+    // rows, encrypted at rest, connected through the UI (wireframe 11a draws both as
+    // OPTIONAL with "Skip for now →"). A boot validator that required them would couple the
+    // process's ability to start to one user's connection state.
+    const env = loadEnv(
+      validEnv({
+        OPENROUTER_API_KEY: "sk-should-be-ignored",
+        GLOO_CLIENT_ID: "ignored",
+        GLOO_CLIENT_SECRET: "ignored",
+      }),
+    ) as Record<string, unknown>;
+    expect(env).not.toHaveProperty("OPENROUTER_API_KEY");
+    expect(env).not.toHaveProperty("GLOO_CLIENT_ID");
+    expect(env).not.toHaveProperty("GLOO_CLIENT_SECRET");
+  });
+});

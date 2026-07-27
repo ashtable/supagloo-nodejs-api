@@ -1,6 +1,7 @@
 import { createPrismaClient } from "@supagloo/database-lib";
 import { buildApp } from "./app";
 import { loadEnv } from "./config/env";
+import { registerLogSecrets } from "./logging/redact";
 import { AuthService } from "./auth/auth-service";
 import { makeYouVersionVerifier } from "./auth/youversion";
 import { SESSION_TTL_MS } from "./auth/tokens";
@@ -27,9 +28,27 @@ import { GalleryService } from "./gallery/gallery-service";
  * Process entry point: validate the environment (fail-fast), build the app with
  * the real Prisma-backed AuthService + YouVersion verifier, and listen. The `api`
  * Compose service runs this via `node dist/server.js`.
+ *
+ * Plan row 43: this is also the ONE place log redaction is armed. `registerLogSecrets`
+ * runs immediately after `loadEnv` — before anything can fail with a secret in hand — and
+ * `buildApp` folds the redacting pino options in for every logger it creates. See
+ * `logging/redact.ts` for what shape-matching alone cannot catch and why the configured
+ * values are registered by exact value.
  */
 async function main(): Promise<void> {
   const env = loadEnv();
+  // The secrets with no recognisable SHAPE — a redactor cannot pattern-match an S3 secret
+  // key or an App OAuth client secret, so the validated values are registered by exact
+  // match. `SECRETS_ENCRYPTION_KEY` and the App private key are shape-matched as well;
+  // registering them too costs nothing and closes the gap if a key format ever changes.
+  registerLogSecrets([
+    env.SECRETS_ENCRYPTION_KEY,
+    env.GITHUB_APP_PRIVATE_KEY,
+    env.GITHUB_APP_CLIENT_SECRET,
+    env.GITHUB_E2E_EXCHANGE_TOKEN,
+    env.S3_SECRET_KEY,
+    env.S3_ACCESS_KEY,
+  ]);
 
   const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
   const authService = new AuthService({

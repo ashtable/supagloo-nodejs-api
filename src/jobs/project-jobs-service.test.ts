@@ -3,8 +3,10 @@ import {
   COMMIT_VERSION_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
+  PROJECT_ACTIVE_REPO_UNIQUE_INDEX,
   PUBLISH_VERSION_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
+  uniqueViolationIndexName,
   type PrismaClient,
 } from "@supagloo/database-lib";
 import { ProjectJobsService, type EnqueueOptions } from "./project-jobs-service";
@@ -39,6 +41,16 @@ interface FakeConfig {
   job?: unknown; // getJob: projectJob.findFirst result
   workingVersion?: { semver: string } | null; // commit: projectVersion.findFirst result
   createdProjectId?: string;
+  /**
+   * Plan row 49. When set, `$transaction` REJECTS WITHOUT INVOKING THE CALLBACK.
+   *
+   * That shape is the assertion, not a convenience: a `P2002` raised inside a Prisma
+   * interactive transaction aborts it (25P02 — Prisma issues no SAVEPOINT, documented at
+   * `gallery-service.ts:542-561`), so a catch sitting INSIDE the callback cannot recover.
+   * A fake that only ever throws from within the callback would pass against either shape.
+   * Throwing from the transaction CALL passes only if the catch wraps the whole call.
+   */
+  transactionError?: unknown;
 }
 
 function makeFake(config: FakeConfig) {
@@ -85,7 +97,13 @@ function makeFake(config: FakeConfig) {
         return Promise.resolve({ ...args.data });
       },
     },
-    $transaction: (fn: any) => Promise.resolve(fn(tx)),
+    $transaction: (fn: any) => {
+      calls.push({ op: "$transaction", args: undefined });
+      if ("transactionError" in config) {
+        return Promise.reject(config.transactionError);
+      }
+      return Promise.resolve(fn(tx));
+    },
   };
   return { prisma: prisma as unknown as PrismaClient, calls };
 }
@@ -705,5 +723,206 @@ describe("ProjectJobsService.getJob", () => {
         "job-x",
       ),
     ).rejects.toBeInstanceOf(ProjectJobNotFoundError);
+  });
+});
+
+// ---------------------------------------------------------------------- plan row 49
+// Repo-creation race hardening, api half (brief §6; design-delta §2.6/§8).
+//
+// THE GAP. "One repo ↔ one project" was enforced only by the `findFirst`-then-`create`
+// check above, made OUTSIDE the write transaction and with no DB constraint behind it, so
+// two concurrent `POST /v1/projects` for the same repo both passed the check and produced
+// two `Project` rows and two `scaffoldProjectWorkflow` runs for one GitHub repo. db-lib
+// (6ca5b79) added the backing constraint — a PARTIAL unique index,
+// `Project_ownerId_repoOwner_repoName_active_key … WHERE "deletedAt" IS NULL` — and this
+// is the half that turns the resulting `P2002` into the 409 that already exists instead of
+// the raw Prisma error `error-handler.ts` would generify into a **500**.
+//
+// TWO MEASURED FACTS SHAPE THE CODE, and both contradict the obvious implementation:
+//
+//   1. On Prisma 7.8.0 through `@prisma/adapter-pg` — the only client this stack builds —
+//      a `P2002` carries NO `meta.target` at all. The violated index name survives only in
+//      `err.meta.driverAdapterError.cause.originalMessage`. Every pre-adapter guide says to
+//      switch on `meta.target`; code that does reads `undefined`, never matches, and 500s
+//      exactly where it meant to 409 — silently, with nothing red. db-lib centralizes the
+//      extraction in `uniqueViolationIndexName` so it is not re-derived, and mis-derived,
+//      per repo. The fixtures below therefore use the REAL adapter shape.
+//
+//   2. `Project_ownerId_slug_key` fires FIRST. Postgres checks a row's unique indexes in
+//      OID (creation) order, and the slug unique predates this one — measured on the live
+//      dev DB: 16616 (slug) vs 69589 (repo). Two simultaneous creates for one repo compute
+//      the SAME slug (both run `nextFreeSlug` over the same owned-slug snapshot), so the
+//      loser violates BOTH uniques and Postgres reports the slug one:
+//
+//        ERROR:  duplicate key value violates unique constraint "Project_ownerId_slug_key"
+//
+//      A different interleaving — the winner commits between the loser's `findFirst` and
+//      its `findMany` — yields a different slug and the repo-index violation instead. BOTH
+//      names are reachable, which is why the mapping is unconditional over `P2002` (D49.1)
+//      rather than narrowed to one index name. A narrowed catch would rethrow the common
+//      case and leave the row's own acceptance criterion (a clean 409, not a 500) failing.
+describe("plan row 49 — the partial unique index maps to the existing 409", () => {
+  /** A `P2002` in the shape `@prisma/adapter-pg` actually produces (measured fact 1). */
+  const p2002 = (indexName: string) => ({
+    code: "P2002",
+    meta: {
+      driverAdapterError: {
+        cause: {
+          originalMessage: `duplicate key value violates unique constraint "${indexName}"`,
+        },
+      },
+    },
+  });
+
+  const SLUG_INDEX = "Project_ownerId_slug_key";
+
+  it("U-R49-10: the index name is the cross-repo contract db-lib publishes (D49.2)", () => {
+    expect(PROJECT_ACTIVE_REPO_UNIQUE_INDEX).toBe(
+      "Project_ownerId_repoOwner_repoName_active_key",
+    );
+    // …and db-lib's extractor really recovers it from the measured adapter shape. If this
+    // ever goes red, every catch below is matching on a value that no longer arrives.
+    expect(uniqueViolationIndexName(p2002(PROJECT_ACTIVE_REPO_UNIQUE_INDEX))).toBe(
+      PROJECT_ACTIVE_REPO_UNIQUE_INDEX,
+    );
+    expect(uniqueViolationIndexName(new Error("nope"))).toBeNull();
+  });
+
+  it("U-R49-1: create — P2002 on the repo index becomes 409 project_exists, not a 500", async () => {
+    const { prisma } = makeFake({
+      connection: { installationId: "42" },
+      transactionError: p2002(PROJECT_ACTIVE_REPO_UNIQUE_INDEX),
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const err = await makeService(prisma, enqueued)
+      .createProjectWithScaffold("u1", CREATE_REQ)
+      .then(
+        () => undefined,
+        (e) => e as Error,
+      );
+    expect(err).toBeInstanceOf(ProjectAlreadyExistsError);
+    // The status is what `error-handler.ts`'s `carriesIntentionalStatus` reads to DELEGATE
+    // instead of generifying; a raw Prisma error carries none and becomes a 500.
+    expect((err as any).statusCode).toBe(409);
+  });
+
+  it("U-R49-2: create — P2002 on the SLUG index (the one that actually fires) is also a 409", async () => {
+    const { prisma } = makeFake({
+      connection: { installationId: "42" },
+      transactionError: p2002(SLUG_INDEX),
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createProjectWithScaffold("u1", CREATE_REQ),
+    ).rejects.toBeInstanceOf(ProjectAlreadyExistsError);
+  });
+
+  it("U-R49-3: create — a non-P2002 failure is rethrown UNCHANGED, never mistranslated", async () => {
+    // Narrowness matters as much as breadth: a raw-query failure answered with
+    // "a project already exists for this repository" is a lie the caller cannot debug.
+    const other = Object.assign(new Error("Raw query failed"), { code: "P2010" });
+    const { prisma } = makeFake({
+      connection: { installationId: "42" },
+      transactionError: other,
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createProjectWithScaffold("u1", CREATE_REQ),
+    ).rejects.toBe(other);
+  });
+
+  it("U-R49-4: create — the loser never enqueues a workflow", async () => {
+    const { prisma } = makeFake({
+      connection: { installationId: "42" },
+      transactionError: p2002(PROJECT_ACTIVE_REPO_UNIQUE_INDEX),
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await makeService(prisma, enqueued)
+      .createProjectWithScaffold("u1", CREATE_REQ)
+      .catch(() => {});
+    // "exactly one workflow enqueued" (the row's e2e criterion) is only true if the loser
+    // enqueues none. The enqueue is after the transaction, so the throw is what stops it.
+    expect(enqueued.calls).toHaveLength(0);
+  });
+
+  it("U-R49-8: create — the catch wraps the $transaction CALL, not the callback", async () => {
+    const { prisma, calls } = makeFake({
+      connection: { installationId: "42" },
+      transactionError: p2002(PROJECT_ACTIVE_REPO_UNIQUE_INDEX),
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createProjectWithScaffold("u1", CREATE_REQ),
+    ).rejects.toBeInstanceOf(ProjectAlreadyExistsError);
+    // The transaction was entered…
+    expect(has(calls, "$transaction")).toBe(true);
+    // …but the callback never ran, so nothing INSIDE it could have caught this. Passing
+    // this while catching inside the callback is impossible.
+    expect(has(calls, "project.create")).toBe(false);
+  });
+
+  it("U-R49-5: import — P2002 on the repo index becomes 409 project_exists (finding S9)", async () => {
+    // The plan row names only `createProjectWithScaffold`, but the identical
+    // findFirst-then-create shape lives in the import path too, and the index constrains
+    // both. Catching in one place only would trade a duplicate-project bug for a new 500.
+    const { prisma } = makeFake({
+      connection: { installationId: "42" },
+      transactionError: p2002(PROJECT_ACTIVE_REPO_UNIQUE_INDEX),
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const err = await makeService(prisma, enqueued)
+      .createProjectFromImport("u1", IMPORT_REQ)
+      .then(
+        () => undefined,
+        (e) => e as Error,
+      );
+    expect(err).toBeInstanceOf(ProjectAlreadyExistsError);
+    expect((err as any).statusCode).toBe(409);
+  });
+
+  it("U-R49-6: import — a non-P2002 failure is rethrown unchanged", async () => {
+    const other = Object.assign(new Error("connection reset"), { code: "P1017" });
+    const { prisma } = makeFake({
+      connection: { installationId: "42" },
+      transactionError: other,
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await expect(
+      makeService(prisma, enqueued).createProjectFromImport("u1", IMPORT_REQ),
+    ).rejects.toBe(other);
+  });
+
+  it("U-R49-7: import — the loser never enqueues, and never enters the callback", async () => {
+    const { prisma, calls } = makeFake({
+      connection: { installationId: "42" },
+      transactionError: p2002(SLUG_INDEX),
+    });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    await makeService(prisma, enqueued)
+      .createProjectFromImport("u1", IMPORT_REQ)
+      .catch(() => {});
+    expect(enqueued.calls).toHaveLength(0);
+    expect(has(calls, "project.create")).toBe(false);
+  });
+
+  it("U-R49-9: the pre-transaction guard is UNCHANGED — the constraint is a backstop", async () => {
+    // The application-level check still answers the common (sequential) cases without ever
+    // reaching the database constraint, and still distinguishes the two 409s. The DB
+    // constraint only decides the genuinely-concurrent case the check cannot see.
+    for (const [inFlightJobs, expected] of [
+      [[{ id: "job-old", status: "running" }], GitOpsInFlightError],
+      [[], ProjectAlreadyExistsError],
+    ] as const) {
+      const { prisma, calls } = makeFake({
+        connection: { installationId: "42" },
+        existingProject: { id: "cprj-existing" },
+        inFlightJobs: [...inFlightJobs],
+      });
+      const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+      await expect(
+        makeService(prisma, enqueued).createProjectWithScaffold("u1", CREATE_REQ),
+      ).rejects.toBeInstanceOf(expected);
+      expect(has(calls, "$transaction")).toBe(false);
+    }
   });
 });

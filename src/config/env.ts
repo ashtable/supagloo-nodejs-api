@@ -18,6 +18,42 @@ const HTTP_URL = /^https?:\/\/.+/;
 const SECRETS_KEY_HEX = /^[0-9a-fA-F]{64}$/;
 
 /**
+ * This file's own path, quoted in every boot failure (plan row 43).
+ *
+ * design-delta §8:1414-1418 / §11.3:2034-2042 / §11.8:2392-2396: a fail-fast is only
+ * actionable if it tells the operator WHICH variable is wrong and WHERE it is read.
+ * "Invalid environment configuration" alone sends them grepping. Kept in the same shape
+ * as `supagloo-nodejs-dbos/src/config/env.ts`'s constant so a stack with two unhappy
+ * services produces two messages that can be told apart at a glance.
+ */
+const ENV_SOURCE_FILE = "supagloo-nodejs-api/src/config/env.ts";
+
+/**
+ * Placeholder `SECRETS_ENCRYPTION_KEY` values that are refused even though they satisfy
+ * {@link SECRETS_KEY_HEX} (plan row 43 / D43.1).
+ *
+ * The all-zeros key is 64 hex characters, so the regex above has always accepted it — and
+ * it caused a real incident (design-delta §11.7:2309-2318): `docker-compose.test.yml`
+ * overrode the API's key to this value while dbos kept the Compose dev key, so every
+ * provider credential this service ENCRYPTED failed `decryptSecret` in the worker. Row 62
+ * deleted that override; this makes the value itself un-loadable so it cannot return by
+ * another door.
+ *
+ * WHY NOT the obvious weak-key gate — reject the well-known dev key when
+ * `NODE_ENV === "production"`: `docker-compose.yml` pins `NODE_ENV: production` on BOTH api
+ * and dbos AND hardcodes that dev key, so a production-gated rejection would refuse to boot
+ * the shipped stack in every lane. The "distinct per environment" half of the row lives
+ * where it can actually be checked — the root repo's Compose/`.env.example` guard — and
+ * this in-process half rejects only the value with a recorded history of breaking
+ * decryption.
+ *
+ * NOT a per-service rule. api and dbos must carry the IDENTICAL key within an environment
+ * (current-design §2.2:99, root `compose-config.test.ts` PART V invariant 5); the message
+ * below is byte-identical to the worker's for exactly that reason.
+ */
+const WEAK_SECRETS_KEYS = new Set(["0".repeat(64)]);
+
+/**
  * A provider base URL: http(s), with the REAL provider URL as the default so
  * production needs zero config.
  *
@@ -195,6 +231,14 @@ const baseEnvSchema = z.object({
       message:
         "SECRETS_ENCRYPTION_KEY must be a 64-character hex string (32 bytes); " +
         "generate one with `openssl rand -hex 32`",
+    })
+    // Plan row 43 / D43.1 — see WEAK_SECRETS_KEYS. Keep this message byte-identical to
+    // supagloo-nodejs-dbos's: the two services share one key, so they must reject the same
+    // values with the same words or an operator will think only one of them is unhappy.
+    .refine((value) => !WEAK_SECRETS_KEYS.has(value), {
+      message:
+        "SECRETS_ENCRYPTION_KEY must not be a placeholder key (all zeros); " +
+        "generate a real one with `openssl rand -hex 32`",
     }),
 
   // Task #13 S3 object storage (design-delta §4/§8). The API presigns DOWNLOAD URLs
@@ -252,7 +296,9 @@ export function loadEnv(
     const details = result.error.issues
       .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
       .join("; ");
-    throw new Error(`Invalid environment configuration — ${details}`);
+    throw new Error(
+      `Invalid environment configuration in ${ENV_SOURCE_FILE} — ${details}`,
+    );
   }
   return result.data;
 }

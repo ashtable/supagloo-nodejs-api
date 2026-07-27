@@ -1,9 +1,13 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, {
+  type FastifyInstance,
+  type FastifyServerOptions,
+} from "fastify";
 import {
   serializerCompiler,
   validatorCompiler,
 } from "fastify-type-provider-zod";
 import { registerErrorHandler } from "./error-handler";
+import { buildLoggerOptions } from "./logging/redact";
 import { registerHealthRoutes } from "./routes/health";
 import { bearerAuthPlugin } from "./auth/bearer-auth";
 import { registerAuthRoutes } from "./routes/auth";
@@ -149,8 +153,15 @@ export interface GalleryDeps {
 }
 
 export interface BuildAppOptions {
-  /** Enable Fastify's request logger (on for the running server, off in tests). */
-  logger?: boolean;
+  /**
+   * Enable Fastify's request logger (`true` for the running server, omitted in tests).
+   *
+   * Whatever is supplied here is MERGED ON TOP of {@link buildLoggerOptions}'s redaction
+   * (plan row 43), never instead of it — pass a `level` or a destination `stream` without
+   * having to remember to re-add the `err` serializer and the header path list, and without
+   * being able to silently drop them.
+   */
+  logger?: FastifyServerOptions["logger"];
   /** Wire the `/v1` auth/session routes. Omit for a health-only app. */
   auth?: AuthDeps;
   /** Wire the `/v1` GitHub connection + repo routes. Requires `auth` (bearer). */
@@ -192,8 +203,32 @@ export interface BuildAppOptions {
  * shared with the Next.js BFF for end-to-end type safety). Returned un-listened
  * so tests can `inject` or `listen` on an ephemeral port.
  */
+/**
+ * Resolve `BuildAppOptions.logger` into what Fastify receives, folding in row 43's
+ * redaction whenever logging is on at all.
+ *
+ * A logger instance (something with `.child`) is passed through untouched — it is already
+ * configured and merging pino OPTIONS into it would be meaningless. Everything else is pino
+ * options: `true` means "the redacting defaults", an object means "the redacting defaults,
+ * plus these".
+ */
+function resolveLoggerOptions(
+  logger: FastifyServerOptions["logger"],
+): FastifyServerOptions["logger"] {
+  if (!logger) return false;
+  const base = buildLoggerOptions();
+  if (logger === true) return base;
+  if (typeof logger === "object" && !("child" in logger)) {
+    return { ...base, ...logger } as FastifyServerOptions["logger"];
+  }
+  return logger;
+}
+
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
-  const app = Fastify({ logger: options.logger ?? false });
+  // Redaction is applied HERE rather than at the one call site that enables logging, so a
+  // future second caller (or an e2e that turns logging on to debug) cannot get an
+  // unredacted logger by simply not knowing about it.
+  const app = Fastify({ logger: resolveLoggerOptions(options.logger ?? false) });
 
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
