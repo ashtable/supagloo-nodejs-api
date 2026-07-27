@@ -105,8 +105,14 @@ async function main(): Promise<void> {
 
   // Enqueue-only DBOS client against the system DB (`supagloo_dbos`); the API never
   // runs the DBOS runtime. Closed on shutdown alongside Prisma.
+  //
+  // DBOS_SYSTEM_DATABASE_SCHEMA is unset in Compose, so this forwards `undefined` and
+  // the SDK's default "dbos" schema stands. It MUST carry the same value as the dbos
+  // worker's: a schema set on one service only would have the api enqueueing into a
+  // namespace nothing polls.
   const jobEnqueuer = makeDbosEnqueuer({
     systemDatabaseUrl: env.DBOS_DATABASE_URL,
+    systemDatabaseSchemaName: env.DBOS_SYSTEM_DATABASE_SCHEMA,
   });
   const projectJobsService = new ProjectJobsService({
     prisma,

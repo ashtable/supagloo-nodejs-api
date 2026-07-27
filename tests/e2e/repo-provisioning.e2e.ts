@@ -16,6 +16,12 @@ import { SESSION_TTL_MS } from "../../src/auth/tokens";
 import { ProjectsService } from "../../src/projects/projects-service";
 import { ProjectJobsService } from "../../src/jobs/project-jobs-service";
 import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
+import {
+  assertLaneRuntimeIsolated,
+  assertWorkflowIsolated,
+  laneSystemSchema,
+  resetLaneSchema,
+} from "../../src/testing/dbos-lane-isolation";
 import { makeGithubUserAuthClient } from "../../src/connections/github-user-auth-client";
 import { RepoProvisioningService } from "../../src/projects/repo-provisioning-service";
 import {
@@ -91,6 +97,18 @@ import {
 //
 // DURABLE SIDE EFFECTS: one private throwaway repo per successful create case, NEVER
 // auto-removed (task-62 D6). Reclaim with the root repo's `npm run cleanup:github-e2e`.
+//
+// ISOLATION, NOT A PRECONDITION. This spec registers a STAND-IN `scaffoldProject` under
+// the REAL shared name on the REAL shared `git-ops` queue. It never documented the
+// assumption, but it had the same one the other three stand-in specs did: an idle Compose
+// `dbos` service, because otherwise the containerised worker dequeues the delegated job
+// and really scaffolds (or fails) it. That precondition is unsatisfiable across a full
+// sweep — root's e2e lane and nextjs's render lane both bring `dbos` UP and leave it up.
+// Instead the in-process runtime AND the enqueuer share a per-lane DBOS system SCHEMA
+// inside the same `supagloo_dbos` database (SDK `systemDatabaseSchemaName`), so the two
+// executors cannot see each other's rows in EITHER direction. The container may be up or
+// down; both pass. The queue and workflow names are unchanged and deliberately still the
+// real ones — exercising the real API↔DBOS name contract is the point of this spec.
 
 const APP_URL =
   process.env.DATABASE_URL ??
@@ -100,6 +118,8 @@ const DBOS_URL =
   "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos";
 const YOUVERSION_BASE =
   process.env.YOUVERSION_BASE_URL ?? "https://api.youversion.com";
+/** This lane's private DBOS system schema inside `supagloo_dbos` (see the header note). */
+const SYSTEM_SCHEMA = laneSystemSchema("api_repo_prov");
 const stamp = () => `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -205,11 +225,28 @@ beforeAll(async () => {
   oauthCreds = resolveGithubOauthClientCreds();
   naming = (await loadRootE2eHarness()).naming;
 
-  DBOS.setConfig({ name: "supagloo-api-repo-prov-e2e", systemDatabaseUrl: DBOS_URL });
+  // Self-heal a crashed previous run BEFORE launch, so no stale PENDING row is adopted
+  // by DBOS's recovery sweep (same executor_id "local", same auto-computed app version).
+  await resetLaneSchema({ systemDatabaseUrl: DBOS_URL, schema: SYSTEM_SCHEMA });
+
+  DBOS.setConfig({
+    name: "supagloo-api-repo-prov-e2e",
+    systemDatabaseUrl: DBOS_URL,
+    systemDatabaseSchemaName: SYSTEM_SCHEMA, // ← the runtime half
+  });
   await DBOS.launch();
   await DBOS.registerQueue(GIT_OPS_QUEUE_NAME, { workerConcurrency: 4 });
 
-  enqueuer = makeDbosEnqueuer({ systemDatabaseUrl: DBOS_URL });
+  // Fail FAST and LOUD if the config did not take. Never a warn, never a skip.
+  await assertLaneRuntimeIsolated({
+    systemDatabaseUrl: DBOS_URL,
+    schema: SYSTEM_SCHEMA,
+  });
+
+  enqueuer = makeDbosEnqueuer({
+    systemDatabaseUrl: DBOS_URL,
+    systemDatabaseSchemaName: SYSTEM_SCHEMA, // ← the enqueuer half
+  });
 
   const authService = new AuthService({
     prisma,
@@ -361,6 +398,14 @@ describe("e2e: GET /v1/projects/repo-authorize-url", () => {
 });
 
 describe("e2e: POST /v1/projects/create-repo — the JIT hop → scaffold", () => {
+  it("E-RP0: the repo-provisioning lane runs on its own DBOS system schema, so the Compose worker cannot see its work", async () => {
+    expect(SYSTEM_SCHEMA).not.toBe("dbos");
+    await assertLaneRuntimeIsolated({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+    });
+  });
+
   it("exchanges the code, creates the repo, and scaffolds it to succeeded", async () => {
     const owner = await seedUser("create");
     await connectGithub(owner.userId);
@@ -384,6 +429,22 @@ describe("e2e: POST /v1/projects/create-repo — the JIT hop → scaffold", () =
     const { projectId, jobId } = await created.json();
     expect(projectId).toBeTruthy();
     expect(jobId).toBeTruthy();
+
+    // The ENQUEUER half of the isolation is real: the delegated job landed in this lane's
+    // schema and is absent from the shared one the Compose worker polls.
+    //
+    // ORDERING IS LOAD-BEARING — this runs here, immediately after the 201, and not
+    // beside the job poll further down. `POST /projects/create-repo` awaits the enqueue
+    // before it answers, so the row is committed by now and this needs no polling.
+    // Sequenced later, a dropped `systemDatabaseSchemaName` on the enqueuer surfaces as a
+    // bare poll timeout (measured in project-jobs.e2e.ts) that names neither the cause nor
+    // the remedy — and only after this spec has already spent several real-GitHub round
+    // trips. Here it fails in milliseconds, with the remedy named.
+    await assertWorkflowIsolated({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowID: jobId,
+    });
 
     // The created Project points at the owner GITHUB assigned (echoed back by
     // `POST /user/repos`, i.e. the discovered account) and the requested repo name —
