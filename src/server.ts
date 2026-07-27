@@ -1,6 +1,11 @@
 import { createPrismaClient } from "@supagloo/database-lib";
 import { buildApp } from "./app";
 import { loadEnv } from "./config/env";
+import {
+  dsnPasswords,
+  registerLogSecrets,
+  reportBootFailure,
+} from "./logging/redact";
 import { AuthService } from "./auth/auth-service";
 import { makeYouVersionVerifier } from "./auth/youversion";
 import { SESSION_TTL_MS } from "./auth/tokens";
@@ -27,9 +32,34 @@ import { GalleryService } from "./gallery/gallery-service";
  * Process entry point: validate the environment (fail-fast), build the app with
  * the real Prisma-backed AuthService + YouVersion verifier, and listen. The `api`
  * Compose service runs this via `node dist/server.js`.
+ *
+ * Plan row 43: this is also the ONE place log redaction is armed. `registerLogSecrets`
+ * runs immediately after `loadEnv` — before anything can fail with a secret in hand — and
+ * `buildApp` folds the redacting pino options in for every logger it creates. See
+ * `logging/redact.ts` for what shape-matching alone cannot catch and why the configured
+ * values are registered by exact value.
  */
 async function main(): Promise<void> {
   const env = loadEnv();
+  // The secrets with no recognisable SHAPE — a redactor cannot pattern-match an S3 secret
+  // key or an App OAuth client secret, so the validated values are registered by exact
+  // match. `SECRETS_ENCRYPTION_KEY` and the App private key are shape-matched as well;
+  // registering them too costs nothing and closes the gap if a key format ever changes.
+  registerLogSecrets([
+    env.SECRETS_ENCRYPTION_KEY,
+    env.GITHUB_APP_PRIVATE_KEY,
+    env.GITHUB_APP_CLIENT_SECRET,
+    env.GITHUB_E2E_EXCHANGE_TOKEN,
+    env.S3_SECRET_KEY,
+    env.S3_ACCESS_KEY,
+    // Both DSN passwords. These are NOT covered by `redactUrlCredentials`: its userinfo
+    // class stops at the first `@`, so a password containing `@` leaks its tail (measured —
+    // `postgres://user:p@ssw0rdLong@db:5432/x` → `postgres://user:***@ssw0rdLong@db:5432/x`).
+    // The DSN is also the credential this process is most likely to log, since
+    // `PrismaClientInitializationError` echoes the datasource URL. See `dsnPasswords`.
+    ...dsnPasswords(env.DATABASE_URL),
+    ...dsnPasswords(env.DBOS_DATABASE_URL),
+  ]);
 
   const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
   const authService = new AuthService({
@@ -117,6 +147,15 @@ async function main(): Promise<void> {
   const projectJobsService = new ProjectJobsService({
     prisma,
     enqueue: jobEnqueuer.enqueue,
+    // Plan row 49: the create path maps EVERY `P2002` from its write transaction onto the
+    // 409 that already exists (deliberately — both `Project_ownerId_slug_key` and the repo
+    // index are reachable, measured), so the index name is the only thing that tells a slug
+    // collision between two different repos apart from a `nextFreeSlug` regression. Without
+    // this line neither produces any log entry and neither produces a 500.
+    //
+    // Bound through a closure because `app` is built BELOW and owns the logger; this is only
+    // ever invoked from inside a request, long after that.
+    warn: (fields, message) => app.log.warn(fields, message),
   });
 
   // AI generations (design-delta §2.8/§7/§8): create + enqueue on the ai-generation
@@ -236,10 +275,23 @@ async function main(): Promise<void> {
   try {
     await app.listen({ port: env.PORT, host: env.HOST });
   } catch (err) {
-    app.log.error(err);
+    // `{ err }, "<message>"` rather than a positional error: the `err` key is the one
+    // `serializers.err` sees, and the static message keeps the raw one out of `msg`.
+    // (`buildLoggerOptions`'s `hooks.logMethod` now normalizes the positional shape too —
+    // this is the belt to that braces, and it reads better in the log.)
+    app.log.error({ err }, "listen failed");
     await prisma.$disconnect();
     process.exit(1);
   }
 }
 
-void main();
+// EVERY rejection out of `main()` is caught, redacted and turned into a non-zero exit —
+// mirroring `supagloo-nodejs-dbos/src/main.ts:56-64`. `main()` calls `loadEnv()`,
+// `registerLogSecrets(...)` and `createPrismaClient({ connectionString: env.DATABASE_URL })`
+// BEFORE the listen try/catch above, so a bare `void main()` handed those failures to Node's
+// default unhandled-rejection handler: the raw `Error`, its whole `cause` chain and every
+// attached property, straight into the shared Compose log stream — sometimes before
+// `registerLogSecrets` had run at all. Node exits 1 on an unhandled rejection either way,
+// which is why row 43's boot e2e (E-BH1/E-BH2 read stderr and assert a non-zero exit) stayed
+// green over it. `U-RED-17` fences the shape; `U-RED-18` proves the redaction.
+void main().catch(reportBootFailure);

@@ -1,9 +1,13 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, {
+  type FastifyInstance,
+  type FastifyServerOptions,
+} from "fastify";
 import {
   serializerCompiler,
   validatorCompiler,
 } from "fastify-type-provider-zod";
 import { registerErrorHandler } from "./error-handler";
+import { buildLoggerOptions } from "./logging/redact";
 import { registerHealthRoutes } from "./routes/health";
 import { bearerAuthPlugin } from "./auth/bearer-auth";
 import { registerAuthRoutes } from "./routes/auth";
@@ -149,8 +153,21 @@ export interface GalleryDeps {
 }
 
 export interface BuildAppOptions {
-  /** Enable Fastify's request logger (on for the running server, off in tests). */
-  logger?: boolean;
+  /**
+   * Enable Fastify's request logger (`true` for the running server, omitted in tests).
+   *
+   * Whatever is supplied here is MERGED ON TOP of {@link buildLoggerOptions}'s redaction
+   * (plan row 43), never instead of it — pass a `level` or a destination `stream` without
+   * having to remember to re-add the `err` serializer, the header path list and the `msg`
+   * hook, and without being able to silently drop them.
+   *
+   * "Never instead of it" is enforced, not merely intended: `resolveLoggerOptions` merges
+   * `redact.paths`, `serializers` and `hooks` sub-object by sub-object with row 43's entries
+   * last, so a caller's own serializer or path list is ADDED alongside them. `U-RED-19` /
+   * `U-RED-19b` hold it. (Before Step 11 this was a shallow spread, and the sentence above
+   * was false: `{ logger: { serializers: { req } } }` removed the `err` serializer.)
+   */
+  logger?: FastifyServerOptions["logger"];
   /** Wire the `/v1` auth/session routes. Omit for a health-only app. */
   auth?: AuthDeps;
   /** Wire the `/v1` GitHub connection + repo routes. Requires `auth` (bearer). */
@@ -192,8 +209,63 @@ export interface BuildAppOptions {
  * shared with the Next.js BFF for end-to-end type safety). Returned un-listened
  * so tests can `inject` or `listen` on an ephemeral port.
  */
+/**
+ * Resolve `BuildAppOptions.logger` into what Fastify receives, folding in row 43's
+ * redaction whenever logging is on at all.
+ *
+ * A logger instance (something with `.child`) is passed through untouched — it is already
+ * configured and merging pino OPTIONS into it would be meaningless. Everything else is pino
+ * options: `true` means "the redacting defaults", an object means "the redacting defaults,
+ * plus these".
+ *
+ * THE MERGE IS DEEP, and that is the whole point of the sentence on
+ * {@link BuildAppOptions.logger}. A shallow `{ ...base, ...logger }` let a caller passing
+ * ANY serializer replace the `err` serializer wholesale, and a caller passing ANY `redact`
+ * block replace the header path list — silently, which is exactly what that JSDoc promises
+ * cannot happen. Each redaction sub-object is therefore spread with BASE'S ENTRIES LAST: a
+ * caller may ADD a serializer, a path or a hook, and can never drop one of row 43's.
+ */
+function resolveLoggerOptions(
+  logger: FastifyServerOptions["logger"],
+): FastifyServerOptions["logger"] {
+  if (!logger) return false;
+  const base = buildLoggerOptions();
+  if (logger === true) return base;
+  if (typeof logger === "object" && !("child" in logger)) {
+    const caller = logger as Record<string, unknown>;
+    const asRecord = (value: unknown): Record<string, unknown> =>
+      typeof value === "object" && value !== null
+        ? (value as Record<string, unknown>)
+        : {};
+    // pino accepts `redact` as either a bare path array or `{ paths, censor, remove }`.
+    const callerRedact = caller.redact;
+    const callerPaths = Array.isArray(callerRedact)
+      ? (callerRedact as string[])
+      : ((callerRedact as { paths?: string[] } | undefined)?.paths ?? []);
+    const callerRedactRest = Array.isArray(callerRedact)
+      ? {}
+      : asRecord(callerRedact);
+    return {
+      ...base,
+      ...caller,
+      redact: {
+        ...callerRedactRest,
+        // Deduped: fast-redact throws on a duplicated path.
+        paths: [...new Set([...callerPaths, ...base.redact.paths])],
+        censor: base.redact.censor,
+      },
+      serializers: { ...asRecord(caller.serializers), ...base.serializers },
+      hooks: { ...asRecord(caller.hooks), ...base.hooks },
+    } as FastifyServerOptions["logger"];
+  }
+  return logger;
+}
+
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
-  const app = Fastify({ logger: options.logger ?? false });
+  // Redaction is applied HERE rather than at the one call site that enables logging, so a
+  // future second caller (or an e2e that turns logging on to debug) cannot get an
+  // unredacted logger by simply not knowing about it.
+  const app = Fastify({ logger: resolveLoggerOptions(options.logger ?? false) });
 
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);

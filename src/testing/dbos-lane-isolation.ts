@@ -271,3 +271,39 @@ export async function assertWorkflowIsolated({
     }
   });
 }
+
+/**
+ * How many workflows named `workflowName` currently exist in this lane's system schema.
+ *
+ * A WATERMARK PRIMITIVE, for the "exactly one workflow was enqueued" class of assertion.
+ * {@link assertWorkflowIsolated} proves that a KNOWN id landed in the lane schema and
+ * nowhere else; it counts nothing globally. So a spec that only ever queries ids it already
+ * holds is structurally incapable of observing a SECOND workflow appearing under an id it
+ * was never told about — which is exactly the defect "exactly one workflow" exists to
+ * prevent. Take the count before the act and after it, and assert the DELTA.
+ *
+ * Reads the lane schema only. A count against the shared `dbos` schema from inside a lane
+ * finds zero rows and passes vacuously (preflight §0.2), and `assertLaneSchemaName` makes
+ * the interpolation safe for the same reason `resetLaneSchema` relies on it.
+ */
+export async function countLaneWorkflows({
+  systemDatabaseUrl,
+  schema,
+  workflowName,
+}: SchemaTarget & { workflowName: string }): Promise<number> {
+  assertLaneSchemaName(schema);
+
+  return withSystemDb(systemDatabaseUrl, async (db) => {
+    if ((await regclassOf(db, `"${schema}".workflow_status`)) === null) {
+      throw isolationFailure(
+        `"${schema}".workflow_status does not exist, so a workflow-count watermark taken here ` +
+          `would read 0 forever and every delta assertion over it would pass vacuously.`,
+      );
+    }
+    return countRows(
+      db,
+      `SELECT count(*)::int AS n FROM "${schema}".workflow_status WHERE name = $1`,
+      workflowName,
+    );
+  });
+}

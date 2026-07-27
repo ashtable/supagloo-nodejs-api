@@ -5,10 +5,12 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import {
   createPrismaClient,
   type PrismaClient,
+  PROJECT_ACTIVE_REPO_UNIQUE_INDEX,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
   SCAFFOLD_STAGES,
   buildInitialStages,
+  uniqueViolationIndexName,
 } from "@supagloo/database-lib";
 import { buildApp } from "../../src/app";
 import { AuthService } from "../../src/auth/auth-service";
@@ -20,6 +22,7 @@ import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
 import {
   assertLaneRuntimeIsolated,
   assertWorkflowIsolated,
+  countLaneWorkflows,
   laneSystemSchema,
   resetLaneSchema,
 } from "../../src/testing/dbos-lane-isolation";
@@ -417,4 +420,173 @@ describe("e2e: GET job — ownership scoping + auth", () => {
     ).toBe(401);
     expect((await api("/projects/x/jobs/y")).status).toBe(401);
   });
+});
+
+// ---------------------------------------------------------------------- plan row 49
+// Repo-creation race hardening (brief §6). The TOCTOU this closes lives entirely in this
+// endpoint: `findFirst`-then-`create` with the check made OUTSIDE the write transaction,
+// so two concurrent requests for one repo both passed it. database-lib (6ca5b79) added the
+// backing PARTIAL unique index and `project-jobs-service.ts` now maps its `P2002` onto the
+// 409 that already existed, instead of letting a raw Prisma error become a 500.
+//
+// WHY THIS SPEC AND NOT `repo-provisioning.e2e.ts` (a deliberate deviation from the Step-5
+// brief §6.4, recorded here so it reads as a decision and not an oversight): `POST
+// /v1/projects` makes ZERO GitHub calls — it reads the connection row, dedups, writes two
+// rows and enqueues. A real fixture repo would therefore prove nothing about the race while
+// costing a durable throwaway repo per run (there is no in-suite teardown, ever) and ~60 s
+// of real-host readiness gating. This lane already owns this endpoint, already carries the
+// stand-in scaffold worker, and already asserts the two SEQUENTIAL duplicate-create 409s
+// immediately above — the concurrent case belongs beside them. The brief's actual
+// constraint (never invoke the non-idempotent `createUserRepo` twice) is satisfied by not
+// invoking it at all.
+describe("e2e: plan row 49 — two SIMULTANEOUS creates for one repo", () => {
+  it("E-PJ-R49a: one 201 + one clean 409 (never a 500), one Project, one job, one workflow", async () => {
+    disarmGates(); // both requests run to completion; no barrier.
+    const owner = await seedUser("race");
+    await connectGithub(owner.userId, "42");
+    const repoName = `psalm-race-${stamp()}`;
+    const createBody = {
+      name: "Psalm Race",
+      repoOwner: "ashtable",
+      repoName,
+      visibility: "private",
+      createdFrom: "blank",
+    };
+
+    // WATERMARK, taken BEFORE the two POSTs. The row's E2E column says "exactly one
+    // workflow enqueued", and that sentence cannot be proven by any query keyed to an id
+    // the test already holds: `assertWorkflowIsolated` and both `listWorkflows` calls below
+    // take the WINNER's id (and `jobsForProject` was already asserted to have length 1, so
+    // the second `listWorkflows` was literally the first one re-issued). A refactor that
+    // enqueued a second `scaffoldProject` under a fresh id — the exact defect the row exists
+    // to prevent — passed all of them. VERIFIED by mutation in Step 11: enqueueing on the
+    // 409 path with a fresh uuid left this whole spec green. Counting by workflow NAME in
+    // the lane schema is what makes the sentence checkable.
+    const scaffoldsBefore = await countLaneWorkflows({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowName: SCAFFOLD_PROJECT_WORKFLOW_NAME,
+    });
+
+    // Fired together, awaited together — the two requests interleave on the same event
+    // loop, which is exactly the window the application-level `findFirst` cannot see.
+    const [a, b] = await Promise.all([
+      api("/projects", owner.token, { method: "POST", body: createBody }),
+      api("/projects", owner.token, { method: "POST", body: createBody }),
+    ]);
+    const results = await Promise.all(
+      [a, b].map(async (r) => ({ status: r.status, body: await r.json() })),
+    );
+
+    const statuses = results.map((r) => r.status).sort();
+    // THE HEADLINE ASSERTION. Before the index + the catch, the loser's raw `P2002` had no
+    // `statusCode`, so `error-handler.ts` generified it to `500 internal_error`.
+    expect(statuses).not.toContain(500);
+    expect(statuses).toEqual([201, 409]);
+
+    const won = results.find((r) => r.status === 201)!;
+    const lost = results.find((r) => r.status === 409)!;
+
+    // WHICH 409 is not asserted, on purpose. Both guards are correct answers and which one
+    // fires is decided by the interleaving: if the winner commits before the loser's
+    // `findFirst`, the application check answers `project_exists`; if it commits after,
+    // the DB constraint answers (also `project_exists`); and if the winner's job row is
+    // already visible, `git_ops_in_flight`. Asserting the MECHANISM would make this test
+    // flaky; asserting the INVARIANT — a clean, typed 409 — is the row's actual criterion.
+    expect(["project_exists", "git_ops_in_flight"]).toContain(lost.body.error);
+    expect(lost.body.message).toBeTruthy();
+
+    // Exactly one Project and exactly one ProjectJob survive — the defect being fixed
+    // produced two of each for one GitHub repo.
+    const projectsForRepo = await prisma.project.findMany({
+      where: { ownerId: owner.userId, repoOwner: "ashtable", repoName },
+    });
+    expect(projectsForRepo).toHaveLength(1);
+    expect(projectsForRepo[0].id).toBe(won.body.projectId);
+
+    const jobsForProject = await prisma.projectJob.findMany({
+      where: { projectId: projectsForRepo[0].id },
+    });
+    expect(jobsForProject).toHaveLength(1);
+    expect(jobsForProject[0].id).toBe(won.body.jobId);
+
+    // Exactly one workflow — and read in the LANE schema with ZERO rows in the shared
+    // `dbos` schema. A default-schema query from inside a lane finds nothing and would
+    // pass vacuously, which is the worst possible failure mode for this assertion.
+    await assertWorkflowIsolated({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowID: won.body.jobId,
+    });
+    expect(await DBOS.listWorkflows({ workflowIDs: [won.body.jobId] })).toHaveLength(1);
+
+    // THE "EXACTLY ONE" ASSERTION, and the only one of these that can fail if a second
+    // workflow appears under an id this test was never told about. Counted by NAME, so it
+    // sees the loser's enqueue whatever id it used; scoped to the lane schema, so it is not
+    // reading the shared `dbos` namespace where a count would be vacuously zero.
+    const scaffoldsAfter = await countLaneWorkflows({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowName: SCAFFOLD_PROJECT_WORKFLOW_NAME,
+    });
+    expect(scaffoldsAfter - scaffoldsBefore).toBe(1);
+
+    // …and the one that exists is the winner's, still keyed to the id the caller received.
+    const allForProject = await DBOS.listWorkflows({
+      workflowIDs: jobsForProject.map((j) => j.id),
+    });
+    expect(allForProject).toHaveLength(1);
+  }, 60_000);
+
+  it("E-PJ-R49b: the constraint is LIVE in this database and is PARTIAL on deletedAt", async () => {
+    disarmGates();
+    // The catch under test is only ever exercised if the index actually exists in the
+    // database the api is pointed at. Asserting the mapper without asserting the constraint
+    // would go green against a database where the migration never ran.
+    const owner = await seedUser("index");
+    await connectGithub(owner.userId, "42");
+    const repoName = `psalm-index-${stamp()}`;
+    const created = await api("/projects", owner.token, {
+      method: "POST",
+      body: {
+        repoOwner: "ashtable",
+        repoName,
+        visibility: "private",
+        createdFrom: "blank",
+      },
+    });
+    expect(created.status).toBe(201);
+    const { projectId } = await created.json();
+
+    const dupe = {
+      slug: `psalm-index-dupe-${stamp()}`, // a FREE slug, so only the repo index can fire
+      ownerId: owner.userId,
+      name: "Duplicate",
+      repoOwner: "ashtable",
+      repoName,
+      repoVisibility: "private" as const,
+      createdFrom: "blank" as const,
+      currentBranch: "main",
+    };
+
+    const violation = await prisma.project.create({ data: dupe }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(violation).toBeDefined();
+    // The name is the cross-repo contract — `meta.target` is absent on this Prisma/adapter
+    // pair, so db-lib's extractor is the only thing that recovers it.
+    expect(uniqueViolationIndexName(violation)).toBe(PROJECT_ACTIVE_REPO_UNIQUE_INDEX);
+
+    // …and the `WHERE "deletedAt" IS NULL` predicate is real: soft-deleting the project
+    // releases the slot, which is what lets a user delete and re-create a project for the
+    // same repository. Nothing persisted from the failed insert above.
+    await prisma.project.update({
+      where: { id: projectId },
+      data: { deletedAt: new Date() },
+    });
+    const revived = await prisma.project.create({ data: dupe });
+    expect(revived.repoName).toBe(repoName);
+    await prisma.project.delete({ where: { id: revived.id } });
+  }, 60_000);
 });
