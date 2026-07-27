@@ -39,11 +39,24 @@ import { createPrismaClient } from "@supagloo/database-lib";
  * `CREATE SCHEMA IF NOT EXISTS "<schemaName>"`, so no Compose or Postgres change is needed.
  *
  * A NEAR-IDENTICAL COPY LIVES AT `supagloo-nodejs-dbos/src/testing/dbos-lane-isolation.ts`.
- * That duplication is deliberate, not drift: routing this through the root checkout would
- * make specs that need no root checkout today (renders, project-jobs) depend on one. The
- * copies cannot meaningfully diverge — the two repos MUST NOT share a lane schema name,
- * and each lane wants its own regardless.
+ * The duplication is deliberate — but the reason is NARROWER than this note used to claim,
+ * and the difference matters. The argument is about the file's LOCATION: routing it through
+ * the root checkout would make specs that need no root checkout today (renders,
+ * project-jobs) depend on one.
+ *
+ * It is NOT that the copies "cannot meaningfully diverge". Only the lane schema NAME is
+ * naturally per-repo (the two repos must never share one). Everything between the
+ * BEGIN/END markers below is a different kind of thing: `LANE_SCHEMA_PREFIX`,
+ * `MAX_PG_IDENTIFIER_BYTES`, `LANE_SCHEMA_RE` and `assertLaneSchemaName` are ONE rule, and
+ * that rule is the only thing standing between an interpolated `DROP SCHEMA … CASCADE` and
+ * the production `"dbos"` schema. A copy that quietly loosened its regex or raised its byte
+ * cap would look exactly like this one and would still pass its own repo's suite. Those
+ * lines are therefore byte-identical across both repos and HELD that way by the root
+ * repo's `tests/unit/dbos-lane-isolation-drift.test.ts`. Prose, error wording and
+ * everything outside the markers are free to differ, and do.
  */
+
+// --- BEGIN SHARED DDL SAFETY (byte-identical across api + dbos; drift-guarded) ---
 
 /** The SDK's own default system schema. Pinned here so an SDK bump that changes it fails
  *  in `dbos-lane-isolation.test.ts` (U-DLI6) rather than as a silent re-coupling. */
@@ -97,6 +110,8 @@ export function laneSystemSchema(lane: string): string {
   assertLaneSchemaName(name);
   return name;
 }
+
+// --- END SHARED DDL SAFETY ---
 
 interface SchemaTarget {
   systemDatabaseUrl: string;
