@@ -1,4 +1,10 @@
-import type { GalleryItem, GalleryItemDto } from "@supagloo/database-lib";
+import {
+  GalleryMakingOfSchema,
+  type GalleryItem,
+  type GalleryItemDetailDto,
+  type GalleryItemDto,
+  type GalleryMakingOf,
+} from "@supagloo/database-lib";
 
 /**
  * A persisted `GalleryItem` with the owner columns the public card needs. Every read in
@@ -71,5 +77,54 @@ export function toGalleryItemDto(
       displayName: row.owner.displayName,
       avatarInitials: row.owner.avatarInitials,
     },
+  };
+}
+
+/** The one extra fact the DETAIL read carries that the card does not. Separate from
+ *  {@link GalleryItemDtoExtras} so the listing cannot accidentally acquire a `COUNT(*)`
+ *  per card: 24 of them a page, for a number no card renders. */
+export interface GalleryItemDetailDtoExtras extends GalleryItemDtoExtras {
+  /** `COUNT(*)` of this owner's `visibility='public'` items. */
+  publicVideoCount: number;
+}
+
+/**
+ * Re-validate a STORED `makingOf` on the way out, degrading to `null`.
+ *
+ * The column is `jsonb` and the value was written by SOME version of this code — an older
+ * one, or a newer one that ships a `version: 2` shape. It is therefore untrusted input on
+ * the read path exactly as the manifest was on the write path, and there are two distinct
+ * reasons to gate it rather than cast:
+ *
+ *   - `GalleryMakingOfSchema.version` is the LITERAL `1` on purpose. Without re-parsing,
+ *     a v2 snapshot would be handed to a v1 consumer, whose recognized fields parse and
+ *     whose unrecognized ones vanish — a page rendering a confident lie. Refusing is what
+ *     lets it degrade honestly to "no making-of".
+ *   - the response serializer is schema-driven, so a malformed value reaching it is a 500
+ *     on a PUBLIC route. A missing section is a far better failure than an error page.
+ */
+export function parseStoredMakingOf(stored: unknown): GalleryMakingOf | null {
+  if (stored === null || stored === undefined) return null;
+  const parsed = GalleryMakingOfSchema.safeParse(stored);
+  return parsed.success ? parsed.data : null;
+}
+
+/**
+ * Map a row to the WATCH PAGE's DTO (`GET /v1/gallery/:id`) — a strict widening of
+ * {@link toGalleryItemDto} by exactly two fields.
+ *
+ * It delegates to the card mapper rather than re-listing the columns, so the two shapes
+ * cannot drift: a field added to the card is on the detail page for free, and a field
+ * REMOVED from the card cannot silently survive here.
+ */
+export function toGalleryItemDetailDto(
+  row: GalleryItemRow,
+  extras: GalleryItemDetailDtoExtras,
+): GalleryItemDetailDto {
+  const base = toGalleryItemDto(row, extras);
+  return {
+    ...base,
+    makingOf: parseStoredMakingOf((row as { makingOf?: unknown }).makingOf),
+    owner: { ...base.owner, publicVideoCount: extras.publicVideoCount },
   };
 }

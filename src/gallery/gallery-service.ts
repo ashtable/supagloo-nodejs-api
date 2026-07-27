@@ -2,12 +2,21 @@ import {
   buildRenderOutputKey,
   buildRenderThumbnailKey,
   deriveScriptureBook,
+  Prisma,
+  type GalleryItemDetailDto,
   type GalleryItemDto,
   type GalleryListQuery,
+  type GalleryMakingOf,
   type PrismaClient,
+  type ProjectManifest,
   type PublishGalleryItemRequest,
 } from "@supagloo/database-lib";
-import { toGalleryItemDto, type GalleryItemRow } from "./dto";
+import {
+  toGalleryItemDetailDto,
+  toGalleryItemDto,
+  type GalleryItemRow,
+} from "./dto";
+import { buildMakingOfSnapshot } from "./making-of";
 import {
   buildGalleryListQuery,
   encodeCursor,
@@ -70,6 +79,35 @@ export interface GalleryServiceOptions {
   streamUrlTtlSeconds?: number;
   /** Rows per page. Default {@link GALLERY_PAGE_SIZE}. */
   pageSize?: number;
+  /**
+   * OPTIONAL: read the owner's project manifest, for the publish-time "making of"
+   * snapshot (Turn 16a). Wired in `server.ts` to `ManifestService.readManifest` — the
+   * SAME synchronous, owner-scoped, token-minting path `GET /v1/projects/:id/manifest`
+   * already uses, so this adds no new GitHub surface, only a new caller.
+   *
+   * OPTIONAL is load-bearing in two places. It keeps every existing construction of this
+   * service (including two e2e apps and the whole unit suite) behaving exactly as it did,
+   * and it makes "this deployment cannot read manifests" a configuration, not an outage:
+   * unset, publish simply stores `makingOf: null`.
+   *
+   * The seam is `Promise<ProjectManifest | null>` while the real implementation THROWS
+   * for its three failure modes (no connection → 409, no file → 404, corrupt → 422).
+   * Both are handled identically here, which is the point: `null` and a throw are the
+   * same outcome — no snapshot.
+   */
+  readManifestForSnapshot?: (
+    userId: string,
+    projectId: string,
+  ) => Promise<ProjectManifest | null>;
+  /**
+   * How long publish will wait for that read before abandoning it. Default 5 000 ms.
+   *
+   * A bound is REQUIRED, not defensive decoration: this is the one call in an otherwise
+   * pure-Postgres endpoint that leaves the process, and GitHub's tail latency would
+   * otherwise become this endpoint's tail latency. Abandoning costs a section; waiting
+   * costs the publish.
+   */
+  manifestSnapshotTimeoutMs?: number;
 }
 
 export interface GalleryPage {
@@ -113,6 +151,8 @@ export class GalleryService {
   private readonly now: () => Date;
   private readonly streamUrlTtlSeconds: number;
   private readonly pageSize: number;
+  private readonly readManifestForSnapshot?: GalleryServiceOptions["readManifestForSnapshot"];
+  private readonly manifestSnapshotTimeoutMs: number;
 
   constructor(opts: GalleryServiceOptions) {
     this.prisma = opts.prisma;
@@ -120,6 +160,8 @@ export class GalleryService {
     this.now = opts.now ?? (() => new Date());
     this.streamUrlTtlSeconds = opts.streamUrlTtlSeconds ?? 120;
     this.pageSize = opts.pageSize ?? GALLERY_PAGE_SIZE;
+    this.readManifestForSnapshot = opts.readManifestForSnapshot;
+    this.manifestSnapshotTimeoutMs = opts.manifestSnapshotTimeoutMs ?? 5_000;
   }
 
   // ------------------------------------------------------------------- publish (D7/D8)
@@ -142,6 +184,37 @@ export class GalleryService {
    * stored strings and never taken from the client — exactly as
    * `RendersService.presignRenderDownload` already does — so the persisted keys are always
    * ones `parseS3Key` can resolve.
+   *
+   * -------------------------------------------------------------------------------------
+   * AMENDED 2026-07-26 (Turn 16a, plan slice C3). The paragraph above argued AGAINST
+   * reading the manifest here, on three grounds. TWO OF THEM NO LONGER APPLY, and the
+   * third was paid rather than dodged — so the code now reads the manifest, and this is
+   * the decision rather than a silent contradiction of it.
+   *
+   *   1. *"puts real GitHub egress into a single-insert path"* — still literally true, but
+   *      the read is now OPTIONAL and BOUNDED. It is attempted only after every
+   *      precondition has passed, it is abandoned at `manifestSnapshotTimeoutMs`, and a
+   *      failure of any kind (no connection, no file, corrupt file, timeout, no seam
+   *      configured at all) stores `makingOf: null` and still returns 201. The publish
+   *      cannot fail because of it. Compare the REQUIRED columns, which still come only
+   *      from the request body — nothing above this line changed.
+   *   2. *"still not answer which of an N-scene manifest's N references is the card's"* —
+   *      does not apply to a SNAPSHOT. It picks none of the N: it joins ALL scenes'
+   *      `scriptText` into the one passage the watch page draws, and lists every scene as
+   *      a tile. The ambiguity that killed the idea for `scriptureReference` does not
+   *      exist for "here is the whole thing".
+   *   3. *"drags this endpoint's e2e under the real-provider policy"* — REAL, and the cost
+   *      was paid by splitting the specs. `tests/e2e/gallery.e2e.ts` stays ZERO-EGRESS and
+   *      owns the best-effort-null branch (its fixtures have no `GithubConnection`, so the
+   *      read fails in `ManifestService` before a socket opens); the new
+   *      `tests/e2e/gallery-making-of.e2e.ts` owns the real-GitHub happy path on task-62's
+   *      fixture-repo harness.
+   *
+   * WHY AT PUBLISH AND NOT AT VIEW. `GET /v1/gallery/:id` is public, anonymous and
+   * crawlable; it must not hold, mint or imply an installation token. Publish is performed
+   * by the authenticated owner, who already has one. And a per-view read would show
+   * TODAY's manifest under a video rendered from an older one — the subtler of the two
+   * lies.
    */
   async publish(
     userId: string,
@@ -179,6 +252,9 @@ export class GalleryService {
       Math.round(render.framesTotal / render.fps),
     );
 
+    // LAST, after every gate: a 404/409/422 must cost no GitHub round trip at all.
+    const makingOf = await this.captureMakingOf(userId, render.projectId);
+
     let row: GalleryItemRow;
     try {
       row = (await this.prisma.galleryItem.create({
@@ -195,6 +271,18 @@ export class GalleryService {
           videoAssetKey: buildRenderOutputKey(render.id),
           thumbnailAssetKey: buildRenderThumbnailKey(render.id),
           visibility: req.visibility,
+          // ALWAYS written, never omitted: "we have no snapshot" is a decision worth
+          // stating in the INSERT.
+          //
+          // `Prisma.DbNull`, NOT `Prisma.JsonNull` and not a bare `null` (which a
+          // nullable `Json` field does not accept at all). The two sentinels write
+          // different values: `DbNull` is SQL NULL, `JsonNull` is the jsonb scalar
+          // `null`. Both read back as `null` through the client, which is exactly why
+          // the choice has to be made deliberately — only `DbNull` makes
+          // `WHERE "makingOf" IS NULL` find these rows, and only `DbNull` makes an item
+          // published before this column existed indistinguishable from one whose
+          // manifest could not be read. They are the same fact and must be the same row.
+          makingOf: makingOf ?? Prisma.DbNull,
         },
         include: OWNER_INCLUDE,
       })) as GalleryItemRow;
@@ -331,21 +419,45 @@ export class GalleryService {
   /**
    * One item by id, for BOTH visibilities: `unlisted` means hidden from the listing,
    * reachable by link. A row that does not exist is a uniform 404.
+   *
+   * Returns the DETAIL DTO (Turn 16a): the card's fields plus the stored `makingOf` and
+   * `owner.publicVideoCount`. Both are per-ITEM costs the listing deliberately does not
+   * pay — a jsonb blob nobody needs 24 of, and a `COUNT(*)` that would be 24 counts a
+   * page for a number no card renders.
+   *
+   * The vote routes reach this method too, so they pay the extra `COUNT(*)` as well. That
+   * is accepted rather than optimized around: ONE read path means the detail response and
+   * the post-vote response can never disagree about an item, and a second path would be
+   * one refactor away from drifting. Their response schema is still
+   * `GalleryItemResponseSchema`, which STRIPS the two extra fields — so the wire contract
+   * of `POST/DELETE /v1/gallery/:id/upvote` is unchanged, and a client must MERGE a vote
+   * response into a watch page's state rather than replace it.
    */
   async getItem(
     viewerId: string | null,
     id: string,
-  ): Promise<GalleryItemDto> {
+  ): Promise<GalleryItemDetailDto> {
     const row = (await this.prisma.galleryItem.findFirst({
       where: { id },
       include: OWNER_INCLUDE,
     })) as GalleryItemRow | null;
     if (!row) throw new GalleryItemNotFoundError();
 
-    const voted = await this.resolveViewerVotes(viewerId, [row.id]);
-    return this.toDto(row, {
+    const [voted, publicVideoCount] = await Promise.all([
+      this.resolveViewerVotes(viewerId, [row.id]),
+      // PUBLIC only. The count sits on a public page beside a creator's name, so
+      // counting items a visitor cannot reach would overstate them to everyone —
+      // including their owner, who would see a number nobody else can verify.
+      this.prisma.galleryItem.count({
+        where: { ownerId: row.ownerId, visibility: "public" },
+      }),
+    ]);
+
+    return toGalleryItemDetailDto(row, {
+      thumbnailUrl: await this.presignThumbnail(row.renderJobId),
       rank: null,
       viewerHasUpvoted: voted.has(row.id),
+      publicVideoCount,
     });
   }
 
@@ -474,6 +586,58 @@ export class GalleryService {
   }
 
   // ------------------------------------------------------------------------- internals
+
+  /**
+   * The publish-time manifest snapshot — BEST EFFORT, and the only place in this service
+   * that leaves the process for anything but S3 signing.
+   *
+   * Four ways to get `null`, all of them ordinary rather than exceptional: no seam
+   * configured, the seam resolves `null`, the seam throws (no GitHub connection, no
+   * manifest file, a corrupt manifest — 409/404/422 on the manifest ROUTE, but not errors
+   * here), or the seam is still running at the timeout.
+   *
+   * WHY `Promise.race` AND NOT FIRE-AND-FORGET, stated precisely (an earlier version of
+   * this comment overstated it, and the mutation test refuted it). Racing leaves the loser
+   * running, but it does NOT leave it unobserved: `Promise.race` attaches a reaction to
+   * every entrant, so a read that rejects after the timer already won is a handled
+   * rejection that settles nothing. The hazard is real for the OTHER shape — kicking the
+   * read off with `.then()` and sleeping — where a late failure is an `unhandledRejection`
+   * that can take the process down long after the 201 was sent, from the one code path
+   * whose whole contract is "this cannot break publish". U-GS-MO3b is the fence against
+   * that shape (verified: it fails when this method is rewritten fire-and-forget), and the
+   * explicit `.catch` below documents the intent rather than supplying the safety.
+   */
+  private async captureMakingOf(
+    userId: string,
+    projectId: string,
+  ): Promise<GalleryMakingOf | null> {
+    const read = this.readManifestForSnapshot;
+    if (!read) return null;
+
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const manifest = await Promise.race([
+        Promise.resolve()
+          .then(() => read(userId, projectId))
+          // A failed read IS "no snapshot", so it is folded to `null` here rather than
+          // left to the outer catch. That leaves the outer `try` responsible for exactly
+          // one thing — a SYNCHRONOUS throw from a misconfigured seam.
+          .catch(() => null),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), this.manifestSnapshotTimeoutMs);
+          // Do not hold the process open for a snapshot nobody is waiting on.
+          timer.unref?.();
+        }),
+      ]);
+      if (!manifest) return null;
+      return buildMakingOfSnapshot(manifest, this.now());
+    } catch {
+      // A synchronous throw from the seam itself (a misconfigured wiring) lands here.
+      return null;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
 
   /** Resolve the item BEFORE opening a transaction, so an unknown id is a 404 that costs no
    *  transaction at all. Uniform denial: existence never leaks. */

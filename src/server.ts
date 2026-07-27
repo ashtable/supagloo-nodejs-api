@@ -150,10 +150,22 @@ async function main(): Promise<void> {
   // 24-row page size are GalleryService defaults, deliberately not env vars: neither is
   // deployment-specific, and adding them to env.ts would mean compose/.env.example churn for
   // two constants.
+  //
+  // Turn 16a adds ONE seam: the publish-time "making of" snapshot reads the owner's
+  // project manifest through the ALREADY-WIRED `ManifestService` — the same synchronous,
+  // owner-scoped, token-minting path `GET /v1/projects/:id/manifest` uses. No new GitHub
+  // client, no new credential, no new route; one more caller of an existing one.
+  //
+  // It is BEST EFFORT by construction: `readManifest` throws for a missing connection, a
+  // missing file and a corrupt manifest, and `GalleryService` treats every throw — and a
+  // timeout — as "no snapshot", still returning 201. That is why this is the only place
+  // the two services meet, and why publish's REQUIRED columns still come from the body.
   const galleryService = new GalleryService({
     prisma,
     presignPublic: (key, ttlSeconds) =>
       filesService.presignPublicKey(key, ttlSeconds),
+    readManifestForSnapshot: (userId, projectId) =>
+      manifestService.readManifest(userId, projectId),
   });
 
   // Create-new-repo JIT hop (design-delta §2.3/§6b): the zero-storage user-token
