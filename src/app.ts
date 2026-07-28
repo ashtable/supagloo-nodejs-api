@@ -26,6 +26,8 @@ import { registerProjectRoutes } from "./routes/projects";
 import { registerManifestRoutes } from "./routes/manifests";
 import { registerProjectJobRoutes } from "./routes/project-jobs";
 import { registerAiGenerationRoutes } from "./routes/ai-generations";
+import { registerAiModelRoutes } from "./routes/ai-models";
+import type { ModelCatalogueService } from "./ai/model-catalogue-service";
 import { registerRepoProvisioningRoutes } from "./routes/repo-provisioning";
 import { registerRenderRoutes } from "./routes/renders";
 import { registerGalleryRoutes } from "./routes/gallery";
@@ -184,6 +186,10 @@ export interface BuildAppOptions {
   projectJobs?: ProjectJobsDeps;
   /** Wire the `/v1` AI-generation routes. Requires `auth` (bearer). */
   aiGenerations?: AiGenerationsDeps;
+  /** Wire `GET /v1/ai/models`, the live provider/model catalogue the studio Inspector's
+   *  model selectors and cost estimate read. Requires `auth` (bearer) — the Gloo half is
+   *  fetched with a token minted from the CALLER'S stored client credentials. */
+  aiModels?: { service: ModelCatalogueService };
   /** Wire the `/v1` create-new-repo JIT hop routes. Requires `auth` (bearer). */
   repoProvisioning?: RepoProvisioningDeps;
   /** Wire the `/v1` render routes. Requires `auth` (bearer). */
@@ -293,6 +299,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const manifests = options.manifests;
   const projectJobs = options.projectJobs;
   const aiGenerations = options.aiGenerations;
+  const aiModels = options.aiModels;
   const repoProvisioning = options.repoProvisioning;
   const renders = options.renders;
   const gallery = options.gallery;
@@ -334,6 +341,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         }
         if (aiGenerations) {
           registerAiGenerationRoutes(v1, { service: aiGenerations.service });
+        }
+        if (aiModels) {
+          registerAiModelRoutes(v1, { service: aiModels.service });
         }
         if (repoProvisioning) {
           registerRepoProvisioningRoutes(v1, {

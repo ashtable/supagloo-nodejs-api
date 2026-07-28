@@ -1,4 +1,4 @@
-import { createPrismaClient } from "@supagloo/database-lib";
+import { createPrismaClient, decryptSecret } from "@supagloo/database-lib";
 import { buildApp } from "./app";
 import { loadEnv } from "./config/env";
 import {
@@ -26,6 +26,7 @@ import { ManifestService } from "./manifests/manifest-service";
 import { makeDbosEnqueuer } from "./jobs/enqueuer";
 import { ProjectJobsService } from "./jobs/project-jobs-service";
 import { AiGenerationsService } from "./ai/ai-generations-service";
+import { ModelCatalogueService } from "./ai/model-catalogue-service";
 import { makeGithubUserAuthClient } from "./connections/github-user-auth-client";
 import { RepoProvisioningService } from "./projects/repo-provisioning-service";
 import { RendersService } from "./renders/renders-service";
@@ -124,6 +125,26 @@ async function main(): Promise<void> {
   });
 
   const connectionsService = new ConnectionsService({ prisma });
+
+  // The live AI model catalogue behind the studio Inspector's model selectors and cost
+  // estimate (genesis-1, items 1 and 3). The credential loader is the reason this endpoint
+  // is here and not in the nextjs BFF: Gloo's `/platform/v2/models` needs a bearer minted
+  // from the user's client credentials, and only this service can decrypt them.
+  const modelCatalogueService = new ModelCatalogueService({
+    openrouterBaseUrl: env.OPENROUTER_BASE_URL,
+    glooBaseUrl: env.GLOO_BASE_URL,
+    loadGlooCredential: async (userId: string) => {
+      const row = await prisma.glooConnection.findUnique({ where: { userId } });
+      if (!row) return null;
+      return {
+        clientId: row.clientId,
+        clientSecret: decryptSecret(
+          row.clientSecretCiphertext,
+          env.SECRETS_ENCRYPTION_KEY,
+        ),
+      };
+    },
+  });
 
   // Presign against the PUBLIC endpoint (browser-reachable). forcePathStyle is
   // applied inside the factory. The API only ever builds the `presign` client;
@@ -273,6 +294,7 @@ async function main(): Promise<void> {
     manifests: { service: manifestService },
     projectJobs: { service: projectJobsService },
     aiGenerations: { service: aiGenerationsService },
+    aiModels: { service: modelCatalogueService },
     repoProvisioning: { service: repoProvisioningService },
     renders: { service: rendersService },
     gallery: { service: galleryService },
