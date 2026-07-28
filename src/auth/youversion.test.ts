@@ -1,185 +1,266 @@
-import { describe, it, expect } from "vitest";
-import { makeYouVersionVerifier } from "./youversion";
+import { describe, expect, it, beforeAll } from "vitest";
+import {
+  SignJWT,
+  createLocalJWKSet,
+  exportJWK,
+  generateKeyPair,
+  type JWK,
+  type KeyLike,
+} from "jose";
+import {
+  makeYouVersionVerifier,
+  youVersionEndpointsFrom,
+  youVersionUserFields,
+} from "./youversion";
 
-// The YouVersion access-token verifier (contract: scratch/auth-and-sessions.md §0).
-// Unit-tested with an INJECTED fetch (fake) — no network. The real stub over real
-// HTTP is exercised by tests/e2e/auth.e2e.ts (no mocking there).
-function fakeFetch(
-  handler: (url: string, init?: RequestInit) => Response,
-): typeof fetch {
-  return (async (input: string | URL, init?: RequestInit) =>
-    handler(String(input), init)) as unknown as typeof fetch;
+/**
+ * These drive the REAL jose verification path. Only key RETRIEVAL is local — the
+ * signature check, `alg` pinning, `iss` matching and `exp` handling all execute for
+ * real, because those are our settings and are exactly what a stubbed verifier would
+ * stop proving.
+ *
+ * Replaces the previous suite, which characterized a `GET /auth/v1/userinfo` contract
+ * that was invented and does not exist (404 live). Those tests passed against a fiction:
+ * every one of them stayed green while production 500'd on every sign-in.
+ */
+
+const ISSUER = "https://api.youversion.com/auth/token";
+
+let privateKey: KeyLike;
+let publicJwk: JWK;
+/** A second, unrelated keypair — used to forge a correctly-shaped but wrongly-signed token. */
+let attackerKey: KeyLike;
+
+beforeAll(async () => {
+  const pair = await generateKeyPair("RS256");
+  privateKey = pair.privateKey;
+  publicJwk = await exportJWK(pair.publicKey);
+  publicJwk.alg = "RS256";
+  publicJwk.use = "sig";
+
+  attackerKey = (await generateKeyPair("RS256")).privateKey;
+});
+
+/** A verifier wired to the local key set, otherwise configured exactly as production. */
+function verifier(overrides: { clockToleranceSec?: number } = {}) {
+  return makeYouVersionVerifier({
+    ...youVersionEndpointsFrom("https://api.youversion.com"),
+    keySet: createLocalJWKSet({ keys: [publicJwk] }),
+    ...overrides,
+  });
 }
 
-const USERINFO = {
-  id: "yv-user-1001",
-  first_name: "Ada",
-  last_name: "Lovelace",
-  email: "ada@example.test",
-  avatar_url: "https://cdn.example.test/avatars/ada.png",
-};
+interface TokenOptions {
+  sub?: string;
+  issuer?: string;
+  expiresIn?: string;
+  issuedAt?: number;
+  key?: KeyLike;
+}
 
-describe("makeYouVersionVerifier", () => {
-  it("calls GET {base}/auth/v1/userinfo with the forwarded bearer token", async () => {
-    let seenUrl = "";
-    let seenAuth: string | undefined;
-    const verify = makeYouVersionVerifier({
-      baseUrl: "http://youversion-stub:8080",
-      fetchImpl: fakeFetch((url, init) => {
-        seenUrl = url;
-        const headers = new Headers(init?.headers);
-        seenAuth = headers.get("authorization") ?? undefined;
-        return new Response(JSON.stringify(USERINFO), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      }),
-    });
+async function token(opts: TokenOptions = {}): Promise<string> {
+  const jwt = new SignJWT({ scope: "email profile openid" })
+    .setProtectedHeader({ alg: "RS256" })
+    .setIssuer(opts.issuer ?? ISSUER)
+    .setIssuedAt(opts.issuedAt)
+    .setExpirationTime(opts.expiresIn ?? "1h");
+  if (opts.sub !== undefined) jwt.setSubject(opts.sub);
+  return jwt.sign(opts.key ?? privateKey);
+}
 
-    await verify("access-abc");
-
-    expect(seenUrl).toBe("http://youversion-stub:8080/auth/v1/userinfo");
-    expect(seenAuth).toBe("Bearer access-abc");
-  });
-
-  it("maps userinfo onto the User shape (id, displayName, email, initials)", async () => {
-    const verify = makeYouVersionVerifier({
-      baseUrl: "http://yv",
-      fetchImpl: fakeFetch(
-        () => new Response(JSON.stringify(USERINFO), { status: 200 }),
-      ),
-    });
-
-    const info = await verify("access-abc");
-
-    expect(info).toEqual({
-      youversionUserId: "yv-user-1001",
-      displayName: "Ada Lovelace",
-      email: "ada@example.test",
-      avatarInitials: "AL",
+describe("makeYouVersionVerifier — accepts a genuine token", () => {
+  it("returns the subject from a correctly signed token", async () => {
+    const sub = "a8feb12c-3873-4a9a-8b08-d9f765b7ca1e";
+    await expect(verifier()(await token({ sub }))).resolves.toEqual({
+      youversionUserId: sub,
     });
   });
 
-  it("returns null on a 401 (invalid/expired access token)", async () => {
-    const verify = makeYouVersionVerifier({
-      baseUrl: "http://yv",
-      fetchImpl: fakeFetch(
-        () =>
-          new Response(JSON.stringify({ error: "invalid_token" }), {
-            status: 401,
-          }),
-      ),
+  /** The shape a real YouVersion access token has — no profile claims anywhere. */
+  it("does not require any profile claim to be present", async () => {
+    const jwt = await new SignJWT({
+      scope: "email profile openid",
+      client_id: "ByJ9zK1Np6T66nTKGxTmbR28djFPAZ234IEfeCNznKiQ0VTN",
+      jti: "ef3953e4-85a4-48c2-9cd4-1b8d7e045c37",
+    })
+      .setProtectedHeader({ alg: "RS256", typ: "at+JWT" })
+      .setIssuer(ISSUER)
+      .setSubject("user-1")
+      .setIssuedAt()
+      .setExpirationTime("1h")
+      .sign(privateKey);
+    await expect(verifier()(jwt)).resolves.toEqual({
+      youversionUserId: "user-1",
     });
-    expect(await verify("bad")).toBeNull();
+  });
+});
+
+describe("makeYouVersionVerifier — rejects with null (⇒ 401)", () => {
+  /** The attack this exists to stop: a well-formed token signed by someone else. */
+  it("rejects a token signed by a DIFFERENT key", async () => {
+    const forged = await token({ sub: "user-1", key: attackerKey });
+    await expect(verifier()(forged)).resolves.toBeNull();
   });
 
-  it("throws on an unexpected upstream error (5xx)", async () => {
-    const verify = makeYouVersionVerifier({
-      baseUrl: "http://yv",
-      fetchImpl: fakeFetch(() => new Response("boom", { status: 500 })),
+  it("rejects an expired token", async () => {
+    const stale = await token({
+      sub: "user-1",
+      issuedAt: Math.floor(Date.now() / 1000) - 7200,
+      expiresIn: "-1h",
     });
-    await expect(verify("x")).rejects.toThrow();
+    await expect(verifier()(stale)).resolves.toBeNull();
   });
 
-  // --- Edge cases of the documented (invented) userinfo contract (Task 34-E6). ---
-  // NOTE: these pin the SHIPPED verifier's invented `GET /auth/v1/userinfo` contract
-  // (fields id/first_name/last_name/email/avatar_url). The REAL YouVersion sign-in is
-  // JWT-claims-based (no userinfo GET); rewriting the verifier to match is a scoped
-  // follow-up (see the 34-E6 report). Until then, these characterize what ships.
-
-  it("stringifies a NUMERIC id (the union+transform branch) → youversionUserId", async () => {
-    const verify = makeYouVersionVerifier({
-      baseUrl: "http://yv",
-      fetchImpl: fakeFetch(
-        () =>
-          new Response(
-            JSON.stringify({ ...USERINFO, id: 1234567 }),
-            { status: 200 },
-          ),
-      ),
-    });
-    const info = await verify("access-abc");
-    expect(info?.youversionUserId).toBe("1234567");
+  it("rejects a token from the wrong issuer", async () => {
+    const wrong = await token({ sub: "user-1", issuer: "https://evil.example" });
+    await expect(verifier()(wrong)).resolves.toBeNull();
   });
 
-  it("with NO first/last name → displayName falls back to email, initials from email", async () => {
-    const verify = makeYouVersionVerifier({
-      baseUrl: "http://yv",
-      fetchImpl: fakeFetch(
-        () =>
-          new Response(
-            JSON.stringify({ id: "yv-2", email: "grace@hopper.test" }),
-            { status: 200 },
-          ),
-      ),
-    });
-    const info = await verify("access-abc");
-    expect(info?.displayName).toBe("grace@hopper.test");
-    // initialsFrom's fallback: first two alphanumerics of the display name, upper.
-    expect(info?.avatarInitials).toBe("GR");
+  /**
+   * `sub` is the User table's `@unique` key. A signature-valid token without one
+   * identifies nobody, and accepting it would key a row on an empty string.
+   */
+  it("rejects a valid signature with no sub", async () => {
+    await expect(verifier()(await token({}))).resolves.toBeNull();
   });
 
-  it("with only a first name → displayName is that name, a single initial", async () => {
-    const verify = makeYouVersionVerifier({
-      baseUrl: "http://yv",
-      fetchImpl: fakeFetch(
-        () =>
-          new Response(
-            JSON.stringify({
-              id: "yv-3",
-              first_name: "Madonna",
-              email: "m@example.test",
-            }),
-            { status: 200 },
-          ),
-      ),
-    });
-    const info = await verify("access-abc");
-    expect(info?.displayName).toBe("Madonna");
-    expect(info?.avatarInitials).toBe("M");
+  it("rejects a blank sub", async () => {
+    await expect(verifier()(await token({ sub: "   " }))).resolves.toBeNull();
   });
 
-  it("normalizes a trailing slash in baseUrl (no double slash in the request URL)", async () => {
-    let seenUrl = "";
-    const verify = makeYouVersionVerifier({
-      baseUrl: "http://yv/",
-      fetchImpl: fakeFetch((url) => {
-        seenUrl = url;
-        return new Response(JSON.stringify(USERINFO), { status: 200 });
-      }),
+  it.each(["", "   ", "not-a-jwt", "a.b", "a.b.c"])(
+    "rejects the malformed token %j without throwing",
+    async (bad) => {
+      await expect(verifier()(bad)).resolves.toBeNull();
+    },
+  );
+
+  /** `alg: none` — the canonical JWT bypass. Pinning `algorithms` is what stops it. */
+  it("rejects an unsigned alg:none token", async () => {
+    const header = Buffer.from(
+      JSON.stringify({ alg: "none", typ: "JWT" }),
+    ).toString("base64url");
+    const body = Buffer.from(
+      JSON.stringify({ sub: "user-1", iss: ISSUER, exp: 4102444800 }),
+    ).toString("base64url");
+    await expect(verifier()(`${header}.${body}.`)).resolves.toBeNull();
+  });
+});
+
+describe("makeYouVersionVerifier — clock tolerance", () => {
+  it("accepts a token that expired within the tolerance window", async () => {
+    const justExpired = await token({
+      sub: "user-1",
+      issuedAt: Math.floor(Date.now() / 1000) - 60,
+      expiresIn: "-10s",
     });
-    await verify("access-abc");
-    expect(seenUrl).toBe("http://yv/auth/v1/userinfo");
+    await expect(
+      verifier({ clockToleranceSec: 120 })(justExpired),
+    ).resolves.toEqual({ youversionUserId: "user-1" });
   });
 
-  it("throws on a malformed body missing the required email field", async () => {
-    const verify = makeYouVersionVerifier({
-      baseUrl: "http://yv",
-      fetchImpl: fakeFetch(
-        () =>
-          new Response(JSON.stringify({ id: "yv-4", first_name: "No" }), {
-            status: 200,
-          }),
-      ),
+  it("still rejects one that expired well outside it", async () => {
+    const longGone = await token({
+      sub: "user-1",
+      issuedAt: Math.floor(Date.now() / 1000) - 7200,
+      expiresIn: "-1h",
     });
-    await expect(verify("access-abc")).rejects.toThrow();
+    await expect(
+      verifier({ clockToleranceSec: 120 })(longGone),
+    ).resolves.toBeNull();
+  });
+});
+
+describe("makeYouVersionVerifier — outage vs rejection", () => {
+  /**
+   * The distinction that keeps an outage from logging everyone out: a key set that
+   * cannot answer must THROW (⇒ 5xx), not return null (⇒ 401 "your token is bad").
+   */
+  it("propagates a key-retrieval failure instead of returning null", async () => {
+    const verify = makeYouVersionVerifier({
+      ...youVersionEndpointsFrom("https://api.youversion.com"),
+      keySet: () => {
+        throw new Error("JWKS unreachable");
+      },
+    });
+    await expect(verify(await token({ sub: "user-1" }))).rejects.toThrow(
+      /JWKS unreachable/,
+    );
+  });
+});
+
+describe("youVersionEndpointsFrom", () => {
+  it("derives the live issuer and JWKS URL from the default base", () => {
+    expect(youVersionEndpointsFrom("https://api.youversion.com")).toEqual({
+      issuer: "https://api.youversion.com/auth/token",
+      jwksUrl: "https://api.youversion.com/.well-known/jwks.json",
+    });
   });
 
-  it("throws when a 200 response body is not valid JSON", async () => {
-    const verify = makeYouVersionVerifier({
-      baseUrl: "http://yv",
-      fetchImpl: fakeFetch(() => new Response("<<not json>>", { status: 200 })),
-    });
-    await expect(verify("access-abc")).rejects.toThrow();
+  it("normalizes a trailing slash", () => {
+    expect(youVersionEndpointsFrom("https://api.youversion.com/").jwksUrl).toBe(
+      "https://api.youversion.com/.well-known/jwks.json",
+    );
   });
 
-  it("throws on a non-401 client error (403) — only 401 maps to null", async () => {
-    const verify = makeYouVersionVerifier({
-      baseUrl: "http://yv",
-      fetchImpl: fakeFetch(
-        () => new Response(JSON.stringify({ error: "forbidden" }), { status: 403 }),
-      ),
+  /** JWKS is at the ROOT well-known path; `/auth/.well-known/jwks.json` 404s. */
+  it("puts JWKS at the root well-known path, not under /auth", () => {
+    const { jwksUrl } = youVersionEndpointsFrom("https://api.youversion.com");
+    expect(jwksUrl).not.toContain("/auth/.well-known");
+  });
+});
+
+describe("youVersionUserFields — unverified display fields", () => {
+  it("uses the supplied name and email", () => {
+    expect(
+      youVersionUserFields({ name: "Ash Srinivas", email: "ash@example.com" }),
+    ).toEqual({
+      displayName: "Ash Srinivas",
+      email: "ash@example.com",
+      avatarInitials: "AS",
     });
-    await expect(verify("access-abc")).rejects.toThrow();
+  });
+
+  it("falls back to the email as a display name when there is no name", () => {
+    const fields = youVersionUserFields({ email: "ash@example.com" });
+    expect(fields.displayName).toBe("ash@example.com");
+    expect(fields.email).toBe("ash@example.com");
+  });
+
+  /** The columns are NOT NULL, so a sparse profile must still produce a storable row. */
+  it("produces a storable row from an entirely absent profile", () => {
+    expect(youVersionUserFields(undefined)).toEqual({
+      displayName: "YouVersion user",
+      email: "",
+      avatarInitials: "YU",
+    });
+  });
+
+  it("produces a storable row from an empty profile object", () => {
+    expect(youVersionUserFields({})).toEqual({
+      displayName: "YouVersion user",
+      email: "",
+      avatarInitials: "YU",
+    });
+  });
+
+  it("ignores whitespace-only fields", () => {
+    expect(youVersionUserFields({ name: "   ", email: "  " }).displayName).toBe(
+      "YouVersion user",
+    );
+  });
+
+  it("takes one initial from a single-word name", () => {
+    expect(youVersionUserFields({ name: "Ash" }).avatarInitials).toBe("A");
+  });
+
+  it("takes at most two initials", () => {
+    expect(
+      youVersionUserFields({ name: "Ash Vijay Srinivas" }).avatarInitials,
+    ).toBe("AV");
+  });
+
+  it("never returns empty initials, even for a symbol-only name", () => {
+    expect(youVersionUserFields({ name: "!!!" }).avatarInitials).toBe("YV");
   });
 });

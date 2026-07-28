@@ -3,6 +3,7 @@ import type {
   Session,
   TestSeedRequest,
   User,
+  YouVersionSignInProfile,
 } from "@supagloo/database-lib";
 import { UnauthorizedError } from "./errors";
 import {
@@ -12,7 +13,7 @@ import {
   isExpired,
   slidingExpiry,
 } from "./tokens";
-import type { YouVersionVerifier } from "./youversion";
+import { youVersionUserFields, type YouVersionVerifier } from "./youversion";
 
 /**
  * All auth/session data-access + policy (design-delta §2.1/§2.2/§6a/§9-Q6). Kept
@@ -61,16 +62,27 @@ export class AuthService {
    * `firstSignInAt`), mint an opaque session, and persist only its hash. Returns
    * the raw token, the user, and `firstSignIn` (true iff the row was created).
    * Throws {@link UnauthorizedError} when the access token is invalid.
+   *
+   * Two sources of very different standing meet here, and the split is the point.
+   * `youversionUserId` comes from `sub` on a SIGNATURE-VERIFIED token and is the sole
+   * key this method looks up, creates and updates by. `profile` is whatever the browser
+   * said — unverified, unverifiable (the token carries no profile claims and the
+   * provider exposes no userinfo endpoint), and used ONLY for the display columns.
+   * A caller who lies about `profile` renames their own row and reaches nothing else.
    */
-  async signIn(accessToken: string): Promise<SignInResult> {
-    const info = await this.verifyToken(accessToken);
-    if (!info) throw new UnauthorizedError("invalid YouVersion access token");
+  async signIn(
+    accessToken: string,
+    profile?: YouVersionSignInProfile,
+  ): Promise<SignInResult> {
+    const identity = await this.verifyToken(accessToken);
+    if (!identity) throw new UnauthorizedError("invalid YouVersion access token");
 
+    const fields = youVersionUserFields(profile);
     const now = this.clock();
     const updateData = {
-      displayName: info.displayName,
-      email: info.email,
-      avatarInitials: info.avatarInitials,
+      displayName: fields.displayName,
+      email: fields.email,
+      avatarInitials: fields.avatarInitials,
       lastSeenAt: now,
     };
 
@@ -79,14 +91,14 @@ export class AuthService {
     // concurrent first-sign-in race (both branches see no row) degrades to an
     // update instead of a 500.
     const existing = await this.prisma.user.findUnique({
-      where: { youversionUserId: info.youversionUserId },
+      where: { youversionUserId: identity.youversionUserId },
     });
 
     let user: User;
     let firstSignIn: boolean;
     if (existing) {
       user = await this.prisma.user.update({
-        where: { youversionUserId: info.youversionUserId },
+        where: { youversionUserId: identity.youversionUserId },
         data: updateData,
       });
       firstSignIn = false;
@@ -94,10 +106,10 @@ export class AuthService {
       try {
         user = await this.prisma.user.create({
           data: {
-            youversionUserId: info.youversionUserId,
-            displayName: info.displayName,
-            email: info.email,
-            avatarInitials: info.avatarInitials,
+            youversionUserId: identity.youversionUserId,
+            displayName: fields.displayName,
+            email: fields.email,
+            avatarInitials: fields.avatarInitials,
             firstSignInAt: now,
             lastSeenAt: now,
           },
@@ -106,7 +118,7 @@ export class AuthService {
       } catch (err) {
         if (!isUniqueViolation(err)) throw err;
         user = await this.prisma.user.update({
-          where: { youversionUserId: info.youversionUserId },
+          where: { youversionUserId: identity.youversionUserId },
           data: updateData,
         });
         firstSignIn = false;
