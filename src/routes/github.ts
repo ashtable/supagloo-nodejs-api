@@ -2,18 +2,24 @@ import type { FastifyInstance } from "fastify";
 import type { ZodTypeProvider } from "fastify-type-provider-zod";
 import { z } from "zod";
 import {
+  GithubAuthorizeUrlQuerySchema,
+  GithubAuthorizeUrlResponseSchema,
   GithubCallbackRequestSchema,
   GithubConnectionResponseSchema,
   GithubDisconnectResponseSchema,
   GithubInstallUrlResponseSchema,
+  GithubLinkExistingRequestSchema,
   GithubRepoFilterSchema,
   GithubRepoListResponseSchema,
 } from "@supagloo/database-lib";
 import type { GithubConnectionService } from "../connections/github-connection-service";
 import {
+  AmbiguousUserInstallationError,
   GithubNotConnectedError,
   InstallationVerificationError,
+  NoUserInstallationError,
 } from "../connections/errors";
+import { GithubUserAuthExchangeError } from "../connections/github-user-auth-client";
 import {
   GITHUB_UPSTREAM_ERROR_SLUG,
   GITHUB_UPSTREAM_STATUS,
@@ -58,6 +64,86 @@ export function registerGithubConnectionRoutes(
       },
     },
     async () => ({ url: service.installUrl() }),
+  );
+
+  // ---- linking an installation the user ALREADY has ------------------------
+  // The install callback only fires when an installation is CREATED, so these two
+  // are the only path for a reinstall, an install made from GitHub's directory, or
+  // one App registration shared across environments.
+  r.get(
+    "/connections/github/authorize-url",
+    {
+      preHandler: app.requireAuth,
+      schema: {
+        querystring: GithubAuthorizeUrlQuerySchema,
+        response: {
+          200: GithubAuthorizeUrlResponseSchema,
+          401: errorResponseSchema,
+        },
+      },
+    },
+    async (req) => ({
+      url: service.authorizeUrl({
+        redirectUri: req.query.redirectUri,
+        state: req.query.state,
+      }),
+    }),
+  );
+
+  r.post(
+    "/connections/github/link-existing",
+    {
+      preHandler: app.requireAuth,
+      schema: {
+        body: GithubLinkExistingRequestSchema,
+        response: {
+          200: GithubConnectionResponseSchema,
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          409: errorResponseSchema,
+          502: errorResponseSchema,
+        },
+      },
+    },
+    async (req, reply) => {
+      try {
+        const connection = await service.linkExisting(
+          req.authUser!.id,
+          req.body.code,
+        );
+        return { connection: toGithubConnectionDto(connection) };
+      } catch (err) {
+        // "You have no installation" and "several match" are both account STATE the
+        // caller resolves by visiting the picker — not malformed input, and not our
+        // outage. They carry distinct slugs so the UI can say which.
+        if (err instanceof NoUserInstallationError) {
+          return reply
+            .code(err.statusCode)
+            .send({ error: "no_installation", message: err.message });
+        }
+        if (err instanceof AmbiguousUserInstallationError) {
+          return reply
+            .code(err.statusCode)
+            .send({ error: "ambiguous_installation", message: err.message });
+        }
+        if (err instanceof InstallationVerificationError) {
+          return reply
+            .code(400)
+            .send({ error: "invalid_installation", message: err.message });
+        }
+        if (err instanceof GithubUserAuthExchangeError) {
+          return reply
+            .code(400)
+            .send({ error: "invalid_code", message: err.message });
+        }
+        if (isUpstreamGithubError(err)) {
+          return reply
+            .code(GITHUB_UPSTREAM_STATUS)
+            .send({ error: GITHUB_UPSTREAM_ERROR_SLUG, message: err.message });
+        }
+        throw err;
+      }
+    },
   );
 
   r.post(

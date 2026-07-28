@@ -550,3 +550,115 @@ describe("makeGithubUserAuthClient.listInstallationRepos", () => {
     ).rejects.toThrow(/401.*Requires authentication/);
   });
 });
+
+describe("makeGithubUserAuthClient.listUserInstallations", () => {
+  const page = (installations: unknown[], link?: string) =>
+    new Response(JSON.stringify({ total_count: installations.length, installations }), {
+      status: 200,
+      headers: link
+        ? { "content-type": "application/json", link }
+        : { "content-type": "application/json" },
+    });
+
+  it("reads id, account login and target type, and sends the USER token", async () => {
+    const { fetchImpl, calls } = recordingFetch(() =>
+      page([
+        { id: 148906100, target_type: "User", account: { login: "ashtable", type: "User" } },
+      ]),
+    );
+
+    const out = await makeClient(fetchImpl).listUserInstallations("ghu_abc");
+
+    expect(out).toEqual([
+      { installationId: "148906100", accountLogin: "ashtable", targetType: "User" },
+    ]);
+    expect(calls[0]!.url).toBe("https://api.github.com/user/installations?per_page=100");
+    // A USER token, not an App JWT — this endpoint is user-to-server only.
+    expect(calls[0]!.auth).toBe("token ghu_abc");
+  });
+
+  /** GitHub sends `id` numerically; the Prisma column is a String. */
+  it("normalizes a numeric id to a string", async () => {
+    const { fetchImpl } = recordingFetch(() =>
+      page([{ id: 42, target_type: "User", account: { login: "a" } }]),
+    );
+    const out = await makeClient(fetchImpl).listUserInstallations("ghu_abc");
+    expect(out[0]!.installationId).toBe("42");
+  });
+
+  it("falls back to account.type when target_type is absent", async () => {
+    const { fetchImpl } = recordingFetch(() =>
+      page([{ id: 1, account: { login: "acme", type: "Organization" } }]),
+    );
+    const out = await makeClient(fetchImpl).listUserInstallations("ghu_abc");
+    expect(out[0]!.targetType).toBe("Organization");
+  });
+
+  it("yields a null targetType when GitHub sends neither field", async () => {
+    const { fetchImpl } = recordingFetch(() =>
+      page([{ id: 1, account: { login: "acme" } }]),
+    );
+    const out = await makeClient(fetchImpl).listUserInstallations("ghu_abc");
+    expect(out[0]!.targetType).toBeNull();
+  });
+
+  it("survives a null account without throwing", async () => {
+    const { fetchImpl } = recordingFetch(() => page([{ id: 1, account: null }]));
+    const out = await makeClient(fetchImpl).listUserInstallations("ghu_abc");
+    expect(out).toEqual([
+      { installationId: "1", accountLogin: "", targetType: null },
+    ]);
+  });
+
+  it("returns an empty array when the user has no installations", async () => {
+    const { fetchImpl } = recordingFetch(() => page([]));
+    await expect(makeClient(fetchImpl).listUserInstallations("ghu_abc")).resolves.toEqual(
+      [],
+    );
+  });
+
+  it("walks Link: rel=next and concatenates the pages", async () => {
+    const { fetchImpl, calls } = recordingFetch((url) =>
+      url.includes("page=2")
+        ? page([{ id: 2, target_type: "Organization", account: { login: "b" } }])
+        : page(
+            [{ id: 1, target_type: "User", account: { login: "a" } }],
+            '<https://api.github.com/user/installations?per_page=100&page=2>; rel="next"',
+          ),
+    );
+
+    const out = await makeClient(fetchImpl).listUserInstallations("ghu_abc");
+
+    expect(out.map((i) => i.installationId)).toEqual(["1", "2"]);
+    expect(calls).toHaveLength(2);
+  });
+
+  /** A malformed Link header must not spin forever inside a request a browser waits on. */
+  it("refuses to walk more than 20 pages", async () => {
+    const { fetchImpl } = recordingFetch(() =>
+      page(
+        [{ id: 1, target_type: "User", account: { login: "a" } }],
+        // Always points at a next page — the pathological header.
+        '<https://api.github.com/user/installations?per_page=100&page=99>; rel="next"',
+      ),
+    );
+
+    await expect(
+      makeClient(fetchImpl).listUserInstallations("ghu_abc"),
+    ).rejects.toThrow(/exceeded 20 pages/);
+  });
+
+  it("throws with the status when GitHub rejects the read", async () => {
+    const { fetchImpl } = recordingFetch(
+      () =>
+        new Response(JSON.stringify({ message: "Bad credentials" }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+
+    await expect(
+      makeClient(fetchImpl).listUserInstallations("ghu_bad"),
+    ).rejects.toThrow(/list-user-installations failed: 401/);
+  });
+});
