@@ -1,7 +1,9 @@
 import { AI_PROVIDERS_BY_KIND } from "@supagloo/database-lib";
 import {
   filterByMatrix,
+  narrowToSelectableKinds,
   toGlooCatalogueEntry,
+  toOpenRouterAudioEntry,
   toOpenRouterCatalogueEntry,
   toOpenRouterSpeechEntry,
   toOpenRouterVideoEntry,
@@ -20,9 +22,11 @@ import {
  * costs the Gloo models, a dead video catalogue costs the video models, and a dead
  * network yields an empty list — always a 200-shaped answer.
  *
- * One distinction is deliberately preserved: `providers.gloo` reports whether the user is
- * CONNECTED, not whether the read succeeded. Collapsing the two would make the Inspector
- * tell someone who has already linked Gloo to go and link it.
+ * One distinction is deliberately preserved: `providers.*` reports whether the user is
+ * CONNECTED, not whether that provider's catalogue read succeeded. Collapsing the two
+ * would make the Inspector tell someone who has already linked a provider to go and link
+ * it. Both flags are answered by an injected connection read — `openrouter` was a
+ * hardcoded `true` until 2026-07-28, which was the same lie in the opposite direction.
  *
  * ── Why the credential loader is injected ───────────────────────────────────────────
  * Gloo's catalogue needs a bearer minted from the user's client credentials, which are
@@ -31,7 +35,7 @@ import {
  * unit-testable without Prisma, and keeps decryption in exactly one place.
  *
  * ── The cache ───────────────────────────────────────────────────────────────────────
- * The studio reads this on every open. A cold read is four upstream round trips (three
+ * The studio reads this on every open. A cold read is five upstream round trips (four
  * OpenRouter catalogues, plus a Gloo mint and catalogue) and the catalogues change on the
  * order of days, so a short process-level TTL is the right trade. Keyed PER USER: the
  * Gloo half is fetched with the caller's own bearer, so a shared key would serve one
@@ -57,6 +61,16 @@ export interface ModelCatalogueServiceOptions {
   glooBaseUrl: string;
   /** Resolve the caller's Gloo client credentials, or null when not connected. */
   loadGlooCredential: (userId: string) => Promise<GlooCredential | null>;
+  /**
+   * Whether the caller has an OpenRouter connection. REQUIRED, not optional with a
+   * default: this field used to be a hardcoded `true`, so `providers.openrouter` asserted
+   * a connection the service had never checked. A required option is what makes
+   * forgetting it a compile error, which a defaulted one would not.
+   *
+   * Unlike Gloo's loader, no credential is read — the catalogue OpenRouter serves us is
+   * public, so this answers the CONNECTION question only.
+   */
+  hasOpenRouterConnection: (userId: string) => Promise<boolean>;
   fetchImpl?: typeof fetch;
   /** Defaults to the shared db-lib matrix; injectable so the filtering RULE can be
    *  tested independently of the constant's current value. */
@@ -118,32 +132,47 @@ export class ModelCatalogueService {
     const fetchImpl = this.opts.fetchImpl ?? fetch;
     const or = trimSlash(this.opts.openrouterBaseUrl);
 
-    const glooCredential = await this.opts
-      .loadGlooCredential(userId)
-      .catch(() => null);
+    // Both connection reads are contained the same way and in the same DIRECTION: an
+    // unreadable connection degrades to not-connected. Failing the whole response instead
+    // would cost the picker entirely — a 500 here leaves the Inspector with no provider
+    // list and no cost row, which is strictly worse than one provider reading unlinked.
+    const [glooCredential, openrouterConnected] = await Promise.all([
+      this.opts.loadGlooCredential(userId).catch(() => null),
+      this.opts.hasOpenRouterConnection(userId).catch(() => false),
+    ]);
 
-    const [chat, speech, video, gloo] = await Promise.all([
+    // Five reads, four of them OpenRouter's four separate catalogues. `speech` and `audio`
+    // are DIFFERENT lists that share no id: narration is served by `POST
+    // /api/v1/audio/speech` (the speech catalogue) and music by the streaming `POST
+    // /api/v1/chat/completions` (the audio catalogue, where the Lyria models live). Reading
+    // only `speech` and stamping its entries with both kinds — which is what this did until
+    // 2026-07-28 — filled the music picker with batch-TTS ids that the music path 400s on.
+    const [chat, speech, audio, video, gloo] = await Promise.all([
       readCatalogue(fetchImpl, `${or}/api/v1/models`),
       readCatalogue(fetchImpl, `${or}/api/v1/models?output_modalities=speech`),
+      readCatalogue(fetchImpl, `${or}/api/v1/models?output_modalities=audio`),
       readCatalogue(fetchImpl, `${or}/api/v1/videos/models`),
       glooCredential
         ? this.readGlooCatalogue(fetchImpl, glooCredential)
         : Promise.resolve([]),
     ]);
 
-    const models = filterByMatrix(
-      [
-        ...chat.map((r) => toOpenRouterCatalogueEntry(r as never)),
-        ...speech.map((r) => toOpenRouterSpeechEntry(r as never)),
-        ...video.map((r) => toOpenRouterVideoEntry(r as never)),
-        ...gloo.map((r) => toGlooCatalogueEntry(r as never)),
-      ],
-      this.matrix,
+    const models = narrowToSelectableKinds(
+      filterByMatrix(
+        [
+          ...chat.map((r) => toOpenRouterCatalogueEntry(r as never)),
+          ...speech.map((r) => toOpenRouterSpeechEntry(r as never)),
+          ...audio.map((r) => toOpenRouterAudioEntry(r as never)),
+          ...video.map((r) => toOpenRouterVideoEntry(r as never)),
+          ...gloo.map((r) => toGlooCatalogueEntry(r as never)),
+        ],
+        this.matrix,
+      ),
     );
 
     return {
       models,
-      providers: { gloo: glooCredential !== null, openrouter: true },
+      providers: { gloo: glooCredential !== null, openrouter: openrouterConnected },
     };
   }
 

@@ -144,6 +144,12 @@ async function main(): Promise<void> {
         ),
       };
     },
+    // OpenRouter's catalogue is public, so nothing is decrypted here — this answers only
+    // "has this user connected OpenRouter", which is what the DTO and its nextjs mirror
+    // both document the field to mean. Same row `ConnectionsService.readAll` reads;
+    // presence IS the connection (design-delta §2.4).
+    hasOpenRouterConnection: async (userId: string) =>
+      (await prisma.openRouterConnection.findUnique({ where: { userId } })) !== null,
   });
 
   // Presign against the PUBLIC endpoint (browser-reachable). forcePathStyle is

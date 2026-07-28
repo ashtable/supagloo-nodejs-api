@@ -170,6 +170,14 @@ describe("AiGenerationsService.createGeneration", () => {
     expect(has(fake.calls, "project.findFirst")).toBe(false);
   });
 
+  // The pair here is deliberately `narration`+`gloo`, NOT `image`+`gloo`. Per decision D1
+  // (genesis-1 Inspector, 2026-07-28) Gloo DOES generate images — `AI_PROVIDERS_BY_KIND.image`
+  // now reads `["gloo","openrouter"]` — so `image`+`gloo` is no longer an out-of-matrix
+  // example and a fixture built on it would assert the OPPOSITE of the shipped matrix the
+  // moment the db-lib gitlink moves. `narration`+`gloo` is openrouter-only in BOTH the
+  // pre-D1 and post-D1 matrices (Gloo has no speech models at all: zero catalogue matches
+  // and `/ai/v2/audio/speech` answers 404, not 405), so this fixture survives the bump and
+  // still discriminates.
   it("422s an out-of-matrix {kind, provider} pair BEFORE any row or enqueue", async () => {
     const fake = makeFake({ project: { id: "proj-1", ownerId: "u1" } });
     const enq = makeEnqueueRecorder();
@@ -179,10 +187,13 @@ describe("AiGenerationsService.createGeneration", () => {
     });
     await expect(
       service.createGeneration("u1", {
-        kind: "image",
+        kind: "narration",
         provider: "gloo",
         model: "m",
-        input: { prompt: "x" },
+        input: {
+          voice: { description: "warm, unhurried" },
+          scenes: [{ sceneId: "s1", scriptText: "In the beginning" }],
+        },
         projectId: "proj-1",
       }),
     ).rejects.toBeInstanceOf(KindProviderIncompatibleError);

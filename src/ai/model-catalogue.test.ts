@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   filterByMatrix,
   kindsForGlooModel,
+  narrowToSelectableKinds,
   kindsForOpenRouterModel,
   toGlooCatalogueEntry,
+  toOpenRouterAudioEntry,
   toOpenRouterCatalogueEntry,
   toOpenRouterSpeechEntry,
   toOpenRouterVideoEntry,
@@ -105,8 +107,8 @@ describe("kindsForOpenRouterModel (U-MC1)", () => {
   });
 });
 
-describe("toOpenRouterSpeechEntry / toOpenRouterVideoEntry (U-MC1)", () => {
-  it("a speech-catalogue entry is the `narration` kind, priced on `prompt`", () => {
+describe("toOpenRouterSpeechEntry / toOpenRouterAudioEntry / toOpenRouterVideoEntry (U-MC1)", () => {
+  it("a speech-catalogue entry is the `narration` kind ONLY, priced on `prompt`", () => {
     // The dedicated `output_modalities=speech` catalogue prices on `prompt` with
     // `completion: "0"` — a different rule from the chat-audio models, which price on
     // `audio`/`completion`. Verified live 2026-07-27.
@@ -114,8 +116,49 @@ describe("toOpenRouterSpeechEntry / toOpenRouterVideoEntry (U-MC1)", () => {
       id: "vendor/tts",
       pricing: { prompt: "0.000004", completion: "0" },
     });
-    expect(entry.kinds).toEqual(["narration", "music"]);
+    expect(entry.kinds).toEqual(["narration"]);
     expect(entry.pricing).toEqual({ perInputToken: 0.000004 });
+  });
+
+  it("U-MC1c: a speech entry is NEVER offered for `music`", () => {
+    // This is the whole point of the two-catalogue split. `generateAudio` dispatches by
+    // kind: narration → `requestSpeech` → `POST /api/v1/audio/speech`; music →
+    // `requestMusic` → the streaming `POST /api/v1/chat/completions`. A batch-TTS model
+    // stamped `music` would be offered in the music picker and then handed to an endpoint
+    // it does not serve — a real 400, minutes after the user chose it.
+    expect(toOpenRouterSpeechEntry({ id: "vendor/tts" }).kinds).not.toContain("music");
+  });
+
+  it("U-MC1d: an audio-catalogue entry is the `music` kind, priced across all three fields", () => {
+    // `GET /api/v1/models?output_modalities=audio` is a SEPARATE catalogue from
+    // `…=speech`. Verified live 2026-07-28: it returns 4 entries — both Lyria music
+    // models and the two chat-audio models — and shares no id with the 15-entry speech
+    // catalogue. The chat-audio models price on `audio`/`completion`, so all three fields
+    // are consulted, exactly as for speech.
+    const entry = toOpenRouterAudioEntry({
+      id: "vendor/gpt-audio",
+      name: "Vendor Audio",
+      pricing: { prompt: "0.0000025", completion: "0.00001", audio: "0.000032" },
+    });
+    expect(entry.kinds).toEqual(["music"]);
+    expect(entry.provider).toBe("openrouter");
+    expect(entry.label).toBe("Vendor Audio");
+    expect(entry.pricing).toEqual({
+      perInputToken: 0.0000025,
+      perOutputToken: 0.00001,
+    });
+  });
+
+  it("U-MC1e: an all-zero audio price is UNPRICED, never free", () => {
+    // Live, both Lyria models publish `{prompt:"0", completion:"0"}`. Rendering that as
+    // `$0.0000` would tell the user a music generation is free. `null` pricing makes the
+    // cost row say "This model publishes no pricing", which is the true statement.
+    expect(
+      toOpenRouterAudioEntry({
+        id: "vendor/lyria",
+        pricing: { prompt: "0", completion: "0" },
+      }).pricing,
+    ).toBeNull();
   });
 
   it("U-MC1b: a VIDEO entry carries NO pricing at all — OpenRouter publishes none", () => {
@@ -256,5 +299,42 @@ describe("filterByMatrix (U-MC4)", () => {
 
     const filtered = filterByMatrix(models, preD1);
     expect(filtered.map((m) => m.id)).toEqual(["g-txt", "or-img", "or-tts"]);
+  });
+});
+
+describe("narrowToSelectableKinds (U-MC13)", () => {
+  it("U-MC13a: drops entries that serve no kind the Inspector has a selector for", () => {
+    // Measured on the live catalogues: 364 entries published, only 26 carrying a
+    // selectable kind. The other 338 are text-only chat models that no control can ever
+    // render — ~67 KB of JSON serialized by the api, shipped `cache: "no-store"` and
+    // re-parsed by a browser-side Zod schema on EVERY studio open, to populate nothing.
+    const kept = narrowToSelectableKinds([
+      { id: "or-img", provider: "openrouter", label: "", kinds: ["image"], pricing: null },
+      {
+        id: "or-txt",
+        provider: "openrouter",
+        label: "",
+        kinds: ["storyboard", "script"],
+        pricing: null,
+      },
+      { id: "or-vid", provider: "openrouter", label: "", kinds: ["video"], pricing: null },
+    ]);
+    expect(kept.map((m) => m.id)).toEqual(["or-img", "or-vid"]);
+  });
+
+  it("U-MC13b: a surviving entry keeps its FULL kinds list, text kinds included", () => {
+    // Trimming would be a second, unmeasured behaviour change: `kinds` is the honest
+    // statement of what a model serves, and `cost-estimate.ts` reads it to decide whether
+    // the selected model can serve the kind at all. The saving is in dropping ENTRIES.
+    const kept = narrowToSelectableKinds([
+      {
+        id: "gloo-multi",
+        provider: "gloo",
+        label: "",
+        kinds: ["image", "storyboard", "script"],
+        pricing: null,
+      },
+    ]);
+    expect(kept[0]?.kinds).toEqual(["image", "storyboard", "script"]);
   });
 });

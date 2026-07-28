@@ -18,13 +18,20 @@ import type { AiGenerationKind, AiProvider } from "@supagloo/database-lib";
  *
  * ── The catalogue facts, all measured live on 2026-07-28 ────────────────────────────
  *
- * **OpenRouter** publishes three separate catalogues, and they price differently:
+ * **OpenRouter** publishes four separate catalogues, and they price differently:
  *   - `GET /api/v1/models` — chat + image. `pricing.prompt`/`.completion` are $/TOKEN;
  *     `pricing.image` is $/IMAGE.
  *   - `GET /api/v1/models?output_modalities=speech` — the DEDICATED batch-TTS catalogue
- *     the speech endpoint serves. Prices on `prompt` with `completion: "0"`.
+ *     the speech endpoint serves. 15 entries. Prices on `prompt` with `completion: "0"`.
+ *   - `GET /api/v1/models?output_modalities=audio` — a DIFFERENT catalogue, 4 entries,
+ *     and the only one carrying the music models. **It shares no id with `…=speech`.**
+ *     These answer chat/completions, which is what `requestMusic` calls.
  *   - `GET /api/v1/videos/models` — `supported_durations` + a text-to-video vs
  *     image-to-video distinction, and **no price field at all**.
+ *
+ * The speech/audio split is not a nicety. `generateAudio` is one workflow dispatching by
+ * the row's kind to two DIFFERENT endpoints, so a model from the wrong catalogue is a 400
+ * the user only discovers after choosing it.
  *
  * **Gloo** publishes one catalogue at `GET /platform/v2/models`, 106 entries, every one
  * carrying `output_modalities` and a `pricing` block of decimal STRINGS per 1k tokens.
@@ -134,26 +141,63 @@ export interface RawOpenRouterSpeechModel {
 }
 
 /**
- * The dedicated speech catalogue. Both audio kinds map here: `POST /api/v1/audio/speech`
- * is what `generateAudio` calls for narration AND for music (one workflow, dispatching by
- * the row's kind), so the same catalogue is the source of options for both selectors.
+ * Pricing for either audio catalogue. Three fields must be consulted: batch-TTS models
+ * price on `prompt` with `completion: "0"`, while chat-audio models price on
+ * `audio`/`completion`.
+ *
+ * `positiveOnly` throughout, and that is load-bearing rather than tidy: both Lyria music
+ * models publish `{prompt: "0", completion: "0"}` live. Passing a zero through would put
+ * `$0.0000` in front of a user about to spend money — the same lie rule 2 refuses for
+ * "free" image models. An absent price makes the cost row say "This model publishes no
+ * pricing", which is the true statement.
  */
-export function toOpenRouterSpeechEntry(raw: RawOpenRouterSpeechModel): AiModelInfo {
-  const id = typeof raw.id === "string" ? raw.id : "";
+function audioPricing(raw: RawOpenRouterSpeechModel): AiModelPricing | null {
   const pricing: AiModelPricing = {};
-  // Three fields must be consulted: speech-catalogue models price on `prompt` with
-  // `completion: "0"`, while chat-audio models price on `audio`/`completion`.
   const perInputToken = price(raw.pricing?.prompt, true) ?? price(raw.pricing?.audio, true);
   const perOutputToken = price(raw.pricing?.completion, true);
   if (perInputToken !== undefined) pricing.perInputToken = perInputToken;
   if (perOutputToken !== undefined) pricing.perOutputToken = perOutputToken;
+  return pricingOrNull(pricing);
+}
 
+/**
+ * `GET /api/v1/models?output_modalities=speech` — the dedicated batch-TTS catalogue,
+ * 15 entries live on 2026-07-28. **Narration ONLY.**
+ *
+ * This used to be stamped `["narration","music"]` on the claim that `generateAudio` calls
+ * the speech endpoint for both kinds. That claim is false. `generate-audio.ts` dispatches
+ * by the row's kind: narration goes to `requestSpeech` → `POST /api/v1/audio/speech`,
+ * music goes to `requestMusic` → the streaming `POST /api/v1/chat/completions`. The music
+ * models live in a DIFFERENT catalogue ({@link toOpenRouterAudioEntry}) that shares no id
+ * with this one — so offering a speech id in the music picker handed the chat endpoint a
+ * model it does not serve.
+ */
+export function toOpenRouterSpeechEntry(raw: RawOpenRouterSpeechModel): AiModelInfo {
+  const id = typeof raw.id === "string" ? raw.id : "";
   return {
     id,
     provider: "openrouter",
     label: typeof raw.name === "string" && raw.name.length > 0 ? raw.name : id,
-    kinds: ["narration", "music"],
-    pricing: pricingOrNull(pricing),
+    kinds: ["narration"],
+    pricing: audioPricing(raw),
+  };
+}
+
+/**
+ * `GET /api/v1/models?output_modalities=audio` — a SEPARATE catalogue from `…=speech`,
+ * and the one that actually carries the music models. Verified live 2026-07-28: 4 entries
+ * (both Lyria models plus two chat-audio models), zero overlap with the 15 speech
+ * entries. All four answer `POST /api/v1/chat/completions`, which is exactly what
+ * `requestMusic` calls.
+ */
+export function toOpenRouterAudioEntry(raw: RawOpenRouterSpeechModel): AiModelInfo {
+  const id = typeof raw.id === "string" ? raw.id : "";
+  return {
+    id,
+    provider: "openrouter",
+    label: typeof raw.name === "string" && raw.name.length > 0 ? raw.name : id,
+    kinds: ["music"],
+    pricing: audioPricing(raw),
   };
 }
 
@@ -260,4 +304,42 @@ export function filterByMatrix(
       kinds: m.kinds.filter((k) => (matrix[k] ?? []).includes(m.provider)),
     }))
     .filter((m) => m.id.length > 0 && m.kinds.length > 0);
+}
+
+/**
+ * The kinds the Inspector actually has a selector for. The two TEXT kinds are absent on
+ * purpose — `storyboard`/`script` are chosen by the system, not the user, so a model that
+ * serves only those can never appear in any control.
+ *
+ * Mirrors `nextjs/app/api/ai/models/route.ts`'s `SELECTABLE_KINDS` and
+ * `nextjs/lib/studio/ai-settings.ts`. Three copies of a four-element list is cheaper than
+ * a wire contract for it, but they must move together.
+ */
+const SELECTABLE_KINDS: readonly AiGenerationKind[] = [
+  "image",
+  "narration",
+  "music",
+  "video",
+];
+
+/**
+ * Drop every model that serves no selectable kind.
+ *
+ * Measured against the live catalogues on 2026-07-28: **364 entries published, 26 of them
+ * carrying a selectable kind.** The other 338 are text-only chat models. The upstream
+ * fetches are TTL-cached, but the serialization and the browser-side Zod parse are not
+ * (the studio reads this `cache: "no-store"` on every open), so those entries cost
+ * ~67 KB → ~4.7 KB of parse work per studio open for a list nothing can render.
+ *
+ * Two deliberate restraints:
+ *
+ *  - **A surviving entry keeps its full `kinds` list.** The saving is in dropping ENTRIES.
+ *    Trimming `["image","storyboard","script"]` down to `["image"]` would make `kinds`
+ *    stop being an honest statement of what the model serves, for no measured gain.
+ *  - **This is a CONSTANT, never a `?kinds=` query parameter.** `ModelCatalogueService`'s
+ *    cache is keyed on `userId` alone; a caller-varying narrowing would let one request's
+ *    narrower answer be served to the next caller who asked for more.
+ */
+export function narrowToSelectableKinds(models: AiModelInfo[]): AiModelInfo[] {
+  return models.filter((m) => m.kinds.some((k) => SELECTABLE_KINDS.includes(k)));
 }

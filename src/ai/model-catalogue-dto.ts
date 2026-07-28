@@ -42,6 +42,11 @@ export const AiModelInfoSchema = z.object({
 export type AiModelInfoDto = z.infer<typeof AiModelInfoSchema>;
 
 export const AiModelCatalogueResponseSchema = z.object({
+  /** Narrowed to models serving at least one SELECTABLE kind (image/narration/music/
+   *  video): the text kinds have no Inspector control, so a text-only model can never be
+   *  rendered. Live, that is 26 of 364 entries. The narrowing is a CONSTANT rather than a
+   *  `?kinds=` parameter — the service's cache is keyed on `userId` alone, so a
+   *  caller-varying narrowing would serve one request's narrower answer to the next. */
   models: z.array(AiModelInfoSchema),
   /** Whether the caller has each provider CONNECTED. Deliberately NOT "whether its
    *  catalogue read succeeded": telling a user who has already linked Gloo to go and link
