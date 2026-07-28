@@ -28,7 +28,7 @@ RUN apt-get update \
 # submodule: whenever a "Bump supagloo-database-lib submodule to <sha>" commit
 # lands, update this default to that same SHA in the same commit.
 # DO NOT "simplify" this back to a COPY of the submodule dir — it breaks Railway.
-ARG DATABASE_LIB_REF=e4be6148514bfe50feac6ad0f8ee987fca17cef7
+ARG DATABASE_LIB_REF=f55280866a682994513570ff45aa28cd1e8a056f
 RUN git clone https://github.com/ashtable/supagloo-database-lib.git supagloo-database-lib \
   && git -C supagloo-database-lib checkout "${DATABASE_LIB_REF}" \
   && rm -rf supagloo-database-lib/.git
