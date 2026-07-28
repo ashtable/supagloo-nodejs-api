@@ -102,6 +102,22 @@ export function registerRepoProvisioningRoutes(
             .send({ error: "project_exists", message: err.message });
         }
         if (err instanceof RepoCreationError) {
+          // The reply was the ONLY place this failure's words went: a real
+          // create-repo failure — a rejected authorization code, a GitHub 403 on
+          // `POST /user/repos` — left no trace whatsoever on the server, and the
+          // browser page that receives it deliberately shows a generic sentence.
+          // `cause` is logged explicitly because it is where the upstream client's
+          // message lives (the wrap in `provisionRepo` only preserves the upstream
+          // STATUS in the message, and only for `GithubCreateRepoError`).
+          req.log.warn(
+            {
+              err,
+              upstreamStatus: err.upstreamStatus,
+              cause: err.cause instanceof Error ? err.cause.message : undefined,
+              causeName: err.cause instanceof Error ? err.cause.name : undefined,
+            },
+            "create-repo failed",
+          );
           return reply
             .code(502)
             .send({ error: "repo_creation_failed", message: err.message });
