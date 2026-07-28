@@ -462,13 +462,28 @@ describe("e2e: POST /v1/ai/generations + poll — full round trip", () => {
 });
 
 describe("e2e: POST validation gates (before any row is created)", () => {
-  it("422s an out-of-matrix pair (image+gloo) and creates no row", async () => {
+  // `narration`+`gloo`, NOT `image`+`gloo`: per decision D1 (genesis-1 Inspector,
+  // 2026-07-28) Gloo generates images, so `AI_PROVIDERS_BY_KIND.image` now carries `gloo`
+  // and image+gloo has stopped being an out-of-matrix example. `narration`+`gloo` is
+  // openrouter-only in both the pre-D1 and post-D1 matrices, so this stays a real 422
+  // across the db-lib bump. The input is a VALID `NarrationSpec` on purpose — the route's
+  // body schema runs before the matrix gate, so a malformed input would 400 here and the
+  // test would prove nothing about the matrix.
+  it("422s an out-of-matrix pair (narration+gloo) and creates no row", async () => {
     disarmGates();
     const owner = await seedUser("matrix");
     const before = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
     const res = await api("/ai/generations", owner.token, {
       method: "POST",
-      body: { kind: "image", provider: "gloo", model: "m", input: { prompt: "x" } },
+      body: {
+        kind: "narration",
+        provider: "gloo",
+        model: "m",
+        input: {
+          voice: { description: "warm, unhurried" },
+          scenes: [{ sceneId: "s1", scriptText: "In the beginning" }],
+        },
+      },
     });
     expect(res.status).toBe(422);
     expect((await res.json()).error).toBe("kind_provider_incompatible");
