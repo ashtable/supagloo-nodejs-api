@@ -24,6 +24,7 @@
     "@supagloo/database-lib": "file:./supagloo-database-lib",
     "fastify": "^5.10.0",
     "fastify-type-provider-zod": "^7.0.0",
+    "jose": "^5.10.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

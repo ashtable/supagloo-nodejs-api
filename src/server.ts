@@ -7,7 +7,10 @@ import {
   reportBootFailure,
 } from "./logging/redact";
 import { AuthService } from "./auth/auth-service";
-import { makeYouVersionVerifier } from "./auth/youversion";
+import {
+  makeYouVersionVerifier,
+  youVersionEndpointsFrom,
+} from "./auth/youversion";
 import { SESSION_TTL_MS } from "./auth/tokens";
 import { makeInteractiveGithubAppClient } from "./connections/github-app-client";
 import { GithubConnectionService } from "./connections/github-connection-service";
@@ -64,7 +67,9 @@ async function main(): Promise<void> {
   const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
   const authService = new AuthService({
     prisma,
-    verifyToken: makeYouVersionVerifier({ baseUrl: env.YOUVERSION_BASE_URL }),
+    verifyToken: makeYouVersionVerifier(
+      youVersionEndpointsFrom(env.YOUVERSION_BASE_URL),
+    ),
     sessionTtlMs: SESSION_TTL_MS,
   });
 

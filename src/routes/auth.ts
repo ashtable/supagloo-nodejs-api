@@ -50,6 +50,7 @@ export function registerAuthRoutes(
       try {
         const { token, user, firstSignIn } = await authService.signIn(
           req.body.accessToken,
+          req.body.profile,
         );
         return { token, user: toAuthUser(user), firstSignIn };
       } catch (err) {
