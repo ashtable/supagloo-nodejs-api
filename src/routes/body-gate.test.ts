@@ -48,6 +48,9 @@ const UNGATED = [
   "POST /v1/connections/openrouter",
   "PUT /v1/connections/gloo",
   "POST /v1/connections/github/callback",
+  // Its only string is a GitHub authorization code — spent against GitHub and
+  // discarded, never written to Postgres. See `../postgres-text`'s scope paragraph.
+  "POST /v1/connections/github/link-existing",
   "POST /v1/projects/:id/renders",
   "POST /v1/projects",
   "POST /v1/projects/import",
@@ -161,7 +164,12 @@ describe("U-BG: the api's body schemas, and which of them carry the Postgres-tex
     // If this ever reads zero, the bodies got their own task and the first test above became
     // a real gate. Until then the number is the honest size of the gap, and it must match
     // what `../postgres-text` tells a reader.
-    expect(UNGATED.length).toBe(13);
-    expect(GATED.length + UNGATED.length).toBe(14);
+    //
+    // Not all 14 are the same kind of open work. `POST /v1/connections/github/link-existing`
+    // is ungated because it has NOTHING to gate — its one string is a GitHub authorization
+    // code that never reaches Postgres — so closing the gap would not shrink this list by
+    // one; it would leave that route exactly where it is.
+    expect(UNGATED.length).toBe(14);
+    expect(GATED.length + UNGATED.length).toBe(15);
   });
 });

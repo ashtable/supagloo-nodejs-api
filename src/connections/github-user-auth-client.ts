@@ -66,6 +66,30 @@ export interface GithubUserAuthClient {
     token: string;
     installationId: string;
   }): Promise<string[]>;
+  /**
+   * Every installation of THIS App the user can reach (`GET /user/installations`).
+   *
+   * The read that makes an already-installed account connectable. GitHub redirects to
+   * the App's Setup URL only when an installation is CREATED, so a user who installed
+   * previously — a reinstall, an install made from GitHub's directory, or one App
+   * registration shared across environments — never produces an install callback and
+   * has no other way to hand us an `installationId`. Asking GitHub which installations
+   * the authorizing user already has is the sanctioned way to recover it.
+   *
+   * Scoped to this App by construction: the endpoint answers for the App whose user
+   * token authorizes the call.
+   */
+  listUserInstallations(token: string): Promise<UserInstallation[]>;
+}
+
+/** One installation of this App, as seen through a user token. */
+export interface UserInstallation {
+  installationId: string;
+  /** The account the App is installed on — a user login or an org login. */
+  accountLogin: string;
+  /** `"User"` for a personal account, `"Organization"` otherwise; `null` if GitHub
+   *  sent neither `target_type` nor `account.type`. */
+  targetType: string | null;
 }
 
 export interface MakeGithubUserAuthClientOptions {
@@ -212,6 +236,32 @@ function parseNextLink(linkHeader: string | null): string | undefined {
  *  Only `full_name` is read; every other field is ignored on purpose. */
 const installationReposSchema = z.object({
   repositories: z.array(z.object({ full_name: z.string() }).passthrough()),
+});
+
+/**
+ * `GET /user/installations` — `{ total_count, installations[] }`.
+ *
+ * Every installation returned belongs to THIS App: the endpoint is scoped to the App
+ * whose user token authorizes the call, so no client-side filtering by app id is
+ * needed or possible.
+ *
+ * `target_type` is the installation's own field ("User" | "Organization");
+ * `account.type` carries the same distinction and is read as a fallback, since only
+ * one of the two is guaranteed present across GitHub's API versions.
+ */
+const userInstallationsSchema = z.object({
+  installations: z.array(
+    z
+      .object({
+        id: z.union([z.string(), z.number()]).transform(String),
+        target_type: z.string().optional(),
+        account: z
+          .object({ login: z.string(), type: z.string().optional() })
+          .passthrough()
+          .nullish(),
+      })
+      .passthrough(),
+  ),
 });
 
 const createdRepoSchema = z.object({
@@ -403,6 +453,46 @@ export function makeGithubUserAuthClient(
         }
         const parsed = installationReposSchema.parse(await res.json());
         for (const repo of parsed.repositories) out.push(repo.full_name);
+        url = parseNextLink(res.headers.get("link"));
+      }
+      return out;
+    },
+
+    async listUserInstallations(token) {
+      const out: UserInstallation[] = [];
+      let url: string | undefined = `${apiBaseUrl}/user/installations?per_page=100`;
+      // Same Link-walking guard as listInstallationRepos, for the same reason: a
+      // malformed `Link` header must not spin inside a request a browser is waiting on.
+      // A user with 2 000+ installations of ONE app is not a real shape.
+      for (let page = 1; url; page += 1) {
+        if (page > 20) {
+          throw new Error(
+            "GitHub list-user-installations exceeded 20 pages — refusing to keep " +
+              "walking Link: rel=next",
+          );
+        }
+        const res: Response = await fetchImpl(url, {
+          headers: {
+            authorization: `token ${token}`,
+            accept: "application/vnd.github+json",
+          },
+        });
+        if (!res.ok) {
+          const detail = await readGithubErrorDetail(res);
+          throw new Error(
+            `GitHub list-user-installations failed: ${res.status}` +
+              (detail ? ` — ${detail}` : ""),
+          );
+        }
+        const parsed = userInstallationsSchema.parse(await res.json());
+        for (const installation of parsed.installations) {
+          out.push({
+            installationId: installation.id,
+            accountLogin: installation.account?.login ?? "",
+            targetType:
+              installation.target_type ?? installation.account?.type ?? null,
+          });
+        }
         url = parseNextLink(res.headers.get("link"));
       }
       return out;

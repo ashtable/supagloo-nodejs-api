@@ -5,10 +5,16 @@ import type {
   PrismaClient,
 } from "@supagloo/database-lib";
 import type { VerifiedInstallation } from "./github-app-client";
+import type {
+  GithubUserAuthClient,
+  UserInstallation,
+} from "./github-user-auth-client";
 import { filterRepos } from "./repo-filter";
 import {
+  AmbiguousUserInstallationError,
   GithubNotConnectedError,
   InstallationVerificationError,
+  NoUserInstallationError,
 } from "./errors";
 
 /**
@@ -39,6 +45,16 @@ export interface GithubConnectionServiceOptions {
   oauthBaseUrl: string;
   /** The GitHub App's URL slug (the install page is addressed by slug, not id). */
   appSlug: string;
+  /**
+   * The USER-authorization surface behind {@link GithubConnectionService.linkExisting}
+   * — the same client the create-repo JIT hop uses, narrowed to the three calls needed
+   * here. REQUIRED rather than optional on purpose: a silently-unwired capability
+   * dead-ends the user at exactly the point this exists to unblock.
+   */
+  userAuth: Pick<
+    GithubUserAuthClient,
+    "buildAuthorizeUrl" | "exchangeCode" | "listUserInstallations"
+  >;
   /** Injectable for deterministic tests; defaults to wall-clock. */
   clock?: () => Date;
 }
@@ -49,6 +65,7 @@ export class GithubConnectionService {
   private readonly listInstallationRepos: GithubConnectionServiceOptions["listInstallationRepos"];
   private readonly oauthBaseUrl: string;
   private readonly appSlug: string;
+  private readonly userAuth: GithubConnectionServiceOptions["userAuth"];
   private readonly clock: () => Date;
 
   constructor(opts: GithubConnectionServiceOptions) {
@@ -57,12 +74,48 @@ export class GithubConnectionService {
     this.listInstallationRepos = opts.listInstallationRepos;
     this.oauthBaseUrl = opts.oauthBaseUrl.replace(/\/+$/, "");
     this.appSlug = opts.appSlug;
+    this.userAuth = opts.userAuth;
     this.clock = opts.clock ?? (() => new Date());
   }
 
   /** The GitHub App's hosted installation-picker URL. No network call. */
   installUrl(): string {
     return `${this.oauthBaseUrl}/apps/${this.appSlug}/installations/new`;
+  }
+
+  /** The hosted GitHub USER-authorization URL for {@link linkExisting}. No network
+   *  call, and no user secret crosses the wire. */
+  authorizeUrl(args: { redirectUri: string; state: string }): string {
+    return this.userAuth.buildAuthorizeUrl(args);
+  }
+
+  /**
+   * Connect an installation the user ALREADY has, using a user-authorization `code`.
+   *
+   * The install callback cannot reach this case. GitHub redirects to the App's Setup
+   * URL only when an installation is CREATED, so a reinstall, an install made from
+   * GitHub's directory, or one App registration shared across environments produces no
+   * callback and no `installationId` — leaving the connect flow with nowhere to go.
+   * Here we ask GitHub instead: exchange the code for a short-lived user token, read
+   * the installations that user can reach, and pick.
+   *
+   * The token is used for that ONE read and never persisted — the same zero-storage
+   * posture as the create-repo hop.
+   *
+   * Selection never guesses. `GET /user/installations` has no documented ordering, so
+   * taking the first would silently wire a user's projects to whichever account GitHub
+   * happened to list first — a wrong answer that looks like a right one and persists.
+   * See {@link selectInstallation}.
+   *
+   * Resolution goes through {@link connectFromCallback}, so the installation is still
+   * App-JWT verified and `githubLogin`/`repositorySelection` still come from GitHub
+   * rather than from this listing. One persistence path, one verification path.
+   */
+  async linkExisting(userId: string, code: string): Promise<GithubConnection> {
+    const { token } = await this.userAuth.exchangeCode(code);
+    const installations = await this.userAuth.listUserInstallations(token);
+    const selected = selectInstallation(installations);
+    return this.connectFromCallback(userId, selected.installationId);
   }
 
   /**
@@ -153,4 +206,38 @@ export class GithubConnectionService {
     });
     return filterRepos(repos, opts);
   }
+}
+
+/**
+ * Choose which of the user's installations to connect.
+ *
+ * The rules, in order:
+ *   1. none            → {@link NoUserInstallationError}. The user authorized us but
+ *                        has not installed the App; their next step is the picker.
+ *   2. exactly one     → that one. The overwhelmingly common shape.
+ *   3. exactly one personal (`target_type: "User"`) → that one. A user who belongs to
+ *                        organizations gets their OWN account, which is what "connect
+ *                        my GitHub" means and what the install-picker flow would also
+ *                        have produced.
+ *   4. anything else   → {@link AmbiguousUserInstallationError}.
+ *
+ * Rule 4 is a refusal, not a fallback, and that is the point. Two org installations
+ * and no personal one is a real shape, GitHub documents no ordering for this listing,
+ * and picking arbitrarily would attach a user's repositories to the wrong
+ * organization — persistently, and with no error for anyone to notice.
+ */
+export function selectInstallation(
+  installations: readonly UserInstallation[],
+): UserInstallation {
+  if (installations.length === 0) throw new NoUserInstallationError();
+  if (installations.length === 1) return installations[0]!;
+
+  const personal = installations.filter((i) => i.targetType === "User");
+  if (personal.length === 1) return personal[0]!;
+
+  throw new AmbiguousUserInstallationError(
+    `${installations.length} GitHub installations match ` +
+      `(${installations.map((i) => i.accountLogin || "?").join(", ")}); ` +
+      "choose one via the installation picker",
+  );
 }

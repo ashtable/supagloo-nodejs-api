@@ -1,7 +1,15 @@
 import { describe, it, expect } from "vitest";
 import type { PrismaClient } from "@supagloo/database-lib";
-import { GithubConnectionService } from "./github-connection-service";
-import { InstallationVerificationError, GithubNotConnectedError } from "./errors";
+import {
+  GithubConnectionService,
+  selectInstallation,
+} from "./github-connection-service";
+import {
+  AmbiguousUserInstallationError,
+  InstallationVerificationError,
+  GithubNotConnectedError,
+  NoUserInstallationError,
+} from "./errors";
 
 // GithubConnectionService branch logic (design-delta §2.3/§6a). No real DB or
 // network — a hand-rolled fake Prisma + fake app client + fixed clock drive every
@@ -67,9 +75,57 @@ function makeFakeClient(overrides: ClientOverrides = {}) {
   };
 }
 
+interface UserAuthOverrides {
+  exchangeCode?: Fn;
+  listUserInstallations?: Fn;
+}
+
+/** The USER-authorization surface behind `linkExisting`, faked the same way as the
+ *  App-JWT client above: recorded calls, overridable per test, no network. */
+function makeFakeUserAuth(overrides: UserAuthOverrides = {}) {
+  const calls = {
+    buildAuthorizeUrl: [] as any[],
+    exchangeCode: [] as any[],
+    listUserInstallations: [] as any[],
+  };
+  return {
+    calls,
+    userAuth: {
+      buildAuthorizeUrl: (args: { redirectUri: string; state: string }) => {
+        calls.buildAuthorizeUrl.push(args);
+        return (
+          "https://github.com/login/oauth/authorize?client_id=cid" +
+          `&redirect_uri=${encodeURIComponent(args.redirectUri)}` +
+          `&state=${encodeURIComponent(args.state)}`
+        );
+      },
+      exchangeCode: async (code: string) => {
+        calls.exchangeCode.push(code);
+        return overrides.exchangeCode
+          ? overrides.exchangeCode(code)
+          : { token: "ghu_test" };
+      },
+      listUserInstallations: async (token: string) => {
+        calls.listUserInstallations.push(token);
+        return overrides.listUserInstallations
+          ? overrides.listUserInstallations(token)
+          : [
+              {
+                installationId: "42",
+                accountLogin: "acme",
+                targetType: "User",
+              },
+            ];
+      },
+    },
+  };
+}
+
 function service(
   prisma: PrismaClient,
   client: ReturnType<typeof makeFakeClient>["client"],
+  userAuth: ReturnType<typeof makeFakeUserAuth>["userAuth"] = makeFakeUserAuth()
+    .userAuth,
 ) {
   return new GithubConnectionService({
     prisma,
@@ -77,6 +133,7 @@ function service(
     listInstallationRepos: client.listInstallationRepos,
     oauthBaseUrl: "https://github.com",
     appSlug: "supagloo-app",
+    userAuth,
     clock,
   });
 }
@@ -279,5 +336,210 @@ describe("GithubConnectionService.listRepos — probe intent (DR2)", () => {
     await service(prisma, client).listRepos("u1", { filter: "all", q: "   " });
 
     expect(probeIntent(calls.listInstallationRepos)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Linking an installation the user ALREADY has (the user-authorization hop).
+//
+// This path exists because the install callback structurally cannot cover it:
+// GitHub redirects to the App's Setup URL only when an installation is CREATED, so a
+// reinstall, an install made from GitHub's own directory, or one App registration
+// shared across environments produces no callback and no installationId at all.
+// ---------------------------------------------------------------------------
+
+const inst = (
+  installationId: string,
+  accountLogin: string,
+  targetType: string | null,
+) => ({ installationId, accountLogin, targetType });
+
+describe("selectInstallation", () => {
+  it("returns the only installation when there is exactly one", () => {
+    expect(selectInstallation([inst("1", "ash", "User")]).installationId).toBe("1");
+  });
+
+  it("returns the single ORG installation when that is all there is", () => {
+    expect(
+      selectInstallation([inst("7", "acme", "Organization")]).installationId,
+    ).toBe("7");
+  });
+
+  it("prefers the user's own account over their organizations", () => {
+    const chosen = selectInstallation([
+      inst("7", "acme", "Organization"),
+      inst("1", "ash", "User"),
+      inst("9", "globex", "Organization"),
+    ]);
+    expect(chosen.installationId).toBe("1");
+    expect(chosen.accountLogin).toBe("ash");
+  });
+
+  it("throws NoUserInstallation when the user has none", () => {
+    expect(() => selectInstallation([])).toThrow(NoUserInstallationError);
+  });
+
+  /**
+   * The refusal that matters. GitHub documents no ordering for this listing, so
+   * picking one here would attach the user's repositories to whichever account
+   * happened to be listed first — wrong, silent, and persisted.
+   */
+  it("REFUSES to guess between several orgs with no personal account", () => {
+    expect(() =>
+      selectInstallation([
+        inst("7", "acme", "Organization"),
+        inst("9", "globex", "Organization"),
+      ]),
+    ).toThrow(AmbiguousUserInstallationError);
+  });
+
+  it("names the candidate accounts in the ambiguity error", () => {
+    expect(() =>
+      selectInstallation([
+        inst("7", "acme", "Organization"),
+        inst("9", "globex", "Organization"),
+      ]),
+    ).toThrow(/acme, globex/);
+  });
+
+  it("refuses when several personal installations somehow appear", () => {
+    expect(() =>
+      selectInstallation([inst("1", "a", "User"), inst("2", "b", "User")]),
+    ).toThrow(AmbiguousUserInstallationError);
+  });
+
+  /** A null targetType must not be mistaken for a personal account. */
+  it("does not treat an unknown targetType as personal", () => {
+    expect(() =>
+      selectInstallation([inst("7", "acme", null), inst("9", "globex", null)]),
+    ).toThrow(AmbiguousUserInstallationError);
+  });
+});
+
+describe("GithubConnectionService.linkExisting", () => {
+  it("exchanges the code, resolves the installation, and stores the connection", async () => {
+    const { prisma, calls: prismaCalls } = makeFakePrisma();
+    const { client } = makeFakeClient();
+    const { userAuth, calls } = makeFakeUserAuth();
+
+    const connection = await service(prisma, client, userAuth).linkExisting(
+      "u1",
+      "code-abc",
+    );
+
+    expect(calls.exchangeCode).toEqual(["code-abc"]);
+    // The token from the exchange is what reads the installations — and it is used
+    // for that one call only, never persisted.
+    expect(calls.listUserInstallations).toEqual(["ghu_test"]);
+    expect(connection.installationId).toBe("42");
+    expect(prismaCalls.upsert).toHaveLength(1);
+    expect(prismaCalls.upsert[0].create.status).toBe("connected");
+  });
+
+  /**
+   * The resolved id still goes through the App-JWT verify, so `githubLogin` and
+   * `repositorySelection` come from GitHub rather than from the user-token listing —
+   * one persistence path, one verification path, shared with the install callback.
+   */
+  it("App-JWT verifies the resolved installation rather than trusting the listing", async () => {
+    const { prisma, calls: prismaCalls } = makeFakePrisma();
+    const { client, calls: clientCalls } = makeFakeClient({
+      verifyInstallation: () => ({
+        githubLogin: "verified-login",
+        repositorySelection: "all",
+      }),
+    });
+    const { userAuth } = makeFakeUserAuth({
+      // The user-token listing claims a DIFFERENT login than the App-JWT verify.
+      // What lands in the row must come from the verify.
+      listUserInstallations: () => [inst("42", "listing-login", "User")],
+    });
+
+    await service(prisma, client, userAuth).linkExisting("u1", "code-abc");
+
+    expect(clientCalls.verifyInstallation).toEqual(["42"]);
+    expect(prismaCalls.upsert[0].create.githubLogin).toBe("verified-login");
+    expect(prismaCalls.upsert[0].create.repositorySelection).toBe("all");
+  });
+
+  it("propagates NoUserInstallation and writes nothing", async () => {
+    const { prisma, calls: prismaCalls } = makeFakePrisma();
+    const { client } = makeFakeClient();
+    const { userAuth } = makeFakeUserAuth({ listUserInstallations: () => [] });
+
+    await expect(
+      service(prisma, client, userAuth).linkExisting("u1", "code-abc"),
+    ).rejects.toThrow(NoUserInstallationError);
+    expect(prismaCalls.upsert).toHaveLength(0);
+  });
+
+  it("propagates the ambiguity refusal and writes nothing", async () => {
+    const { prisma, calls: prismaCalls } = makeFakePrisma();
+    const { client } = makeFakeClient();
+    const { userAuth } = makeFakeUserAuth({
+      listUserInstallations: () => [
+        inst("7", "acme", "Organization"),
+        inst("9", "globex", "Organization"),
+      ],
+    });
+
+    await expect(
+      service(prisma, client, userAuth).linkExisting("u1", "code-abc"),
+    ).rejects.toThrow(AmbiguousUserInstallationError);
+    expect(prismaCalls.upsert).toHaveLength(0);
+  });
+
+  /** A rejected authorization code must never reach the installations read. */
+  it("does not list installations when the code exchange fails", async () => {
+    const { prisma } = makeFakePrisma();
+    const { client } = makeFakeClient();
+    const { userAuth, calls } = makeFakeUserAuth({
+      exchangeCode: () => {
+        throw new Error("bad_verification_code");
+      },
+    });
+
+    await expect(
+      service(prisma, client, userAuth).linkExisting("u1", "code-abc"),
+    ).rejects.toThrow(/bad_verification_code/);
+    expect(calls.listUserInstallations).toEqual([]);
+  });
+
+  /** Upsert-by-userId, so re-linking replaces rather than duplicating or failing. */
+  it("re-links an already-connected user by overwriting the stored installation", async () => {
+    const { prisma, calls: prismaCalls } = makeFakePrisma({
+      findUnique: () => ({ userId: "u1", installationId: "42" }),
+    });
+    const { client } = makeFakeClient();
+    const { userAuth } = makeFakeUserAuth({
+      listUserInstallations: () => [inst("99", "ash", "User")],
+    });
+
+    await service(prisma, client, userAuth).linkExisting("u1", "code-abc");
+
+    expect(prismaCalls.upsert[0].where).toEqual({ userId: "u1" });
+    expect(prismaCalls.upsert[0].create.installationId).toBe("99");
+    expect(prismaCalls.upsert[0].update.installationId).toBe("99");
+  });
+});
+
+describe("GithubConnectionService.authorizeUrl", () => {
+  it("delegates to the user-auth client, carrying redirectUri and state", () => {
+    const { prisma } = makeFakePrisma();
+    const { client } = makeFakeClient();
+    const { userAuth, calls } = makeFakeUserAuth();
+
+    const url = service(prisma, client, userAuth).authorizeUrl({
+      redirectUri: "http://localhost:8000/api/connect/github/callback",
+      state: "nonce-1",
+    });
+
+    expect(calls.buildAuthorizeUrl).toEqual([
+      {
+        redirectUri: "http://localhost:8000/api/connect/github/callback",
+        state: "nonce-1",
+      },
+    ]);
+    expect(url).toContain("state=nonce-1");
   });
 });

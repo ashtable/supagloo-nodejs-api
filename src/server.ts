@@ -85,12 +85,26 @@ async function main(): Promise<void> {
     appId: env.GITHUB_APP_ID,
     privateKey: env.GITHUB_APP_PRIVATE_KEY,
   });
+  // Built HERE rather than beside its other consumer below, because two surfaces now
+  // share it: the create-repo JIT hop (design-delta §2.3/§6b) and the connection
+  // service's link-existing path. One client, one set of OAuth credentials.
+  const githubUserAuthClient = makeGithubUserAuthClient({
+    // PUBLIC (the browser opens it) vs INTERNAL (this process POSTs to it) — plan
+    // row 66. Unset, the internal one resolves to the public one in `loadEnv`, so
+    // production and every existing deployment are unchanged.
+    oauthBaseUrl: env.GITHUB_OAUTH_BASE_URL,
+    oauthInternalBaseUrl: env.GITHUB_OAUTH_INTERNAL_BASE_URL,
+    apiBaseUrl: env.GITHUB_API_BASE_URL,
+    clientId: env.GITHUB_APP_CLIENT_ID,
+    clientSecret: env.GITHUB_APP_CLIENT_SECRET,
+  });
   const githubService = new GithubConnectionService({
     prisma,
     verifyInstallation: githubAppClient.verifyInstallation,
     listInstallationRepos: githubAppClient.listInstallationRepos,
     oauthBaseUrl: env.GITHUB_OAUTH_BASE_URL,
     appSlug: env.GITHUB_APP_SLUG,
+    userAuth: githubUserAuthClient,
   });
 
   const openrouterClient = makeOpenRouterClient({
@@ -214,16 +228,8 @@ async function main(): Promise<void> {
 
   // Create-new-repo JIT hop (design-delta §2.3/§6b): the zero-storage user-token
   // dance that creates the repo before delegating to the scaffold create path.
-  const githubUserAuthClient = makeGithubUserAuthClient({
-    // PUBLIC (the browser opens it) vs INTERNAL (this process POSTs to it) — plan
-    // row 66. Unset, the internal one resolves to the public one in `loadEnv`, so
-    // production and every existing deployment are unchanged.
-    oauthBaseUrl: env.GITHUB_OAUTH_BASE_URL,
-    oauthInternalBaseUrl: env.GITHUB_OAUTH_INTERNAL_BASE_URL,
-    apiBaseUrl: env.GITHUB_API_BASE_URL,
-    clientId: env.GITHUB_APP_CLIENT_ID,
-    clientSecret: env.GITHUB_APP_CLIENT_SECRET,
-  });
+  // `githubUserAuthClient` is constructed above, where the connection service also
+  // takes it.
   const repoProvisioningService = new RepoProvisioningService({
     prisma,
     userAuthClient: githubUserAuthClient,

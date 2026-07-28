@@ -71,6 +71,13 @@ function recordingUserAuthClient(overrides: Partial<GithubUserAuthClient> = {}) 
       // Default: the created repo is ALREADY visible, i.e. the common case.
       return ["acme/psalm-121"];
     },
+    // Part of the client interface but never reached from repo provisioning — it
+    // belongs to the connection surface's link-existing path. Recorded anyway, so a
+    // stray call here would show up rather than pass silently.
+    listUserInstallations: async (token) => {
+      calls.push(`listUserInstallations:${token}`);
+      return [];
+    },
     ...overrides,
   };
   return { client, calls };

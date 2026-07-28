@@ -31,6 +31,46 @@ export class GithubNotConnectedError extends Error {
 }
 
 /**
+ * Thrown when the authorizing user has NO installation of this App
+ * (`GET /user/installations` came back empty).
+ *
+ * Distinct from {@link InstallationVerificationError}: nothing was malformed, the user
+ * simply has not installed the App — so the caller's next step is the install picker,
+ * not a retry. Routes map it to a `409`, an account-state precondition, alongside
+ * {@link GithubNotConnectedError}.
+ */
+export class NoUserInstallationError extends Error {
+  readonly statusCode = 409;
+  constructor(
+    message = "the authorizing GitHub user has no installation of this app",
+  ) {
+    super(message);
+    this.name = "NoUserInstallationError";
+  }
+}
+
+/**
+ * Thrown when the user has several installations and none is unambiguously theirs —
+ * e.g. the App is installed on two organizations they belong to, and on no personal
+ * account.
+ *
+ * Deliberately a refusal rather than a guess. `GET /user/installations` has no
+ * documented ordering, so "take the first" would wire a user's projects to whichever
+ * account GitHub happened to list first, and the failure would be silent and durable.
+ * Routes map it to a `409` so the caller falls back to the install picker, where the
+ * user names the account themselves.
+ */
+export class AmbiguousUserInstallationError extends Error {
+  readonly statusCode = 409;
+  constructor(
+    message = "several GitHub installations match; choose one via the installation picker",
+  ) {
+    super(message);
+    this.name = "AmbiguousUserInstallationError";
+  }
+}
+
+/**
  * Thrown when the Gloo client-credentials test mint fails (design-delta §2.5 —
  * verify-then-store). The supplied `clientId`/`clientSecret` are invalid, so no row
  * is written and routes map it to a `400` (mirrors {@link InstallationVerificationError}).

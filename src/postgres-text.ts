@@ -30,9 +30,9 @@ import { z } from "zod";
  * the surface" passes through here, which is a claim about the api that the code does not
  * make. PATH PARAMETERS are gated api-wide, and `src/routes/path-params-gate.test.ts`
  * enumerates the real route table to keep them that way. REQUEST BODIES ARE NOT: of the
- * FOURTEEN `body` schemas across this api's ten route files, exactly ONE —
+ * FIFTEEN `body` schemas across this api's ten route files, exactly ONE —
  * `POST /v1/renders/:id/gallery` in `src/routes/gallery.ts` — is wrapped. The other
- * thirteen are not, and these among them reach Prisma carrying a caller's string:
+ * fourteen are not, and these among them reach Prisma carrying a caller's string:
  *
  *   POST  /v1/projects                     `name`  → `prisma.project.create`
  *   PATCH /v1/projects/:id                 `name`  → `prisma.project.update`
@@ -42,6 +42,13 @@ import { z } from "zod";
  * Those are the SAME class as the anonymous 500s this module was built for, one
  * authentication step further in — read off the call paths, and NOT measured against real
  * Postgres the way the gallery ones were, so no number is claimed for them here.
+ *
+ * `POST /v1/connections/github/link-existing` is the fifteenth, and it is ungated for a
+ * DIFFERENT and stronger reason than the ones above: its only string is a GitHub
+ * authorization `code`, which is spent against GitHub's token endpoint and discarded. No
+ * part of it is ever written to Postgres — the row this route persists is built from the
+ * App-JWT verify's response, not from the request. So there is no value here for the gate
+ * to protect, and a 400 on a hostile code would replace GitHub's own rejection with ours.
  *
  * They stay ungated ON PURPOSE, for the reason that already rejected a scope-wide
  * `preValidation` hook: this is a gallery task (plan rows 39/40/41), and widening the gate
