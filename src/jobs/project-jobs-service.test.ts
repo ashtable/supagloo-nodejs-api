@@ -1021,3 +1021,76 @@ describe("plan row 49 — the partial unique index maps to the existing 409", ()
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Feature 2 — the scaffolded manifest is SEEDED with the picked passage
+// ---------------------------------------------------------------------------
+//
+// `buildBlankManifest()` writes `scenes: []`, and `ManifestScene.reference`/`.translation`
+// are required — so with zero scenes the wizard's selection has nowhere per-scene to
+// live. It is seeded at the PROJECT level instead (`manifest.scripture`), which is also
+// what the datum is: the origin passage survives a re-plan, a scene does not.
+//
+// Seeding a synthesized first scene was the alternative and it is worse: it would mean
+// inventing a `scriptText` and a `visualPrompt` the user never asked for, committing them
+// to their GitHub repo, and then having the first storyboard generation delete them.
+
+describe("createProjectWithScaffold — the wizard's picked passage (feature 2)", () => {
+  const SCRIPTURE = {
+    reference: "Psalm 121",
+    translation: "ASV",
+    language: "en",
+    passageId: "PSA.121",
+  };
+
+  it("U-W18: seeds manifest.scripture into the scaffold payload", async () => {
+    const { prisma } = makeFake({ connection: { installationId: "42" } });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const svc = makeService(prisma, enqueued);
+
+    await svc.createProjectWithScaffold("u1", {
+      ...CREATE_REQ,
+      createdFrom: "passage" as const,
+      scripture: SCRIPTURE,
+    } as any);
+
+    const payload = enqueued.calls[0].payload;
+    expect(payload.createdFrom).toBe("passage");
+    expect(payload.manifest.scripture).toEqual(SCRIPTURE);
+    // The rest of the blank manifest is untouched — this seeds a field, it does not
+    // fabricate a composition.
+    expect(payload.manifest.manifestVersion).toBe(1);
+    expect(payload.manifest.scenes).toEqual([]);
+  });
+
+  it("U-W19: a project row records the passage origin", async () => {
+    const { prisma, calls } = makeFake({ connection: { installationId: "42" } });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const svc = makeService(prisma, enqueued);
+
+    await svc.createProjectWithScaffold("u1", {
+      ...CREATE_REQ,
+      createdFrom: "passage" as const,
+      scripture: SCRIPTURE,
+    } as any);
+
+    expect(find(calls, "project.create").args.data.createdFrom).toBe("passage");
+  });
+
+  it("U-W20: WITHOUT a passage the scaffolded manifest is byte-identical to today's", async () => {
+    const { prisma } = makeFake({ connection: { installationId: "42" } });
+    const enqueued = { calls: [] as { opts: EnqueueOptions; payload: any }[] };
+    const svc = makeService(prisma, enqueued);
+
+    await svc.createProjectWithScaffold("u1", CREATE_REQ);
+
+    const manifest = enqueued.calls[0].payload.manifest;
+    expect("scripture" in manifest).toBe(false);
+    expect(manifest).toEqual({
+      manifestVersion: 1,
+      composition: { width: 1080, height: 1920, fps: 30, aspectRatio: "9:16" },
+      scenes: [],
+      narratorVoice: { description: "Calm, measured narrator" },
+    });
+  });
+});

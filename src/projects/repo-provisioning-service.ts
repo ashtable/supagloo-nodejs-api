@@ -12,13 +12,17 @@ import {
   RepoCreationError,
   RepoNotVisibleError,
 } from "./repo-provisioning-errors";
+import type { ProjectScripture } from "../jobs/project-scripture";
 
 /** The create-project+scaffold delegate (task-18 `ProjectJobsService.createProjectWithScaffold`),
  *  injected as a seam so this service depends only on the create CONTRACT, not the
- *  whole ProjectJobsService class. */
+ *  whole ProjectJobsService class.
+ *
+ *  Feature 2: `scripture` is a forward declaration — db-lib's request schemas carry it
+ *  from the release step, and this intersection collapses at the bump. */
 export type CreateProjectDelegate = (
   userId: string,
-  req: CreateProjectRequest,
+  req: CreateProjectRequest & { scripture?: ProjectScripture },
 ) => Promise<{ projectId: string; jobId: string }>;
 
 /** Tuning for the installation-visibility gate (DR1). Every value has a default; this
@@ -151,12 +155,17 @@ export class RepoProvisioningService {
     // Delegate to the existing create-project+scaffold path with the CREATED repo's
     // GitHub-assigned owner + name. The gate above is what makes the workflow's
     // `ensureRepoReachable` step safe to enqueue against.
+    // Feature 2: the wizard's picked passage rides through to the SAME seeding path the
+    // "use existing empty repo" tab takes. Carrying it on only one of the two submit
+    // paths would make the feature work on one tab and silently do nothing on the other.
+    const scripture = (req as { scripture?: ProjectScripture }).scripture;
     return this.createProject(userId, {
       name: req.name,
       repoOwner: created.owner,
       repoName: created.name,
       visibility: req.visibility,
       createdFrom: req.createdFrom,
+      ...(scripture !== undefined ? { scripture } : {}),
     });
   }
 

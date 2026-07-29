@@ -26,7 +26,24 @@ import {
 import { GithubNotConnectedError } from "../connections/errors";
 import { ProjectNotFoundError } from "../projects/errors";
 import { toProjectJobDto } from "../jobs/dto";
+import { ProjectScriptureSchema } from "../jobs/project-scripture";
 import { errorResponseSchema } from "./auth";
+
+/**
+ * Feature 2 — the create body, with the wizard's picked passage EXPLICITLY declared.
+ *
+ * `.extend()` rather than relying on db-lib's own field, because this repo's pinned
+ * db-lib copy does not carry it yet and a plain `z.object` strips unknown keys in
+ * SILENCE: the wizard would post the passage, get its 201, watch the project scaffold,
+ * and the selection would simply be gone. Declaring it here makes a malformed block a
+ * loud 400 and lets the good case reach the service today.
+ *
+ * At the db-lib bump this becomes a no-op re-declaration of an identical shape and
+ * collapses back to `CreateProjectRequestSchema`.
+ */
+const CreateProjectBodySchema = CreateProjectRequestSchema.extend({
+  scripture: ProjectScriptureSchema.optional(),
+});
 
 export interface ProjectJobRoutesDeps {
   service: ProjectJobsService;
@@ -64,7 +81,7 @@ export function registerProjectJobRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        body: CreateProjectRequestSchema,
+        body: CreateProjectBodySchema,
         response: {
           201: CreateProjectResponseSchema,
           400: errorResponseSchema,

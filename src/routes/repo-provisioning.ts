@@ -13,7 +13,17 @@ import {
   ProjectAlreadyExistsError,
 } from "../jobs/errors";
 import { GithubNotConnectedError } from "../connections/errors";
+import { ProjectScriptureSchema } from "../jobs/project-scripture";
 import { errorResponseSchema } from "./auth";
+
+/** Feature 2 — the create-new-repo body, with the wizard's picked passage explicitly
+ *  declared. Same reason as `CreateProjectBodySchema` in `./project-jobs.ts`: a plain
+ *  `z.object` strips an undeclared key in SILENCE, so this is what stops the "create new
+ *  repo" tab from posting a passage that quietly never lands. Collapses at the db-lib
+ *  bump. */
+const CreateRepoBodySchema = CreateRepoRequestSchema.extend({
+  scripture: ProjectScriptureSchema.optional(),
+});
 
 export interface RepoProvisioningRoutesDeps {
   service: RepoProvisioningService;
@@ -68,7 +78,7 @@ export function registerRepoProvisioningRoutes(
     {
       preHandler: app.requireAuth,
       schema: {
-        body: CreateRepoRequestSchema,
+        body: CreateRepoBodySchema,
         response: {
           201: CreateProjectResponseSchema,
           400: errorResponseSchema,
