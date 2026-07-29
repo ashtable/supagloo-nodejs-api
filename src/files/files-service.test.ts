@@ -5,7 +5,7 @@ import {
   buildRenderOutputKey,
   buildRenderThumbnailKey,
 } from "@supagloo/database-lib";
-import { FilesService } from "./files-service";
+import { DEMO_VIDEO_KEY, FilesService } from "./files-service";
 import { makeS3Client, type S3EnvConfig } from "./s3-client";
 import { FileAccessDeniedError } from "./errors";
 
@@ -230,4 +230,41 @@ describe("FilesService.presignDownload — malformed keys", () => {
       expect(calls).toEqual([]);
     });
   }
+});
+
+describe("FilesService.presignDemoVideo — the landing page's public demo", () => {
+  it("signs the module constant, and takes no key to sign anything else", async () => {
+    const now = () => new Date("2026-07-29T00:00:00.000Z");
+    const { service, calls } = makeService({}, { now, expiresInSeconds: 300 });
+
+    const res = await service.presignDemoVideo(120);
+
+    const url = new URL(res.url);
+    // Path-style against the PUBLIC endpoint, like every other presign here.
+    expect(url.host).toBe("localhost:9000");
+    expect(url.pathname).toBe(`/${S3_CFG.bucket}/${DEMO_VIDEO_KEY}`);
+    expect(url.searchParams.get("X-Amz-Expires")).toBe("120");
+    expect(res.expiresAt.toISOString()).toBe("2026-07-29T00:02:00.000Z");
+
+    // No database lookup at all: there is no row to authorize, which is exactly why the
+    // key must not be caller-supplied.
+    expect(calls).toEqual([]);
+  });
+
+  it("cannot be asked to sign a different object", () => {
+    // The security property, asserted against the SIGNATURE rather than the behaviour:
+    // `presignDemoVideo` accepts a TTL and nothing else. If a `key` parameter is ever
+    // added, this stops compiling and the reviewer has to justify it — which is the
+    // point, because this method is reachable with no authentication at all.
+    const { service } = makeService({});
+    expect(service.presignDemoVideo).toHaveLength(1); // (expiresInSeconds?) only
+    expect(DEMO_VIDEO_KEY).toBe("demos/genesis-1-demo.mp4");
+  });
+
+  it("falls back to the service TTL when none is given", async () => {
+    const now = () => new Date("2026-07-29T00:00:00.000Z");
+    const { service } = makeService({}, { now, expiresInSeconds: 300 });
+    const res = await service.presignDemoVideo();
+    expect(new URL(res.url).searchParams.get("X-Amz-Expires")).toBe("300");
+  });
 });
