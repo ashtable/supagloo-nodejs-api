@@ -19,8 +19,11 @@ import type { ProjectManifest } from "@supagloo/database-lib";
  *
  * **DELETE THIS FILE AT THE db-lib BUMP** and read `CreateProjectRequestSchema.scripture`
  * / `ManifestScriptureSchema` directly. This is byte-identical to db-lib's
- * `ManifestScriptureSchema`; the two are pinned against each other by
- * `project-scripture.test.ts` once db-lib exports it.
+ * `ManifestScriptureSchema`, and `project-scripture.test.ts` holds the two against each
+ * other BEHAVIOURALLY — same accepts, same rejects, same parsed output. That check reads
+ * the db-lib barrel at RUNTIME, so it is inert (and asserts that it is inert, rather than
+ * skipping) while the pinned SHA predates the export, and starts comparing for real the
+ * moment the submodule bump lands. Nothing has to be remembered at the release.
  *
  * ## What it deliberately does not carry
  *
