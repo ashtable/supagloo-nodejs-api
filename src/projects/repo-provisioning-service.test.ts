@@ -448,3 +448,56 @@ describe("RepoProvisioningService.createRepoAndProject — installation-visibili
     expect(createCalls).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Feature 2 — the OTHER wizard payload site
+// ---------------------------------------------------------------------------
+//
+// The wizard has two submit paths: the "create new repo" tab posts here, the "use
+// existing empty repo" tab posts straight to `POST /v1/projects`. Carrying the passage on
+// only one of them would make the feature work on one tab and silently do nothing on the
+// other — with no error on either, because the delegate simply never sees the field.
+
+describe("RepoProvisioningService.createRepoAndProject — the picked passage (feature 2)", () => {
+  const SCRIPTURE = {
+    reference: "Psalm 121",
+    translation: "ASV",
+    language: "en",
+    passageId: "PSA.121",
+  };
+
+  it("U-W21: forwards scripture + createdFrom to the create-project delegate", async () => {
+    const { client } = recordingUserAuthClient();
+    const { createProject, calls: createCalls } = recordingCreateProject();
+    const svc = new RepoProvisioningService({
+      prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
+      userAuthClient: client,
+      createProject,
+    });
+
+    await svc.createRepoAndProject("u1", {
+      ...REQ,
+      createdFrom: "passage",
+      scripture: SCRIPTURE,
+    } as any);
+
+    expect(createCalls[0].req).toMatchObject({
+      createdFrom: "passage",
+      scripture: SCRIPTURE,
+    });
+  });
+
+  it("U-W22: a blank project forwards no scripture key at all", async () => {
+    const { client } = recordingUserAuthClient();
+    const { createProject, calls: createCalls } = recordingCreateProject();
+    const svc = new RepoProvisioningService({
+      prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
+      userAuthClient: client,
+      createProject,
+    });
+
+    await svc.createRepoAndProject("u1", REQ);
+
+    expect("scripture" in (createCalls[0].req as object)).toBe(false);
+  });
+});

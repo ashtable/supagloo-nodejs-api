@@ -32,6 +32,17 @@ import {
 } from "./errors";
 import { resolveGitOpsWorkflow } from "./workflow-lookup";
 import { nextFreeSlug, slugify } from "./slug";
+import {
+  seedManifestScripture,
+  type ProjectScripture,
+} from "./project-scripture";
+
+/** Feature 2: the create request plus the wizard's picked passage. A forward declaration
+ *  — db-lib's `CreateProjectRequestSchema` carries `scripture` from the release step, and
+ *  this alias collapses into it at the bump. */
+type CreateProjectRequestWithScripture = CreateProjectRequest & {
+  scripture?: ProjectScripture;
+};
 
 /** The enqueue arguments: workflow name + queue + the workflowID (= ProjectJob id). */
 export interface EnqueueOptions {
@@ -189,7 +200,7 @@ export class ProjectJobsService {
 
   async createProjectWithScaffold(
     userId: string,
-    req: CreateProjectRequest,
+    req: CreateProjectRequestWithScripture,
   ): Promise<{ projectId: string; jobId: string }> {
     // `import` is a DIFFERENT flow (task-19 import_verify), never scaffolded here.
     if (req.createdFrom === "import") {
@@ -232,7 +243,10 @@ export class ProjectJobsService {
 
     const name = req.name ?? req.repoName;
     const jobId = this.generateJobId();
-    const manifest = buildBlankManifest();
+    // Feature 2: the scaffolded manifest, plus the passage the wizard's step 2 picked
+    // (seeded at the PROJECT level — see `seedManifestScripture` for why not a scene).
+    // With no passage this is byte-identical to `buildBlankManifest()`.
+    const manifest = seedManifestScripture(buildBlankManifest(), req.scripture);
     const stages = buildInitialStages(SCAFFOLD_STAGES);
 
     // The catch wraps the WHOLE `$transaction` call — see {@link asDuplicateCreate}.

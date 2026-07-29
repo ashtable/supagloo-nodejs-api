@@ -524,3 +524,97 @@ describe("POST /projects/:id/publish (Task #22)", () => {
     expect(res.statusCode).toBe(401);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Feature 2 — the wizard's picked passage must SURVIVE the route boundary
+// ---------------------------------------------------------------------------
+//
+// This is the expensive gap the brief names: Zod `.strip()` drops an undeclared field
+// SILENTLY rather than rejecting it, so a scripture block added to the client payload
+// would appear to work and do nothing at all. There is no error to notice — the wizard
+// gets its 201, the project scaffolds, and the passage is simply gone.
+//
+// The route therefore validates the body with an EXPLICITLY extended schema, and this
+// test is the guard on that: it drives the real handler and asserts the value reaches the
+// service. Asserting the schema alone would prove nothing, because this repo's pinned
+// `@supagloo/database-lib` copy is exactly the version that strips it.
+
+describe("POST /projects — the scripture selection (feature 2)", () => {
+  const SCRIPTURE = {
+    reference: "Psalm 121",
+    translation: "ASV",
+    language: "en",
+    passageId: "PSA.121",
+  };
+  const CREATE_BODY = {
+    name: "Psalm 121",
+    repoOwner: "ashtable",
+    repoName: "psalm-121",
+    visibility: "private",
+    createdFrom: "passage",
+    scripture: SCRIPTURE,
+  };
+
+  const capturing = () => {
+    const seen: { userId?: string; req?: any } = {};
+    return {
+      seen,
+      service: makeService({
+        createProjectWithScaffold: async (userId: string, req: any) => {
+          seen.userId = userId;
+          seen.req = req;
+          return { projectId: "p", jobId: "j" };
+        },
+      }),
+    };
+  };
+
+  it("U-W15: the picked passage reaches the service instead of being silently stripped", async () => {
+    const { seen, service } = capturing();
+    app = await buildTestApp(service);
+    const res = await app.inject({
+      method: "POST",
+      url: "/projects",
+      headers: BEARER,
+      payload: CREATE_BODY,
+    });
+    expect(res.statusCode).toBe(201);
+    expect(seen.req.scripture).toEqual(SCRIPTURE);
+    expect(seen.req.createdFrom).toBe("passage");
+  });
+
+  it("U-W16: a blank project still sends no scripture at all", async () => {
+    const { seen, service } = capturing();
+    app = await buildTestApp(service);
+    const { scripture, ...blank } = CREATE_BODY;
+    void scripture;
+    const res = await app.inject({
+      method: "POST",
+      url: "/projects",
+      headers: BEARER,
+      payload: { ...blank, createdFrom: "blank" },
+    });
+    expect(res.statusCode).toBe(201);
+    expect("scripture" in seen.req).toBe(false);
+  });
+
+  it("U-W17: a MALFORMED scripture block is a 400, not a silent drop", async () => {
+    // The whole point of declaring it: an unknown key vanishes without complaint, but a
+    // known key with a bad value must be refused loudly. Otherwise the failure mode is a
+    // project that scaffolds successfully with no passage and nothing to look at.
+    app = await buildTestApp(makeService());
+    for (const bad of [
+      { reference: "Psalm 121" },
+      { reference: "", translation: "ASV" },
+      { reference: "Psalm 121", translation: "ASV", passageId: "" },
+    ]) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/projects",
+        headers: BEARER,
+        payload: { ...CREATE_BODY, scripture: bad },
+      });
+      expect(res.statusCode, JSON.stringify(bad)).toBe(400);
+    }
+  });
+});
