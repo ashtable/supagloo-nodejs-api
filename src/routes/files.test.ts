@@ -115,3 +115,73 @@ describe("File routes — presign-download", () => {
     expect(res.statusCode).toBe(400);
   });
 });
+
+describe("File routes — demo stream-url (public)", () => {
+  let app: FastifyInstance | undefined;
+  afterEach(async () => {
+    if (app) await app.close();
+    app = undefined;
+  });
+
+  const DEMO = {
+    url: "http://localhost:9000/supagloo-dev/demos/genesis-1-demo.mp4?X-Amz-Signature=abc",
+    expiresAt: new Date("2026-07-29T00:02:00.000Z"),
+  };
+
+  const demoDeps = () => {
+    const calls: unknown[][] = [];
+    return {
+      calls,
+      deps: makeDeps({
+        service: {
+          presignDemoVideo: async (...args: unknown[]) => {
+            calls.push(args);
+            return DEMO;
+          },
+        },
+      }),
+    };
+  };
+
+  it("serves an ANONYMOUS caller — no bearer token, no 401", async () => {
+    // The landing page is public, so its demo has to be. This is the assertion that
+    // would fail if someone "tidied up" by giving every route in this file the same
+    // preHandler as its neighbour.
+    const { deps } = demoDeps();
+    app = await buildApp(deps);
+
+    const res = await app.inject({ method: "GET", url: "/demo/stream-url" });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      url: DEMO.url,
+      expiresAt: "2026-07-29T00:02:00.000Z",
+    });
+  });
+
+  it("ignores anything the caller tries to say — there is no key parameter", async () => {
+    // An unauthenticated route that signed a caller-supplied key would presign ANY object
+    // in the bucket for ANYONE. The handler passes only a TTL, so a `key` in the query
+    // string is inert: it reaches neither the service nor S3.
+    const { deps, calls } = demoDeps();
+    app = await buildApp(deps);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/demo/stream-url?key=renders/someone-elses-render/output.mp4",
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(calls).toEqual([[120]]); // the TTL, and nothing else
+    expect(res.json().url).toBe(DEMO.url);
+  });
+
+  it("presigns for 120s, not the authed 300s default", async () => {
+    // For an anonymous caller the URL *is* the credential, so it should outlive the click
+    // by as little as still works.
+    const { deps, calls } = demoDeps();
+    app = await buildApp(deps);
+    await app.inject({ method: "GET", url: "/demo/stream-url" });
+    expect(calls[0][0]).toBe(120);
+  });
+});

@@ -8,6 +8,15 @@ import {
 import { FileAccessDeniedError } from "./errors";
 
 /**
+ * The landing page's demo video, uploaded out-of-band (not written by any workflow) and
+ * therefore deliberately OUTSIDE db-lib's `parseS3Key` layouts — those describe objects the
+ * render/git-ops workflows produce, and this is not one.
+ *
+ * A module constant, never a parameter: see {@link FilesService.presignDemoVideo}.
+ */
+export const DEMO_VIDEO_KEY = "demos/genesis-1-demo.mp4";
+
+/**
  * S3 presigned-download service (design-delta §4/§8). Backs the single route
  * `GET /v1/files/presign-download?key=`. It:
  *   1. parses the requested key with the SHARED db-lib layout helper (so the format
@@ -106,6 +115,40 @@ export class FilesService {
    *
    * @throws {FileAccessDeniedError} on a malformed key, before touching S3 or the database.
    */
+  /**
+   * Presign the landing page's demo video — the ONE object served to a caller who is not
+   * merely unauthenticated but anonymous, with no row anywhere to authorize them.
+   *
+   * **It deliberately takes no key**, and that is the security property, stated in the type
+   * signature rather than trusted to a comment. `GET /v1/demo/stream-url` has no auth hook,
+   * so a key taken from the request would make this sign whatever anyone asked for — an open
+   * presigning oracle over a bucket holding every user's renders, scene assets and narration
+   * audio, where anyone who learned or guessed a project id could pull private media out
+   * without credentials. A compile-time constant makes that request unrepresentable.
+   *
+   * WHY NO `parseS3Key`, unlike every other method here: that guard exists to stop a
+   * malformed CALLER-SUPPLIED key from reaching S3, and there is no caller input to
+   * validate. {@link DEMO_VIDEO_KEY} is also outside the layouts `parseS3Key` knows — it is
+   * neither a project asset nor a render output — so routing it through that helper would
+   * reject the one key this method is permitted to sign.
+   *
+   * Same short-TTL reasoning as the gallery stream (for an anonymous caller the URL *is* the
+   * credential), and the same honest limitation: a range session already in flight continues
+   * past expiry, so the TTL bounds NEW requests only.
+   */
+  async presignDemoVideo(expiresInSeconds?: number): Promise<PresignedDownload> {
+    const expiresIn = expiresInSeconds ?? this.expiresInSeconds;
+    const url = await getSignedUrl(
+      this.s3,
+      new GetObjectCommand({ Bucket: this.bucket, Key: DEMO_VIDEO_KEY }),
+      { expiresIn },
+    );
+    return {
+      url,
+      expiresAt: new Date(this.now().getTime() + expiresIn * 1000),
+    };
+  }
+
   async presignPublicKey(
     key: string,
     expiresInSeconds?: number,
