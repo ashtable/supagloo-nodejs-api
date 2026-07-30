@@ -7,7 +7,10 @@ import {
 } from "@supagloo/database-lib";
 import { buildApp } from "../../src/app";
 import { AuthService } from "../../src/auth/auth-service";
-import { makeYouVersionVerifier } from "../../src/auth/youversion";
+import {
+  makeYouVersionVerifier,
+  youVersionEndpointsFrom,
+} from "../../src/auth/youversion";
 import { SESSION_TTL_MS } from "../../src/auth/tokens";
 import { ProjectsService } from "../../src/projects/projects-service";
 
@@ -39,7 +42,7 @@ describe("e2e: projects/versions read CRUD", () => {
     prisma = createPrismaClient({ connectionString: APP_URL });
     const authService = new AuthService({
       prisma,
-      verifyToken: makeYouVersionVerifier({ baseUrl: YOUVERSION_BASE }),
+      verifyToken: makeYouVersionVerifier(youVersionEndpointsFrom(YOUVERSION_BASE)),
       sessionTtlMs: SESSION_TTL_MS,
     });
     const projectsService = new ProjectsService({ prisma });
