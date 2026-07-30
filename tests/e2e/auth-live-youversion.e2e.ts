@@ -3,7 +3,10 @@ import type { FastifyInstance } from "fastify";
 import { createPrismaClient, type PrismaClient } from "@supagloo/database-lib";
 import { buildApp } from "../../src/app";
 import { AuthService } from "../../src/auth/auth-service";
-import { makeYouVersionVerifier } from "../../src/auth/youversion";
+import {
+  makeYouVersionVerifier,
+  youVersionEndpointsFrom,
+} from "../../src/auth/youversion";
 import { SESSION_TTL_MS } from "../../src/auth/tokens";
 import {
   resolveYouVersionLiveGate,
@@ -61,7 +64,7 @@ describe.skipIf(!gate.enabled)(
         prisma,
         // REAL verifier against the REAL host — this spec's entire purpose is to
         // exercise live YouVersion egress with a real access token.
-        verifyToken: makeYouVersionVerifier({ baseUrl: YOUVERSION_BASE }),
+        verifyToken: makeYouVersionVerifier(youVersionEndpointsFrom(YOUVERSION_BASE)),
         clock: () => new Date(),
         sessionTtlMs: SESSION_TTL_MS,
       });
