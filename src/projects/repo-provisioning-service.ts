@@ -131,9 +131,13 @@ export interface RepoProvisioningServiceOptions {
   /** Injected alongside `sleep` for the same reason. Production uses `Date.now`. */
   now?: () => number;
   installationVisibility?: InstallationVisibilityOptions;
-  /** Override the gate's listing — see {@link InstallationRepoLister}. Left in place for
-   *  the api e2e, which reaches the SAME endpoint with a token it minted itself rather
-   *  than building a whole App client for one read. */
+  /** Override the gate's listing — see {@link InstallationRepoLister}.
+   *
+   *  As of 2026-07-31 nothing outside the unit lane uses this: the api e2e used to
+   *  substitute a lister because the old endpoint was unreachable there, and now runs the
+   *  real path. It stays because a bounded retry loop over an injected async function is
+   *  the only cheap way to script "not yet, not yet, now" — the App-client fake would have
+   *  to grow a page-scripting mode to say the same thing. */
   listInstallationRepos?: InstallationRepoLister;
 }
 

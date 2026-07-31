@@ -511,9 +511,10 @@ describe("RepoProvisioningService.createRepoAndProject — installation-visibili
     expect(Math.max(...clock.sleeps)).toBe(5_000);
   });
 
-  // The gate's listing is still a SEAM over the App-client default. The api e2e uses it
-  // to reach the SAME endpoint with a token it has already minted, rather than building a
-  // whole App client for one read.
+  // The gate's listing is still a SEAM over the App-client default — the mechanism the
+  // scripted-listing cases above use to say "not yet, not yet, now". Nothing OUTSIDE this
+  // file overrides it any more (the api e2e runs the real path since 2026-07-31), so this
+  // case is what keeps the seam honest.
   it("uses an injected lister in preference to the App client's", async () => {
     const clock = fakeClock();
     const { client } = recordingUserAuthClient();
