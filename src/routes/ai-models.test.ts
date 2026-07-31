@@ -7,6 +7,7 @@ import {
 import { bearerAuthPlugin } from "../auth/bearer-auth";
 import { registerAiModelRoutes } from "./ai-models";
 import { AiModelCatalogueResponseSchema } from "../ai/model-catalogue-dto";
+import type { AiModelInfo } from "../ai/model-catalogue";
 
 /**
  * U-MC10/U-MC11 — the thin handler for `GET /v1/ai/models`.
@@ -28,7 +29,10 @@ const fakeAuthService = {
     token === "valid" ? { user: { id: "u1" }, session: { id: "s1" } } : null,
 };
 
-const RESULT = {
+const RESULT: {
+  models: AiModelInfo[];
+  providers: { gloo: boolean; openrouter: boolean };
+} = {
   models: [
     {
       id: "vendor/img",
@@ -36,6 +40,7 @@ const RESULT = {
       label: "Vendor Image",
       kinds: ["image" as const],
       pricing: { perImage: 0.03 },
+      voices: null,
     },
     {
       id: "gloo-vendor-flux",
@@ -43,6 +48,7 @@ const RESULT = {
       label: "Vendor Flux",
       kinds: ["image" as const],
       pricing: null,
+      voices: null,
     },
   ],
   providers: { gloo: true, openrouter: true },
@@ -50,7 +56,12 @@ const RESULT = {
 
 let app: FastifyInstance | undefined;
 
-async function build(read: (userId: string) => Promise<typeof RESULT>) {
+async function build(
+  read: (userId: string) => Promise<{
+    models: AiModelInfo[];
+    providers: { gloo: boolean; openrouter: boolean };
+  }>,
+) {
   const instance = Fastify();
   instance.setValidatorCompiler(validatorCompiler);
   instance.setSerializerCompiler(serializerCompiler);
@@ -119,5 +130,43 @@ describe("GET /ai/models", () => {
       models: [],
       providers: { gloo: false, openrouter: true },
     });
+  });
+
+  it("U-MC12: the SERIALIZER does not strip `supported_voices`", async () => {
+    // THE strip point. Fastify's zod serializer runs the response through
+    // `AiModelCatalogueResponseSchema`, and a `z.object` drops unknown keys — so adding
+    // `voices` to the service and the mapper without adding it to the DTO yields exactly
+    // nothing on the wire, silently, with every service-level test still green. This is
+    // the boundary the four-mirror rule does not name and no other repo's suite can see.
+    //
+    // Asserted against the RAW body rather than the parsed one: parsing with the same
+    // schema that does the stripping is agreement, not proof.
+    const instance = await build(async () => ({
+      models: [
+        {
+          id: "hexgrad/kokoro-82m",
+          provider: "openrouter" as const,
+          label: "hexgrad: Kokoro 82M",
+          kinds: ["narration" as const],
+          pricing: null,
+          voices: ["af_alloy", "am_adam"],
+        },
+        RESULT.models[0],
+      ],
+      providers: { gloo: false, openrouter: true },
+    }));
+    const res = await instance.inject({
+      method: "GET",
+      url: "/ai/models",
+      headers: { authorization: "Bearer valid" },
+    });
+    expect(res.statusCode).toBe(200);
+    const raw = JSON.parse(res.body) as {
+      models: Array<{ id: string; voices: unknown }>;
+    };
+    expect(raw.models[0].voices).toEqual(["af_alloy", "am_adam"]);
+    // And `null` survives as null rather than being dropped to `undefined`, which would
+    // make an unpublished vocabulary indistinguishable from a stripped one.
+    expect(raw.models[1]).toHaveProperty("voices", null);
   });
 });

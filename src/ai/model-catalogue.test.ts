@@ -50,6 +50,7 @@ describe("toOpenRouterCatalogueEntry (U-MC1, U-MC2)", () => {
       label: "Vendor Image",
       kinds: ["image"],
       pricing: { perImage: 0.03, perInputToken: 0.0000005, perOutputToken: 0.000002 },
+      voices: null,
     });
   });
 
@@ -173,6 +174,61 @@ describe("toOpenRouterSpeechEntry / toOpenRouterAudioEntry / toOpenRouterVideoEn
     expect(entry.kinds).toEqual(["video"]);
     expect(entry.pricing).toBeNull();
   });
+
+  it("U-MC1f: a speech entry carries the provider's `supported_voices` VERBATIM", () => {
+    // The whole of the narrator-voice bug lives on this line. The studio shipped a
+    // CURATED per-model voice table, and it was wrong for every model it claimed to cover:
+    // there is no `openai/` entry in the speech catalogue at all, so its `FALLBACK`
+    // matched nothing real and every live speech model fell through to a list none of them
+    // declare. Measured against `hexgrad/kokoro-82m` on 2026-07-30, six of the eight
+    // offered ids aliased silently onto Kokoro voices (both "Alloy" and "Shimmer" onto
+    // American FEMALE ones — the reported symptom) and two hard-400'd the generation.
+    //
+    // The provider states its own vocabulary on a top-level `supported_voices` key of this
+    // very response, which this service has been fetching and discarding all along. Order
+    // is preserved and nothing is normalised: the id is sent to the provider verbatim.
+    const entry = toOpenRouterSpeechEntry({
+      id: "vendor/tts",
+      supported_voices: ["bm_daniel", "am_adam", "af_alloy"],
+    });
+    expect(entry.voices).toEqual(["bm_daniel", "am_adam", "af_alloy"]);
+  });
+
+  it("U-MC1g: an UNPUBLISHED vocabulary is `null`, and `null` is not `[]`", () => {
+    // Measured live 2026-07-30: 6 of the 19 speech models publish `supported_voices: null`
+    // (all `fish-audio/*`, both `minimax/*`). An empty array never occurs. The two states
+    // must stay distinguishable — `null` is "the provider says nothing", `[]` would be
+    // "the provider says there are none" — because the picker renders them the same way
+    // only by coincidence today.
+    expect(toOpenRouterSpeechEntry({ id: "vendor/tts" }).voices).toBeNull();
+    expect(
+      toOpenRouterSpeechEntry({ id: "vendor/tts", supported_voices: null }).voices,
+    ).toBeNull();
+    expect(
+      toOpenRouterSpeechEntry({ id: "vendor/tts", supported_voices: "alloy" }).voices,
+    ).toBeNull();
+    expect(
+      toOpenRouterSpeechEntry({ id: "vendor/tts", supported_voices: [] }).voices,
+    ).toEqual([]);
+    // Non-string members are dropped rather than coerced: a coerced `"[object Object]"`
+    // would be sent to the provider as a voice id.
+    expect(
+      toOpenRouterSpeechEntry({
+        id: "vendor/tts",
+        supported_voices: ["am_adam", 7, null, { id: "x" }, ""],
+      }).voices,
+    ).toEqual(["am_adam"]);
+  });
+
+  it("U-MC1h: every OTHER catalogue's entries carry `voices: null`", () => {
+    // A required-nullable field rather than an optional one, mirroring `pricing`: the
+    // mappers are its only writers, so a missed one is a compile error rather than an
+    // absent key the consumer has to guess about.
+    expect(toOpenRouterCatalogueEntry({ id: "vendor/chat" }).voices).toBeNull();
+    expect(toOpenRouterAudioEntry({ id: "vendor/lyria" }).voices).toBeNull();
+    expect(toOpenRouterVideoEntry({ id: "vendor/video" }).voices).toBeNull();
+    expect(toGlooCatalogueEntry({ id: "gloo-vendor-flux" }).voices).toBeNull();
+  });
 });
 
 describe("toGlooCatalogueEntry (U-MC3, U-MC5)", () => {
@@ -238,13 +294,14 @@ describe("toGlooCatalogueEntry (U-MC3, U-MC5)", () => {
 
 describe("filterByMatrix (U-MC4)", () => {
   const models: AiModelInfo[] = [
-    { id: "g-img", provider: "gloo", label: "g-img", kinds: ["image"], pricing: null },
+    { id: "g-img", provider: "gloo", label: "g-img", kinds: ["image"], pricing: null, voices: null },
     {
       id: "g-txt",
       provider: "gloo",
       label: "g-txt",
       kinds: ["storyboard", "script"],
       pricing: null,
+      voices: null,
     },
     {
       id: "or-img",
@@ -252,6 +309,7 @@ describe("filterByMatrix (U-MC4)", () => {
       label: "or-img",
       kinds: ["image"],
       pricing: null,
+      voices: null,
     },
     {
       id: "or-tts",
@@ -259,6 +317,7 @@ describe("filterByMatrix (U-MC4)", () => {
       label: "or-tts",
       kinds: ["narration", "music"],
       pricing: null,
+      voices: null,
     },
   ];
 
@@ -309,15 +368,16 @@ describe("narrowToSelectableKinds (U-MC13)", () => {
     // render — ~67 KB of JSON serialized by the api, shipped `cache: "no-store"` and
     // re-parsed by a browser-side Zod schema on EVERY studio open, to populate nothing.
     const kept = narrowToSelectableKinds([
-      { id: "or-img", provider: "openrouter", label: "", kinds: ["image"], pricing: null },
+      { id: "or-img", provider: "openrouter", label: "", kinds: ["image"], pricing: null, voices: null },
       {
         id: "or-txt",
         provider: "openrouter",
         label: "",
         kinds: ["storyboard", "script"],
         pricing: null,
+        voices: null,
       },
-      { id: "or-vid", provider: "openrouter", label: "", kinds: ["video"], pricing: null },
+      { id: "or-vid", provider: "openrouter", label: "", kinds: ["video"], pricing: null, voices: null },
     ]);
     expect(kept.map((m) => m.id)).toEqual(["or-img", "or-vid"]);
   });
@@ -333,6 +393,7 @@ describe("narrowToSelectableKinds (U-MC13)", () => {
         label: "",
         kinds: ["image", "storyboard", "script"],
         pricing: null,
+        voices: null,
       },
     ]);
     expect(kept[0]?.kinds).toEqual(["image", "storyboard", "script"]);

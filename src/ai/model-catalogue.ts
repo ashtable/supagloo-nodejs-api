@@ -68,6 +68,29 @@ export interface AiModelInfo {
   /** `null` when the provider publishes nothing usable — deliberately distinct from an
    *  empty object, so a consumer cannot mistake "unpriced" for "priced at zero". */
   pricing: AiModelPricing | null;
+  /**
+   * The provider's OWN voice vocabulary for a speech model — `supported_voices`, a
+   * top-level key on every entry of `GET /api/v1/models?output_modalities=speech`.
+   *
+   * `null` for every non-speech model AND for a speech model that publishes nothing,
+   * exactly as {@link pricing} works. Measured live 2026-07-30: 6 of the 19 speech models
+   * answer `supported_voices: null` (all `fish-audio/*`, both `minimax/*`); an empty array
+   * never occurs, so `[]` stays distinguishable rather than folded into `null`.
+   *
+   * ── Why this field exists ───────────────────────────────────────────────────────────
+   * The studio shipped a CURATED per-model voice table, and it was wrong for every model
+   * it claimed to cover: there is no `openai/` entry in this catalogue at all, so its
+   * `FALLBACK` matched nothing real and every live speech model fell through to a list
+   * none of them declare. Against `hexgrad/kokoro-82m`, six of the eight ids it offered
+   * aliased silently onto Kokoro voices — both "Alloy" and "Shimmer" onto American FEMALE
+   * ones, which is why one user heard a single narrator for two different picks — and two
+   * hard-400'd the entire generation.
+   *
+   * The bytes were already here: `ModelCatalogueService` has been fetching this catalogue
+   * and discarding the key. Which voices a model has is the provider's fact to state, not
+   * ours to assert.
+   */
+  voices: string[] | null;
 }
 
 /** The two text kinds, which any chat-capable model serves. */
@@ -91,6 +114,19 @@ function pricingOrNull(p: AiModelPricing): AiModelPricing | null {
 
 function strings(raw: unknown): string[] {
   return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === "string") : [];
+}
+
+/**
+ * A published voice vocabulary, or `null` when the provider published none.
+ *
+ * The `null`/`[]` distinction is deliberate and mirrors `pricing`: `null` is "the provider
+ * says nothing", `[]` would be "the provider says there are none". Non-string members are
+ * DROPPED rather than coerced — a coerced `"[object Object]"` would be sent to the speech
+ * endpoint as a voice id and rejected by name.
+ */
+function voiceList(raw: unknown): string[] | null {
+  if (!Array.isArray(raw)) return null;
+  return raw.filter((v): v is string => typeof v === "string" && v.length > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +167,7 @@ export function toOpenRouterCatalogueEntry(raw: RawOpenRouterModel): AiModelInfo
     label: typeof raw.name === "string" && raw.name.length > 0 ? raw.name : id,
     kinds: kindsForOpenRouterModel(strings(raw.architecture?.output_modalities)),
     pricing: pricingOrNull(pricing),
+    voices: null,
   };
 }
 
@@ -138,6 +175,8 @@ export interface RawOpenRouterSpeechModel {
   id?: unknown;
   name?: unknown;
   pricing?: { prompt?: unknown; completion?: unknown; audio?: unknown };
+  /** Present (and meaningful) on the SPEECH catalogue only — see `AiModelInfo.voices`. */
+  supported_voices?: unknown;
 }
 
 /**
@@ -180,6 +219,9 @@ export function toOpenRouterSpeechEntry(raw: RawOpenRouterSpeechModel): AiModelI
     label: typeof raw.name === "string" && raw.name.length > 0 ? raw.name : id,
     kinds: ["narration"],
     pricing: audioPricing(raw),
+    // The one mapper that carries a vocabulary. Order is preserved and nothing is
+    // normalised: this id is sent to the provider verbatim.
+    voices: voiceList(raw.supported_voices),
   };
 }
 
@@ -198,6 +240,7 @@ export function toOpenRouterAudioEntry(raw: RawOpenRouterSpeechModel): AiModelIn
     label: typeof raw.name === "string" && raw.name.length > 0 ? raw.name : id,
     kinds: ["music"],
     pricing: audioPricing(raw),
+    voices: null,
   };
 }
 
@@ -222,6 +265,7 @@ export function toOpenRouterVideoEntry(raw: RawOpenRouterVideoModel): AiModelInf
     label: typeof raw.name === "string" && raw.name.length > 0 ? raw.name : id,
     kinds: ["video"],
     pricing: null,
+    voices: null,
   };
 }
 
@@ -271,6 +315,9 @@ export function toGlooCatalogueEntry(raw: RawGlooModel): AiModelInfo {
     label: typeof raw.name === "string" && raw.name.length > 0 ? raw.name : id,
     kinds: kindsForGlooModel(strings(raw.output_modalities)),
     pricing: pricingOrNull(pricing),
+    // Gloo publishes no speech models at all (those routes answer 404, not 405), so there
+    // is no vocabulary to carry and never will be until the modality is wired end to end.
+    voices: null,
   };
 }
 
