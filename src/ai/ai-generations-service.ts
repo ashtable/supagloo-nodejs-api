@@ -8,10 +8,15 @@ import {
   type PrismaClient,
 } from "@supagloo/database-lib";
 import { ProjectNotFoundError } from "../projects/errors";
+import type {
+  ConnectionLookup,
+  ConnectionProvider,
+} from "../connections/connections-service";
 import {
   AiGenerationNotFoundError,
   GenerationNotCancelableError,
   KindProviderIncompatibleError,
+  ProviderNotConnectedError,
 } from "./errors";
 import { resolveAiGenerationWorkflow } from "./workflow-lookup";
 
@@ -44,6 +49,15 @@ export interface AiGenerationsServiceOptions {
   enqueue: GenerationEnqueue;
   /** Cancel a running/queued DBOS workflow by id (`DBOSClient.cancelWorkflow`). */
   cancel: GenerationCancel;
+  /**
+   * "Has this user connected `provider`?" — backs the pre-row 409 gate.
+   *
+   * REQUIRED rather than optional. An optional dependency defaulting to "allow" is a gate
+   * you can forget to wire and never notice, because the failure it prevents surfaces
+   * minutes later inside DBOS. Making it required means `server.ts` cannot compile without
+   * passing the real `ConnectionsService`.
+   */
+  connections: ConnectionLookup;
   /** Injectable clock for a deterministic `completedAt`. Defaults to wall-clock. */
   now?: () => Date;
   /** Injectable id generator for `AiGeneration.id` (= workflow id); defaults to uuid. */
@@ -64,6 +78,7 @@ export class AiGenerationsService {
   private readonly prisma: PrismaClient;
   private readonly enqueue: GenerationEnqueue;
   private readonly cancel: GenerationCancel;
+  private readonly connections: ConnectionLookup;
   private readonly now: () => Date;
   private readonly generateId: () => string;
 
@@ -71,17 +86,24 @@ export class AiGenerationsService {
     this.prisma = opts.prisma;
     this.enqueue = opts.enqueue;
     this.cancel = opts.cancel;
+    this.connections = opts.connections;
     this.now = opts.now ?? (() => new Date());
     this.generateId = opts.generateId ?? (() => randomUUID());
   }
 
   /**
-   * Create an `AiGeneration` row and enqueue its workflow. The two validation gates run
-   * BEFORE any row/workflow is created and yield distinct codes:
+   * Create an `AiGeneration` row and enqueue its workflow. FOUR gates run BEFORE any
+   * row/workflow is created, and their ORDER is a decision rather than an accident:
    *   1. if a `projectId` is given, the caller must own it (else 404 — never attach a
-   *      generation to a foreign project, which would leak it into that owner's list);
-   *   2. the `{kind, provider}` pair must be in the compatibility matrix (else 422);
-   *   3. the kind's workflow must be registered (else 501 for the not-yet-built kinds).
+   *      generation to a foreign project, which would leak it into that owner's list, and
+   *      never let the CHOICE of refusal reveal that the project exists);
+   *   2. the `{kind, provider}` pair must be in the compatibility matrix (else 422) — a
+   *      PERMANENT impossibility, which must win over the recoverable one below or we would
+   *      send the user off to connect an account that cannot help;
+   *   3. the caller must have CONNECTED that provider (else 409) — see
+   *      {@link ProviderNotConnectedError} for why this exists and why a disabled control in
+   *      the Studio is not enough on its own;
+   *   4. the kind's workflow must be registered (else 501 for the not-yet-built kinds).
    * Then create the queued row and enqueue AFTER the write (workflowID = generationId; a
    * re-enqueue on the same id is idempotent, so a post-write enqueue failure is a
    * recoverable stuck-`queued` gap, matching the ProjectJob create path).
@@ -100,6 +122,20 @@ export class AiGenerationsService {
     if (!isProviderCompatible(req.kind, req.provider)) {
       throw new KindProviderIncompatibleError(
         `provider "${req.provider}" cannot serve generation kind "${req.kind}"`,
+      );
+    }
+
+    // The connection gate. AFTER the matrix (a permanent impossibility outranks a
+    // recoverable one) and BEFORE the workflow lookup and the row write, so a refused
+    // request leaves nothing behind — no row for the user's generations list, no enqueue.
+    if (
+      !(await this.connections.isConnected(
+        userId,
+        req.provider as ConnectionProvider,
+      ))
+    ) {
+      throw new ProviderNotConnectedError(
+        `provider "${req.provider}" is not connected for this user`,
       );
     }
 

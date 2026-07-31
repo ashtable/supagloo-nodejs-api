@@ -46,6 +46,37 @@ export class UnsupportedGenerationKindError extends Error {
 }
 
 /**
+ * Thrown when the request's `provider` is matrix-VALID for the kind but the caller has not
+ * connected it. Maps to **409** (`provider_not_connected`), matching the existing
+ * `GithubNotConnectedError` / `OpenRouterNotConnectedError` precedent in
+ * `src/connections/errors.ts`.
+ *
+ * ── Why this is a distinct class from the 422, and why it exists at all ──────────────
+ *
+ * Before 2026-07-31 this path had no connection check anywhere. `{kind:"narration",
+ * provider:"openrouter"}` from a user with no `OpenRouterConnection` is in the matrix, so
+ * the 422 never fired: the api answered 201, wrote an `AiGeneration` row, enqueued a
+ * workflow, and the request died minutes later inside DBOS at credential-decrypt time. The
+ * user saw a spinner and then a generic failure — a greyed-out control in the Studio was
+ * still accepted by the server, which is the dishonesty R5/R7 exist to remove.
+ *
+ * It must NOT be folded into the 422. The two refusals need different words:
+ *   · **422** — this pair can NEVER work (Gloo publishes zero speech models). Nothing the
+ *     user can do; "connect Gloo and retry" would be advice that cannot succeed.
+ *   · **409** — connect this account and try again. Recoverable, and the message names
+ *     which account.
+ * The gate therefore runs AFTER the matrix check, so a permanently-impossible pair keeps
+ * answering 422 even for a user connected to nothing.
+ */
+export class ProviderNotConnectedError extends Error {
+  readonly statusCode = 409;
+  constructor(message = "this provider is not connected for this user") {
+    super(message);
+    this.name = "ProviderNotConnectedError";
+  }
+}
+
+/**
  * Thrown when a generation cannot be resolved for the caller — the id does not exist or
  * belongs to a different user. Maps to **404** (never leaks existence; mirrors
  * {@link import("../jobs/errors").ProjectJobNotFoundError}).
