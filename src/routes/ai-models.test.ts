@@ -39,7 +39,7 @@ const RESULT: {
       provider: "openrouter" as const,
       label: "Vendor Image",
       kinds: ["image" as const],
-      pricing: { perImage: 0.03 },
+      pricing: { perOutputImageToken: 0.00006 },
       voices: null,
     },
     {

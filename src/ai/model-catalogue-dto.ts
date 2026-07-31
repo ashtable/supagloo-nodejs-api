@@ -20,11 +20,13 @@ import { AiGenerationKindSchema, AiProviderSchema } from "@supagloo/database-lib
  */
 
 export const AiModelPricingSchema = z.object({
-  /** $ per generated image (OpenRouter's per-image price). */
-  perImage: z.number().optional(),
+  /** $ per GENERATED-IMAGE token (OpenRouter `image_output`). Renamed from `perImage` on
+   *  2026-07-31 — it was never a per-image total, and the old NAME is exactly what made a
+   *  consumer multiply it by one. See `AiModelPricing.perOutputImageToken`. */
+  perOutputImageToken: z.number().optional(),
   /** $ per input token, normalized across providers (Gloo publishes per 1k). */
   perInputToken: z.number().optional(),
-  /** $ per output token, normalized across providers. */
+  /** $ per output TEXT token, normalized across providers. */
   perOutputToken: z.number().optional(),
 });
 export type AiModelPricingDto = z.infer<typeof AiModelPricingSchema>;

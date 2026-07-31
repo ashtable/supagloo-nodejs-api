@@ -17,10 +17,18 @@ import { z } from "zod";
  *   - `createUserRepo` → `POST {apiBase}/user/repos` with that user token → the repo.
  *   - `addRepoToInstallation` → `PUT {apiBase}/user/installations/:id/repositories/:repoId`
  *     with the same user token (only for `selected`-mode installations).
- *   - `listInstallationRepos` → `GET {apiBase}/user/installations/:id/repositories`
- *     with the same user token — the read the visibility gate polls (DR1).
  * The user token is used ONLY inside a single `createRepoAndProject` call and is
  * never persisted anywhere.
+ *
+ * ── The READ that used to live here (removed 2026-07-31) ────────────────────────────
+ * This client also carried `listInstallationRepos` → `GET
+ * {apiBase}/user/installations/:id/repositories`, for one caller: the DR1 visibility
+ * gate. That gate now reads the INSTALLATION's own listing through the App client
+ * instead (`RepoProvisioningService`'s `InstallationRepoLister` documents why), leaving
+ * this method with zero callers. It is deleted rather than kept "in case", because the
+ * endpoint is served only to user-to-server tokens and is therefore unreachable from
+ * every test lane we have — a tested-but-unused wrapper around exactly that endpoint is
+ * an invitation to wire the gate back to it.
  */
 
 export interface CreatedUserRepo {
@@ -50,22 +58,6 @@ export interface GithubUserAuthClient {
     installationId: string;
     repositoryId: number;
   }): Promise<void>;
-  /**
-   * Every repo full name (`owner/name`) an installation can reach, as seen through the
-   * USER token — the READ analogue of {@link GithubUserAuthClient.addRepoToInstallation}
-   * and the only installation listing this client can reach with the credential it
-   * already holds (`GET /user/installations/:id/repositories` is user-to-server,
-   * answered for the same `repo` scope as that PUT — no App JWT, no installation token,
-   * no new wiring).
-   *
-   * It exists for ONE caller: `RepoProvisioningService`'s bounded visibility gate
-   * between "the repo now exists on GitHub" and "enqueue the scaffold workflow". See
-   * that gate for why absence is not merely a slow start.
-   */
-  listInstallationRepos(args: {
-    token: string;
-    installationId: string;
-  }): Promise<string[]>;
   /**
    * Every installation of THIS App the user can reach (`GET /user/installations`).
    *
@@ -219,9 +211,8 @@ const tokenResponseSchema = z.object({
 
 /**
  * `Link: <url>; rel="next"` → `url`, else undefined. GitHub paginates
- * `/user/installations/:id/repositories` and a brand-new repo is not guaranteed to land
- * on page 1, so the visibility gate that reads it must walk every page or it can decide
- * "absent" about a repo that is right there on page 2.
+ * `/user/installations`, and a user whose installation of this App is not on page 1 is
+ * a user we would otherwise report as having none.
  */
 function parseNextLink(linkHeader: string | null): string | undefined {
   if (!linkHeader) return undefined;
@@ -231,12 +222,6 @@ function parseNextLink(linkHeader: string | null): string | undefined {
   }
   return undefined;
 }
-
-/** `GET /user/installations/:id/repositories` — `{ total_count, repositories[] }`.
- *  Only `full_name` is read; every other field is ignored on purpose. */
-const installationReposSchema = z.object({
-  repositories: z.array(z.object({ full_name: z.string() }).passthrough()),
-});
 
 /**
  * `GET /user/installations` — `{ total_count, installations[] }`.
@@ -424,44 +409,11 @@ export function makeGithubUserAuthClient(
       // 204 No Content — nothing to parse.
     },
 
-    async listInstallationRepos({ token, installationId }) {
-      const out: string[] = [];
-      let url: string | undefined =
-        `${apiBaseUrl}/user/installations/${installationId}/repositories?per_page=100`;
-      // A user with 2 000+ installation repos is already implausible; the guard exists
-      // so a malformed `Link` header can never spin this into an infinite loop inside a
-      // request the browser is waiting on.
-      for (let page = 1; url; page += 1) {
-        if (page > 20) {
-          throw new Error(
-            `GitHub list-installation-repos for ${installationId} exceeded 20 pages — ` +
-              "refusing to keep walking Link: rel=next",
-          );
-        }
-        const res: Response = await fetchImpl(url, {
-          headers: {
-            authorization: `token ${token}`,
-            accept: "application/vnd.github+json",
-          },
-        });
-        if (!res.ok) {
-          const detail = await readGithubErrorDetail(res);
-          throw new Error(
-            `GitHub list-installation-repos failed for installation ` +
-              `${installationId}: ${res.status}` + (detail ? ` — ${detail}` : ""),
-          );
-        }
-        const parsed = installationReposSchema.parse(await res.json());
-        for (const repo of parsed.repositories) out.push(repo.full_name);
-        url = parseNextLink(res.headers.get("link"));
-      }
-      return out;
-    },
-
     async listUserInstallations(token) {
       const out: UserInstallation[] = [];
       let url: string | undefined = `${apiBaseUrl}/user/installations?per_page=100`;
-      // Same Link-walking guard as listInstallationRepos, for the same reason: a
+      // The same Link-walking guard the removed installation listing carried, for the
+      // same reason: a
       // malformed `Link` header must not spin inside a request a browser is waiting on.
       // A user with 2 000+ installations of ONE app is not a real shape.
       for (let page = 1; url; page += 1) {

@@ -1,7 +1,11 @@
 import { describe, it, expect } from "vitest";
 import type { PrismaClient } from "@supagloo/database-lib";
 import type { CreateRepoRequest } from "@supagloo/database-lib";
-import { RepoProvisioningService } from "./repo-provisioning-service";
+import {
+  RepoProvisioningService,
+  installationTokenRepoLister,
+} from "./repo-provisioning-service";
+import type { GithubAppClient } from "../connections/github-app-client";
 import {
   RepoCreationError,
   RepoNotVisibleError,
@@ -66,11 +70,6 @@ function recordingUserAuthClient(overrides: Partial<GithubUserAuthClient> = {}) 
     addRepoToInstallation: async ({ installationId, repositoryId }) => {
       calls.push(`addRepoToInstallation:${installationId}:${repositoryId}`);
     },
-    listInstallationRepos: async ({ token, installationId }) => {
-      calls.push(`listInstallationRepos:${token}:${installationId}`);
-      // Default: the created repo is ALREADY visible, i.e. the common case.
-      return ["acme/psalm-121"];
-    },
     // Part of the client interface but never reached from repo provisioning — it
     // belongs to the connection surface's link-existing path. Recorded anyway, so a
     // stray call here would show up rather than pass silently.
@@ -81,6 +80,34 @@ function recordingUserAuthClient(overrides: Partial<GithubUserAuthClient> = {}) 
     ...overrides,
   };
   return { client, calls };
+}
+
+/**
+ * The App client the visibility gate reads the INSTALLATION's own listing through
+ * (`GET /installation/repositories`, minting its own installation token).
+ *
+ * `fullNames` is a function of the probe number so a listing can change between probes —
+ * the whole point of a gate is that the answer is allowed to be "not yet".
+ */
+function recordingAppClient(
+  fullNames: (probe: number) => string[] = () => ["acme/psalm-121"],
+) {
+  const probes: Array<{ installationId: string; deriveEmptinessFor: unknown }> = [];
+  const appClient: Pick<GithubAppClient, "listInstallationRepos"> = {
+    listInstallationRepos: async ({ installationId, deriveEmptinessFor }) => {
+      probes.push({ installationId, deriveEmptinessFor });
+      return fullNames(probes.length).map((fullName, i) => ({
+        id: i + 1,
+        name: fullName.split("/")[1],
+        fullName,
+        owner: fullName.split("/")[0],
+        private: true,
+        defaultBranch: "main",
+        empty: true,
+      }));
+    },
+  };
+  return { appClient, probes };
 }
 
 /**
@@ -113,10 +140,12 @@ function recordingCreateProject() {
 describe("RepoProvisioningService.authorizeUrl", () => {
   it("delegates to the user-auth client's buildAuthorizeUrl", () => {
     const { client } = recordingUserAuthClient();
+    const { appClient } = recordingAppClient();
     const { createProject } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma(null),
       userAuthClient: client,
+      appClient,
       createProject,
     });
     const url = svc.authorizeUrl({
@@ -131,10 +160,12 @@ describe("RepoProvisioningService.authorizeUrl", () => {
 describe("RepoProvisioningService.createRepoAndProject", () => {
   it("rejects with GithubNotConnectedError when the user has no connection", async () => {
     const { client } = recordingUserAuthClient();
+    const { appClient } = recordingAppClient();
     const { createProject } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma(null),
       userAuthClient: client,
+      appClient,
       createProject,
     });
     await expect(svc.createRepoAndProject("u1", REQ)).rejects.toThrow(
@@ -144,23 +175,28 @@ describe("RepoProvisioningService.createRepoAndProject", () => {
 
   it("selected-mode: exchanges, creates repo, adds to installation, delegates create", async () => {
     const { client, calls } = recordingUserAuthClient();
+    const { appClient, probes } = recordingAppClient();
     const { createProject, calls: createCalls } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "selected" }),
       userAuthClient: client,
+      appClient,
       createProject,
     });
 
     const result = await svc.createRepoAndProject("u1", REQ);
 
     expect(result).toEqual({ projectId: "cprj1", jobId: "job-1" });
+    // Everything the USER token is used for, in order — and it stops at the create.
     expect(calls).toEqual([
       "exchangeCode:gh-code",
       "createUserRepo:ghu_stub_user_1:psalm-121:true",
       "addRepoToInstallation:42:7",
-      // The visibility gate runs LAST, before the enqueue (DR1, below).
-      "listInstallationRepos:ghu_stub_user_1:42",
     ]);
+    // …and the visibility gate runs LAST, before the enqueue (DR1, below), against the
+    // INSTALLATION's own listing rather than the user's.
+    expect(probes).toHaveLength(1);
+    expect(probes[0].installationId).toBe("42");
     // delegates to createProject with the CREATED repo's owner + name (from GitHub).
     expect(createCalls).toHaveLength(1);
     expect(createCalls[0].userId).toBe("u1");
@@ -175,10 +211,12 @@ describe("RepoProvisioningService.createRepoAndProject", () => {
 
   it("all-mode installation: skips the installation-add step", async () => {
     const { client, calls } = recordingUserAuthClient();
+    const { appClient, probes } = recordingAppClient();
     const { createProject } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
       userAuthClient: client,
+      appClient,
       createProject,
     });
 
@@ -187,11 +225,11 @@ describe("RepoProvisioningService.createRepoAndProject", () => {
     expect(calls).toEqual([
       "exchangeCode:gh-code",
       "createUserRepo:ghu_stub_user_1:psalm-121:true",
-      // …but the visibility gate still runs: an all-repos installation covers a new
-      // repo automatically, and that is exactly the case that is not INSTANT.
-      "listInstallationRepos:ghu_stub_user_1:42",
     ]);
     expect(calls.some((c) => c.startsWith("addRepoToInstallation"))).toBe(false);
+    // …but the visibility gate still runs: an all-repos installation covers a new repo
+    // automatically, and that is exactly the case that is not INSTANT.
+    expect(probes).toHaveLength(1);
   });
 
   it("wraps a user-auth/create failure as RepoCreationError", async () => {
@@ -200,10 +238,12 @@ describe("RepoProvisioningService.createRepoAndProject", () => {
         throw new Error("boom");
       },
     });
+    const { appClient } = recordingAppClient();
     const { createProject } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "selected" }),
       userAuthClient: client,
+      appClient,
       createProject,
     });
     await expect(svc.createRepoAndProject("u1", REQ)).rejects.toThrow(RepoCreationError);
@@ -224,10 +264,12 @@ describe("RepoProvisioningService.createRepoAndProject", () => {
         );
       },
     });
+    const { appClient } = recordingAppClient();
     const { createProject } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
       userAuthClient: client,
+      appClient,
       createProject,
     });
 
@@ -257,25 +299,101 @@ describe("RepoProvisioningService.createRepoAndProject — installation-visibili
   function scriptedListing(pages: string[][]) {
     const probes: string[] = [];
     const listInstallationRepos = async ({
-      token,
       installationId,
     }: {
-      token: string;
       installationId: string;
     }) => {
-      probes.push(`${token}:${installationId}`);
+      probes.push(installationId);
       return pages[Math.min(probes.length - 1, pages.length - 1)];
     };
     return { listInstallationRepos, probes };
   }
 
-  it("adds NO wait when the created repo is already visible to the installation", async () => {
+  /**
+   * U-RP1 — THE ENDPOINT CHOICE, pinned rather than incidental.
+   *
+   * The gate exists to predict whether dbos's `ensureRepoReachable` will find the repo,
+   * and that step walks `GET /installation/repositories`. Until 2026-07-31 this gate
+   * asked a DIFFERENT question — `GET /user/installations/:id/repositories`, the user's
+   * view — which was indirect in production and outright unreachable in the browser e2e,
+   * where the synthetic token exchange yields a classic PAT and GitHub answers 403 to
+   * anything but a user-to-server token on that route (`E-RNP1b`, red since 2026-07-25).
+   *
+   * Two claims here, and the second is what stops a future rewire from being silent:
+   *  1. the default lister goes through the APP client (installation token, installation
+   *     listing), carrying only the installation id;
+   *  2. the user-auth client is not consulted for a listing at all — it no longer even
+   *     exposes one, so this assertion is about the whole call sequence, not one name.
+   */
+  it("U-RP1: the gate reads the INSTALLATION's own listing through the App client, never the user's", async () => {
     const clock = fakeClock();
     const { client, calls } = recordingUserAuthClient();
+    const { appClient, probes } = recordingAppClient();
     const { createProject, calls: createCalls } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
       userAuthClient: client,
+      appClient,
+      createProject,
+      sleep: clock.sleep,
+      now: clock.now,
+    });
+
+    await svc.createRepoAndProject("u1", REQ);
+
+    expect(probes).toEqual([{ installationId: "42", deriveEmptinessFor: undefined }]);
+    // The user token's last use is the create — nothing after it touches the user client.
+    expect(calls).toEqual([
+      "exchangeCode:gh-code",
+      "createUserRepo:ghu_stub_user_1:psalm-121:true",
+    ]);
+    expect(createCalls).toHaveLength(1);
+  });
+
+  /**
+   * U-RP2 — and the listing must stay CHEAP.
+   *
+   * `GithubAppClient.listInstallationRepos` takes an opt-in `deriveEmptinessFor`
+   * predicate that fans a `GET /repos/:o/:r/commits` probe out over every `size === 0`
+   * repo in the installation (measured at 55 for the live account). The gate polls in a
+   * loop, inside a request a browser is holding open, and never reads `empty`. Passing
+   * that predicate here would multiply the whole gate's request cost by the size of the
+   * user's account to compute a field it discards.
+   */
+  it("U-RP2: the gate's listing never asks for the emptiness probe", async () => {
+    const seen: unknown[] = [];
+    const lister = installationTokenRepoLister({
+      listInstallationRepos: async (args) => {
+        seen.push(args.deriveEmptinessFor);
+        return [
+          {
+            id: 7,
+            name: "psalm-121",
+            fullName: "acme/psalm-121",
+            owner: "acme",
+            private: true,
+            defaultBranch: "main",
+            empty: true,
+          },
+        ];
+      },
+    });
+
+    await expect(lister({ installationId: "42" })).resolves.toEqual([
+      "acme/psalm-121",
+    ]);
+    expect(seen).toEqual([undefined]);
+  });
+
+  it("adds NO wait when the created repo is already visible to the installation", async () => {
+    const clock = fakeClock();
+    const { client } = recordingUserAuthClient();
+    const { appClient, probes } = recordingAppClient();
+    const { createProject, calls: createCalls } = recordingCreateProject();
+    const svc = new RepoProvisioningService({
+      prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
+      userAuthClient: client,
+      appClient,
       createProject,
       sleep: clock.sleep,
       now: clock.now,
@@ -284,7 +402,7 @@ describe("RepoProvisioningService.createRepoAndProject — installation-visibili
     await svc.createRepoAndProject("u1", REQ);
 
     // One listing, ZERO sleeps: the common case pays a single round-trip, never a delay.
-    expect(calls.filter((c) => c.startsWith("listInstallationRepos"))).toHaveLength(1);
+    expect(probes).toHaveLength(1);
     expect(clock.sleeps).toEqual([]);
     expect(createCalls).toHaveLength(1);
   });
@@ -296,39 +414,36 @@ describe("RepoProvisioningService.createRepoAndProject — installation-visibili
       ["acme/other"],
       ["acme/other", "acme/psalm-121"],
     ]);
-    const { client } = recordingUserAuthClient({
-      listInstallationRepos: listing.listInstallationRepos,
-    });
+    const { client } = recordingUserAuthClient();
+    const { appClient } = recordingAppClient();
     const { createProject, calls: createCalls } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
       userAuthClient: client,
+      appClient,
       createProject,
       sleep: clock.sleep,
       now: clock.now,
+      listInstallationRepos: listing.listInstallationRepos,
     });
 
     await svc.createRepoAndProject("u1", REQ);
 
     expect(clock.sleeps).toEqual([1000, 2000]);
     expect(createCalls).toHaveLength(1);
-    // Three probes, all with the SAME short-lived user token that created the repo.
-    expect(listing.probes).toEqual([
-      "ghu_stub_user_1:42",
-      "ghu_stub_user_1:42",
-      "ghu_stub_user_1:42",
-    ]);
+    // Three probes, all for the SAME installation — and carrying nothing else.
+    expect(listing.probes).toEqual(["42", "42", "42"]);
   });
 
   it("matches the repo full name case-insensitively", async () => {
     const clock = fakeClock();
-    const { client } = recordingUserAuthClient({
-      listInstallationRepos: async () => ["ACME/Psalm-121"],
-    });
+    const { client } = recordingUserAuthClient();
+    const { appClient } = recordingAppClient(() => ["ACME/Psalm-121"]);
     const { createProject, calls: createCalls } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
       userAuthClient: client,
+      appClient,
       createProject,
       sleep: clock.sleep,
       now: clock.now,
@@ -342,20 +457,21 @@ describe("RepoProvisioningService.createRepoAndProject — installation-visibili
   it("treats a failing probe as 'not yet' and keeps polling inside the window", async () => {
     const clock = fakeClock();
     let n = 0;
-    const { client } = recordingUserAuthClient({
-      listInstallationRepos: async () => {
-        n += 1;
-        if (n === 1) throw new Error("GitHub 503 on /user/installations/42/repositories");
-        return ["acme/psalm-121"];
-      },
-    });
+    const { client } = recordingUserAuthClient();
+    const { appClient } = recordingAppClient();
     const { createProject, calls: createCalls } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
       userAuthClient: client,
+      appClient,
       createProject,
       sleep: clock.sleep,
       now: clock.now,
+      listInstallationRepos: async () => {
+        n += 1;
+        if (n === 1) throw new Error("GitHub 503 on /installation/repositories");
+        return ["acme/psalm-121"];
+      },
     });
 
     await svc.createRepoAndProject("u1", REQ);
@@ -366,13 +482,13 @@ describe("RepoProvisioningService.createRepoAndProject — installation-visibili
 
   it("NEVER enqueues when the repo never becomes visible — it throws RepoNotVisibleError", async () => {
     const clock = fakeClock();
-    const { client } = recordingUserAuthClient({
-      listInstallationRepos: async () => ["acme/some-other-repo"],
-    });
+    const { client } = recordingUserAuthClient();
+    const { appClient } = recordingAppClient(() => ["acme/some-other-repo"]);
     const { createProject, calls: createCalls } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
       userAuthClient: client,
+      appClient,
       createProject,
       sleep: clock.sleep,
       now: clock.now,
@@ -395,50 +511,52 @@ describe("RepoProvisioningService.createRepoAndProject — installation-visibili
     expect(Math.max(...clock.sleeps)).toBe(5_000);
   });
 
-  // The gate's listing is a SEAM, defaulting to the user-auth client. An injected
-  // lister replaces it wholesale — that is how the e2e reads the installation-token
-  // view (`GET /installation/repositories`, dbos's own view), which the user-to-server
-  // endpoint cannot stand in for there because GitHub requires a token AUTHORIZED TO
-  // THE APP and the e2e fakes the token's provenance with a PAT.
-  it("uses an injected lister in preference to the user-auth client", async () => {
+  // The gate's listing is still a SEAM over the App-client default — the mechanism the
+  // scripted-listing cases above use to say "not yet, not yet, now". Nothing OUTSIDE this
+  // file overrides it any more (the api e2e runs the real path since 2026-07-31), so this
+  // case is what keeps the seam honest.
+  it("uses an injected lister in preference to the App client's", async () => {
     const clock = fakeClock();
-    const { client, calls } = recordingUserAuthClient();
+    const { client } = recordingUserAuthClient();
+    const { appClient, probes } = recordingAppClient();
     const { createProject, calls: createCalls } = recordingCreateProject();
     const injected: string[] = [];
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
       userAuthClient: client,
+      appClient,
       createProject,
       sleep: clock.sleep,
       now: clock.now,
-      listInstallationRepos: async ({ token, installationId }) => {
-        injected.push(`${token}:${installationId}`);
+      listInstallationRepos: async ({ installationId }) => {
+        injected.push(installationId);
         return ["acme/psalm-121"];
       },
     });
 
     await svc.createRepoAndProject("u1", REQ);
 
-    expect(injected).toEqual(["ghu_stub_user_1:42"]);
-    expect(calls.some((c) => c.startsWith("listInstallationRepos"))).toBe(false);
+    expect(injected).toEqual(["42"]);
+    expect(probes).toHaveLength(0);
     expect(createCalls).toHaveLength(1);
   });
 
   it("names the last probe failure when the gate expires on a broken listing", async () => {
     const clock = fakeClock();
-    const { client } = recordingUserAuthClient({
-      listInstallationRepos: async () => {
-        throw new Error("GitHub 401 Requires authentication");
-      },
-    });
+    const { client } = recordingUserAuthClient();
+    const { appClient } = recordingAppClient();
     const { createProject, calls: createCalls } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
       userAuthClient: client,
+      appClient,
       createProject,
       sleep: clock.sleep,
       now: clock.now,
       installationVisibility: { timeoutMs: 3_000 },
+      listInstallationRepos: async () => {
+        throw new Error("GitHub 401 Requires authentication");
+      },
     });
 
     const err = await svc.createRepoAndProject("u1", REQ).catch((e: unknown) => e);
@@ -468,10 +586,12 @@ describe("RepoProvisioningService.createRepoAndProject — the picked passage (f
 
   it("U-W21: forwards scripture + createdFrom to the create-project delegate", async () => {
     const { client } = recordingUserAuthClient();
+    const { appClient } = recordingAppClient();
     const { createProject, calls: createCalls } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
       userAuthClient: client,
+      appClient,
       createProject,
     });
 
@@ -489,10 +609,12 @@ describe("RepoProvisioningService.createRepoAndProject — the picked passage (f
 
   it("U-W22: a blank project forwards no scripture key at all", async () => {
     const { client } = recordingUserAuthClient();
+    const { appClient } = recordingAppClient();
     const { createProject, calls: createCalls } = recordingCreateProject();
     const svc = new RepoProvisioningService({
       prisma: makeFakePrisma({ installationId: "42", repositorySelection: "all" }),
       userAuthClient: client,
+      appClient,
       createProject,
     });
 
