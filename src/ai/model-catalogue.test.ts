@@ -37,39 +37,95 @@ import {
  */
 
 describe("toOpenRouterCatalogueEntry (U-MC1, U-MC2)", () => {
-  it("U-MC1: an image-capable entry with a positive per-image price is priced per image", () => {
+  it("U-MC1: an image-capable entry prices generated images per OUTPUT TOKEN, from `image_output`", () => {
     const entry = toOpenRouterCatalogueEntry({
       id: "vendor/img",
       name: "Vendor Image",
       architecture: { output_modalities: ["image"] },
-      pricing: { prompt: "0.0000005", completion: "0.000002", image: "0.03" },
+      pricing: {
+        prompt: "0.0000005",
+        completion: "0.000002",
+        image: "0.0000005",
+        image_output: "0.00006",
+      },
     });
     expect(entry).toEqual<AiModelInfo>({
       id: "vendor/img",
       provider: "openrouter",
       label: "Vendor Image",
       kinds: ["image"],
-      pricing: { perImage: 0.03, perInputToken: 0.0000005, perOutputToken: 0.000002 },
+      pricing: {
+        perOutputImageToken: 0.00006,
+        perInputToken: 0.0000005,
+        perOutputToken: 0.000002,
+      },
       voices: null,
     });
+  });
+
+  it("U-MC1b: `pricing.image` is the image-INPUT rate and is NEVER read as a per-image total", () => {
+    // Measured live 2026-07-31, and the whole reason this mapper changed. On every Gemini
+    // image entry `pricing.image` is BYTE-IDENTICAL to `pricing.prompt` — it is what an
+    // image supplied as INPUT costs per token, not what a generated one costs:
+    //
+    //   google/gemini-2.5-flash-image  prompt 0.0000003  image 0.0000003  image_output 0.00003
+    //   google/gemini-3-pro-image      prompt 0.000002   image 0.000002   image_output 0.00012
+    //
+    // The old mapper published `image` as `perImage` and the studio rendered
+    // "$0.0000003 per image × 1 image" stamped `measured` — wrong by ~5 orders of
+    // magnitude, on the screen the user is about to spend money from. `image` is now read
+    // by NOTHING, which is what makes that unrepeatable.
+    const entry = toOpenRouterCatalogueEntry({
+      id: "google/gemini-2.5-flash-image",
+      architecture: { output_modalities: ["image", "text"] },
+      pricing: { prompt: "0.0000003", completion: "0.0000025", image: "0.0000003" },
+    });
+    expect(entry.pricing?.perOutputImageToken).toBeUndefined();
+    // …and the fields it DOES carry are the ones it was actually given, so this cannot
+    // pass merely because the whole pricing block was dropped.
+    expect(entry.pricing?.perInputToken).toBe(0.0000003);
+    expect(entry.pricing?.perOutputToken).toBe(0.0000025);
+  });
+
+  it("U-MC1c: `image_token` is read as the alias, and `image_output` wins where both exist", () => {
+    // Live 2026-07-31: `microsoft/mai-image-2.5-pro` (the catalogue's FIRST image entry)
+    // and the three krea models publish BOTH keys at the SAME value; nothing live
+    // publishes `image_token` alone today. Reading it is cheap insurance against a
+    // catalogue that drops the newer spelling — and the precedence is asserted rather
+    // than assumed, because "both keys, same value" cannot reveal an ordering bug.
+    expect(
+      toOpenRouterCatalogueEntry({
+        id: "vendor/legacy-only",
+        architecture: { output_modalities: ["image"] },
+        pricing: { prompt: "0.000005", completion: "0", image_token: "0.000108" },
+      }).pricing?.perOutputImageToken,
+    ).toBe(0.000108);
+
+    expect(
+      toOpenRouterCatalogueEntry({
+        id: "vendor/both",
+        architecture: { output_modalities: ["image"] },
+        pricing: { image_output: "0.00012", image_token: "0.000108" },
+      }).pricing?.perOutputImageToken,
+    ).toBe(0.00012);
   });
 
   it("U-MC2a: a NEGATIVE price is variable/auto-priced and is dropped, not negated", () => {
     const entry = toOpenRouterCatalogueEntry({
       id: "vendor/auto",
       architecture: { output_modalities: ["image"] },
-      pricing: { prompt: "-1", completion: "-1", image: "-1" },
+      pricing: { prompt: "-1", completion: "-1", image_output: "-1" },
     });
     expect(entry.pricing).toBeNull();
   });
 
-  it("U-MC2b: a ZERO per-image price is dropped — a 'free' image model 500s in practice", () => {
+  it("U-MC2b: a ZERO generated-image rate is dropped — a 'free' image model 500s in practice", () => {
     const entry = toOpenRouterCatalogueEntry({
       id: "vendor/free-img",
       architecture: { output_modalities: ["image"] },
-      pricing: { prompt: "0", completion: "0", image: "0" },
+      pricing: { prompt: "0", completion: "0", image_output: "0" },
     });
-    expect(entry.pricing?.perImage).toBeUndefined();
+    expect(entry.pricing?.perOutputImageToken).toBeUndefined();
   });
 
   it("U-MC2c: a missing pricing block yields null pricing, never a fabricated zero", () => {
@@ -281,7 +337,7 @@ describe("toGlooCatalogueEntry (U-MC3, U-MC5)", () => {
     });
     expect(entry.pricing?.perInputToken).toBeCloseTo(0.0000001, 12);
     expect(entry.pricing?.perOutputToken).toBeCloseTo(0.0000004, 12);
-    expect(entry.pricing?.perImage).toBeUndefined();
+    expect(entry.pricing?.perOutputImageToken).toBeUndefined();
   });
 
   it("tolerates a catalogue entry with no pricing block", () => {

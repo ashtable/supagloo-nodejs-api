@@ -19,8 +19,12 @@ import type { AiGenerationKind, AiProvider } from "@supagloo/database-lib";
  * ── The catalogue facts, all measured live on 2026-07-28 ────────────────────────────
  *
  * **OpenRouter** publishes four separate catalogues, and they price differently:
- *   - `GET /api/v1/models` — chat + image. `pricing.prompt`/`.completion` are $/TOKEN;
- *     `pricing.image` is $/IMAGE.
+ *   - `GET /api/v1/models` — chat + image. `pricing.prompt`/`.completion` are $/TOKEN.
+ *     A generated image is priced by `pricing.image_output` (alias `image_token`), also
+ *     $/TOKEN. **`pricing.image` is the image-INPUT rate, NOT $/IMAGE** — this line said
+ *     otherwise until 2026-07-31 and the studio shipped the consequence; see
+ *     `AiModelPricing.perOutputImageToken`. Only 4 of 40 live image entries publish
+ *     `pricing.image` at all, so the mistake was also invisible most of the time.
  *   - `GET /api/v1/models?output_modalities=speech` — the DEDICATED batch-TTS catalogue
  *     the speech endpoint serves. 15 entries. Prices on `prompt` with `completion: "0"`.
  *   - `GET /api/v1/models?output_modalities=audio` — a DIFFERENT catalogue, 4 entries,
@@ -42,19 +46,45 @@ import type { AiGenerationKind, AiProvider } from "@supagloo/database-lib";
  *
  *  1. **A negative OpenRouter price means variable/auto-priced.** Passing it through would
  *     put a negative dollar amount in front of the user; it is dropped instead.
- *  2. **A zero `pricing.image` is not free, it is broken.** Zero-priced "free" image
- *     models return 500 on real OpenRouter, so a positive `pricing.image` is the
+ *  2. **A zero generated-image rate is not free, it is broken.** Zero-priced "free" image
+ *     models return 500 on real OpenRouter, so a positive `image_output` is the
  *     reliability signal. Advertising "$0.00" would recommend a model that cannot run.
  *  3. **Units must be reconciled.** Gloo per-1k vs OpenRouter per-token is a silent 1000x
  *     error if it is not normalized here, in one place.
  */
 
 export interface AiModelPricing {
-  /** $ per generated image. OpenRouter only — Gloo does not price images per unit. */
-  perImage?: number;
+  /**
+   * $ per GENERATED-IMAGE token. OpenRouter only — Gloo does not price image output
+   * separately from text output.
+   *
+   * ── This replaced `perImage` on 2026-07-31, and the UNIT is the point ──────────────
+   *
+   * There was a `perImage?: number` here, documented as "$ per generated image" and
+   * sourced from OpenRouter's `pricing.image`. Both halves were wrong.
+   *
+   * `pricing.image` is the rate for an image supplied as **INPUT** to a multimodal model.
+   * On every live Gemini image entry it is byte-identical to `pricing.prompt`
+   * (`gemini-2.5-flash-image`: both `0.0000003`; `gemini-3-pro-image`: both `0.000002`),
+   * which is what gives it away. The studio rendered that as
+   * `$0.0000003 per image × 1 image`, stamped `confidence: "measured"` — off by roughly
+   * five orders of magnitude, on the screen a user is about to spend from.
+   *
+   * The field that prices a GENERATED image is `image_output` (alias `image_token`), and
+   * it is **per token**, not per image: `gemini-3-pro-image`'s `0.00012` × its ~1120
+   * output tokens ≈ its real ~$0.134/image. So there is no per-image total to publish —
+   * an image's token count depends on the resolution the provider picks, which is not
+   * knowable before the run. Consumers must show the RATE and refuse the total, exactly
+   * as they already do for Gloo. Naming the field for its unit is what stops the next
+   * reader multiplying it by one.
+   */
+  perOutputImageToken?: number;
   /** $ per INPUT token (both providers, normalized). */
   perInputToken?: number;
-  /** $ per OUTPUT token (both providers, normalized). */
+  /** $ per OUTPUT TEXT token (both providers, normalized). Deliberately distinct from
+   *  `perOutputImageToken`: a model like `google/gemini-3.1-flash-image` serves `image`
+   *  AND the text kinds, and its two output rates differ by 20x (`completion` 0.000003 vs
+   *  `image_output` 0.00006). Folding them together would corrupt whichever kind lost. */
   perOutputToken?: number;
 }
 
@@ -137,7 +167,22 @@ export interface RawOpenRouterModel {
   id?: unknown;
   name?: unknown;
   architecture?: { output_modalities?: unknown };
-  pricing?: { prompt?: unknown; completion?: unknown; image?: unknown };
+  pricing?: {
+    prompt?: unknown;
+    completion?: unknown;
+    /** The GENERATED-image token rate. `image_token` is the older spelling; live entries
+     *  that carry both carry the same value, so the newer one wins. */
+    image_output?: unknown;
+    image_token?: unknown;
+    /**
+     * ⚠️ The image-INPUT token rate. DELIBERATELY DECLARED AND DELIBERATELY UNREAD.
+     *
+     * It is named here so the next person to open this file finds out what it is instead
+     * of rediscovering it the way we did — by shipping it to users as a per-image total.
+     * Nothing below may read it; `U-MC1b` fails if anything does.
+     */
+    image?: unknown;
+  };
 }
 
 /** Modalities → the kinds the studio can request. An unplaceable model yields NO kinds
@@ -152,12 +197,16 @@ export function kindsForOpenRouterModel(modalities: string[]): AiGenerationKind[
 export function toOpenRouterCatalogueEntry(raw: RawOpenRouterModel): AiModelInfo {
   const id = typeof raw.id === "string" ? raw.id : "";
   const pricing: AiModelPricing = {};
-  // `image` is positive-only (rule 2); the token rates may legitimately be zero on a
-  // genuinely free CHAT model, which does work.
-  const perImage = price(raw.pricing?.image, true);
+  // The generated-image rate is positive-only (rule 2); the token rates may legitimately
+  // be zero on a genuinely free CHAT model, which does work. `raw.pricing.image` is NOT
+  // consulted — see `AiModelPricing.perOutputImageToken` for what it actually means.
+  const perOutputImageToken =
+    price(raw.pricing?.image_output, true) ?? price(raw.pricing?.image_token, true);
   const perInputToken = price(raw.pricing?.prompt);
   const perOutputToken = price(raw.pricing?.completion);
-  if (perImage !== undefined) pricing.perImage = perImage;
+  if (perOutputImageToken !== undefined) {
+    pricing.perOutputImageToken = perOutputImageToken;
+  }
   if (perInputToken !== undefined) pricing.perInputToken = perInputToken;
   if (perOutputToken !== undefined) pricing.perOutputToken = perOutputToken;
 
