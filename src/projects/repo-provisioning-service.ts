@@ -8,6 +8,7 @@ import {
   GithubCreateRepoError,
   type GithubUserAuthClient,
 } from "../connections/github-user-auth-client";
+import type { GithubAppClient } from "../connections/github-app-client";
 import {
   RepoCreationError,
   RepoNotVisibleError,
@@ -41,25 +42,69 @@ export interface InstallationVisibilityOptions {
 /**
  * The gate's listing, as a seam: `owner/name` for every repo the installation can reach.
  *
- * It defaults to `userAuthClient.listInstallationRepos` — `GET
- * /user/installations/:id/repositories`, the only installation listing reachable with
- * the short-lived user token this flow already holds. The seam exists because that
- * endpoint requires a token **authorized to the GitHub App**, so the api e2e — which
- * fakes the user token's PROVENANCE with a PAT (design-delta §10.2), and only its
- * provenance — is refused by GitHub with a 403 there ("You must authenticate with an
- * access token authorized to a GitHub App…", verified live). That lane injects a lister
- * over `GET /installation/repositories` with a real installation token instead, which is
- * the STRICTER read: it is byte-for-byte the view dbos's `ensureRepoReachable` consults.
+ * ── WHICH ENDPOINT, AND WHY IT CHANGED (2026-07-31) ─────────────────────────────────
+ * It reads **`GET /installation/repositories` with an installation token this service's
+ * GitHub App client mints itself** — see {@link RepoProvisioningServiceOptions.appClient}.
  *
- * See also the report note: the ideal production wiring is that same installation-token
- * listing (`githubAppClient.listInstallationRepos`, already built one scope away in
- * `server.ts`), which would make the seam's default and the e2e's override the same
- * endpoint. It is a one-line change in `server.ts`, a file this pass does not own.
+ * Until this change it read `GET /user/installations/:id/repositories` with the
+ * short-lived USER token, which was available for free but was the wrong question in two
+ * ways:
+ *
+ *  1. **Fidelity.** The thing this gate exists to predict is dbos's `ensureRepoReachable`
+ *     (`scaffold-project/github-rest.ts`), which walks `GET /installation/repositories`
+ *     and treats absence as a PERMANENT failure. Probing the USER's view to predict the
+ *     INSTALLATION's view is indirect: two endpoints, two caches, no guarantee they agree
+ *     at any instant. Probing the installation's own view asks the question that is
+ *     actually being answered later.
+ *  2. **Testability.** GitHub serves `/user/installations/:id/repositories` to GitHub App
+ *     **user-to-server tokens only**, answering anything else with
+ *     `403 "You must authenticate with an access token authorized to a GitHub App…"`
+ *     (verified live, 2026-07-31, against BOTH e2e PATs). Production's real OAuth hop
+ *     mints a user-to-server token so the old read worked there — but the browser e2e
+ *     (`E-RNP1b`) fakes the token's PROVENANCE with a classic PAT (design-delta §10.2),
+ *     so the gate could never pass in the harness, deterministically. A product gate that
+ *     is unreachable from the only lane that drives it end to end is untested by
+ *     construction.
+ *
+ * The installation listing has neither problem: the app client mints its own token from
+ * the App's private key, so it is the same credential in production and in every lane.
+ *
+ * Note the argument shape: **no `token`**. That is deliberate and load-bearing — the
+ * user token is now scoped to `provisionRepo` and cannot reach the gate at all, so this
+ * seam cannot be quietly repointed back at a user-scoped endpoint.
  */
 export type InstallationRepoLister = (args: {
-  token: string;
   installationId: string;
 }) => Promise<string[]>;
+
+/**
+ * The production lister: dbos's own view, through the App client.
+ *
+ * Exported (rather than inlined at the construction site) so the endpoint choice is a
+ * named, unit-tested thing instead of a lambda in `server.ts`'s 300-line `main()`, which
+ * nothing can reach without booting a process.
+ *
+ * `deriveEmptinessFor` is deliberately NOT passed: it would fan an extra commits probe
+ * out over every `size === 0` repo in the installation — measured at 55 for the live
+ * account — on a request a browser is already waiting on, to compute a field this gate
+ * does not read.
+ *
+ * COST, stated rather than discovered later: each probe is one token mint plus one
+ * listing GET per page (measured 2026-07-26: 582 repos ⇒ 6 pages ⇒ 7 requests). The
+ * previous user-token listing paginated identically, so the delta is the mint — and the
+ * COMMON case is a single probe, because the gate reads before it ever sleeps. The App
+ * client's "mint fresh per call, never store" invariant is deliberately not bent to share
+ * a token across probes: a bounded loop that runs a handful of times on one non-idempotent
+ * hop is not where that invariant should be spent.
+ */
+export function installationTokenRepoLister(
+  appClient: Pick<GithubAppClient, "listInstallationRepos">,
+): InstallationRepoLister {
+  return async ({ installationId }) => {
+    const repos = await appClient.listInstallationRepos({ installationId });
+    return repos.map((r) => r.fullName);
+  };
+}
 
 const VISIBILITY_DEFAULTS = {
   timeoutMs: 60_000,
@@ -70,6 +115,15 @@ const VISIBILITY_DEFAULTS = {
 export interface RepoProvisioningServiceOptions {
   prisma: PrismaClient;
   userAuthClient: GithubUserAuthClient;
+  /**
+   * The GitHub App client the visibility gate reads the installation's own repository
+   * listing through ({@link installationTokenRepoLister}).
+   *
+   * REQUIRED, and required on purpose: when the lister merely defaulted to the user-auth
+   * client, the wrong endpoint was what you got by saying nothing. Now the only way to
+   * build this service is to hand it something that can answer the installation's view.
+   */
+  appClient: Pick<GithubAppClient, "listInstallationRepos">;
   createProject: CreateProjectDelegate;
   /** Injected ONLY so unit tests never really wait (and so a fake clock can drive the
    *  bounded loop to its deadline in microseconds). Production uses `setTimeout`. */
@@ -77,7 +131,9 @@ export interface RepoProvisioningServiceOptions {
   /** Injected alongside `sleep` for the same reason. Production uses `Date.now`. */
   now?: () => number;
   installationVisibility?: InstallationVisibilityOptions;
-  /** Override the gate's listing — see {@link InstallationRepoLister}. */
+  /** Override the gate's listing — see {@link InstallationRepoLister}. Left in place for
+   *  the api e2e, which reaches the SAME endpoint with a token it minted itself rather
+   *  than building a whole App client for one read. */
   listInstallationRepos?: InstallationRepoLister;
 }
 
@@ -93,8 +149,9 @@ export interface RepoProvisioningServiceOptions {
  *   2. exchange the user-authorization `code` for a short-lived `ghu_…` user token;
  *   3. `POST /user/repos` to create the repo (owner determined by GitHub);
  *   4. for a `selected`-mode installation, add the new repo to its access list;
- *   5. WAIT, bounded, for the installation to actually LIST the new repo (DR1);
- *   6. discard the user token (never persisted);
+ *   5. discard the user token (never persisted — it does not outlive step 4);
+ *   6. WAIT, bounded, for the INSTALLATION to actually LIST the new repo (DR1), read
+ *      with the App's own installation token — the same view dbos will walk;
  *   7. delegate to `createProject` with the CREATED repo's `{ owner, name }` →
  *      the same `{ projectId, jobId }` as `POST /v1/projects`.
  * Any provider failure in steps 2–4 becomes {@link RepoCreationError} (502), and a
@@ -115,8 +172,7 @@ export class RepoProvisioningService {
     this.userAuthClient = opts.userAuthClient;
     this.createProject = opts.createProject;
     this.listInstallationRepos =
-      opts.listInstallationRepos ??
-      ((args) => opts.userAuthClient.listInstallationRepos(args));
+      opts.listInstallationRepos ?? installationTokenRepoLister(opts.appClient);
     this.sleep =
       opts.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
     this.now = opts.now ?? Date.now;
@@ -139,18 +195,18 @@ export class RepoProvisioningService {
     });
     if (!connection) throw new GithubNotConnectedError();
 
-    const { created, token } = await this.provisionRepo(req, connection);
+    // The user token never leaves `provisionRepo`: its last use is the repo creation
+    // itself. The gate below asks the INSTALLATION, with the installation's own
+    // credential, so nothing here needs to hold a user credential open across it.
+    const created = await this.provisionRepo(req, connection);
 
     // THE GATE (DR1). The repo now exists on GitHub — which is NOT the same as the
     // installation being able to see it, and it is the installation's view that the
     // scaffold workflow depends on.
     await this.awaitInstallationVisibility({
-      token,
       installationId: connection.installationId,
       fullName: created.fullName,
     });
-    // Only NOW does the user token go out of scope for good — never persisted, and its
-    // last use is a read.
 
     // Delegate to the existing create-project+scaffold path with the CREATED repo's
     // GitHub-assigned owner + name. The gate above is what makes the workflow's
@@ -211,7 +267,6 @@ export class RepoProvisioningService {
    * from the 502 they are already waiting on, instead of from a job that dies later.
    */
   private async awaitInstallationVisibility(args: {
-    token: string;
     installationId: string;
     fullName: string;
   }): Promise<void> {
@@ -226,7 +281,6 @@ export class RepoProvisioningService {
     for (;;) {
       try {
         const fullNames = await this.listInstallationRepos({
-          token: args.token,
           installationId: args.installationId,
         });
         if (fullNames.some((name) => name.toLowerCase() === wanted)) return;
@@ -251,11 +305,11 @@ export class RepoProvisioningService {
   /** Steps 2–4: exchange → create → (selected) add-to-installation.
    *  Any provider failure is wrapped as {@link RepoCreationError} (502).
    *
-   *  Returns the user token alongside the created repo so the caller's visibility gate
-   *  can issue its read with the SAME short-lived credential. It stays a local of one
-   *  `createRepoAndProject` call and is still never persisted, logged or returned to the
-   *  client — widening its scope by one frame is the price of gating on a listing this
-   *  service can reach without a second credential. */
+   *  The user token is a local of THIS method and nothing else. It used to be returned
+   *  alongside the created repo so the visibility gate could re-use it; the gate now reads
+   *  the installation's own view with the installation's own credential
+   *  ({@link InstallationRepoLister}), so the shortest-lived credential in the system is
+   *  back to the narrowest scope that can hold it. */
   private async provisionRepo(
     req: CreateRepoRequest,
     connection: { installationId: string; repositorySelection: string },
@@ -274,7 +328,7 @@ export class RepoProvisioningService {
           repositoryId: created.id,
         });
       }
-      return { created, token };
+      return created;
     } catch (err) {
       // Plan row 63 / D63.5: keep the reply's 502 + `repo_creation_failed` slug exactly
       // as the contract pins them, but stop DESTROYING the upstream status. A typed

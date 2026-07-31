@@ -26,6 +26,7 @@ import {
   resetLaneSchema,
 } from "../../src/testing/dbos-lane-isolation";
 import { makeGithubUserAuthClient } from "../../src/connections/github-user-auth-client";
+import { makeGithubAppClient } from "../../src/connections/github-app-client";
 import { RepoProvisioningService } from "../../src/projects/repo-provisioning-service";
 import {
   githubApiBaseUrl,
@@ -184,18 +185,18 @@ const nextLink = (link: string | null): string | undefined => {
  * a PERMANENT `RepoUnreachableError`, so it is what the product's visibility gate is
  * ultimately protecting.
  *
- * It is injected into `RepoProvisioningService` as the gate's lister, REPLACING the
- * production default (`GET /user/installations/:id/repositories` with the user token).
- * That substitution is forced, not a shortcut: the production endpoint requires a token
- * **authorized to the GitHub App**, and this lane fakes the user token's PROVENANCE with
- * a PAT — GitHub answers a classic `repo`-scoped PAT there with
- * `403 "You must authenticate with an access token authorized to a GitHub App…"`
- * (verified live against the real host). It is the SAME faked-provenance carve-out this
- * file's header already declares for the code→token exchange, showing up a second time
- * on the first endpoint that actually inspects provenance; the production lister itself
- * is unit-tested in `src/connections/github-user-auth-client.test.ts`. The substitution
- * makes this lane STRICTER, not laxer — it gates on dbos's own view rather than a proxy
- * for it.
+ * ── This used to be INJECTED into the service; as of 2026-07-31 it is not ────────────
+ * The gate's production default was `GET /user/installations/:id/repositories` with the
+ * user token, which this lane could not use: that endpoint requires a token **authorized
+ * to the GitHub App**, and the lane fakes the user token's PROVENANCE with a PAT, which
+ * GitHub answers `403 "You must authenticate with an access token authorized to a GitHub
+ * App…"` (verified live). So this function was substituted in as the lister.
+ *
+ * The product now reads THIS endpoint itself, with its own installation token. The
+ * substitution is therefore gone and the service runs its real code path here — and this
+ * function keeps its remaining job: an INDEPENDENT verification (a raw probe with a
+ * separately minted token) that the repo really is installation-visible after the fact.
+ * It is deliberately not the same implementation as the thing it checks.
  */
 async function installationRepoFullNames(): Promise<string[]> {
   const out: string[] = [];
@@ -274,12 +275,17 @@ beforeAll(async () => {
   const repoProvisioningService = new RepoProvisioningService({
     prisma,
     userAuthClient,
+    // The DR1 visibility gate runs its REAL production path here: the App client mints
+    // its own installation token and walks `GET /installation/repositories` — dbos's own
+    // view. Nothing about the gate is substituted any more (see
+    // `installationRepoFullNames` for the substitution this replaced and why it existed).
+    appClient: makeGithubAppClient({
+      apiBaseUrl: githubApiBaseUrl(),
+      appId: ctx.appId,
+      privateKey: ctx.privateKey,
+    }),
     createProject: (userId, req) =>
       jobsService.createProjectWithScaffold(userId, req),
-    // The DR1 visibility gate, reading dbos's own view — see
-    // `installationRepoFullNames` for why the production default cannot be used here.
-    // Everything else about the gate (deadline, backoff, failure mode) is the product's.
-    listInstallationRepos: installationRepoFullNames,
   });
 
   app = buildApp({

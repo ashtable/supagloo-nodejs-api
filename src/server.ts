@@ -264,6 +264,11 @@ async function main(): Promise<void> {
   const repoProvisioningService = new RepoProvisioningService({
     prisma,
     userAuthClient: githubUserAuthClient,
+    // The DR1 visibility gate reads the INSTALLATION's own listing (`GET
+    // /installation/repositories`) with a token this client mints from the App key —
+    // byte-for-byte the view dbos's `ensureRepoReachable` consults, and the same
+    // credential in production and in every test lane. See `InstallationRepoLister`.
+    appClient: githubAppClient,
     createProject: (userId, req) =>
       projectJobsService.createProjectWithScaffold(userId, req),
   });
