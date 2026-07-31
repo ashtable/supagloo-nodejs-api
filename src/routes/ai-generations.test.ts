@@ -127,6 +127,49 @@ describe("POST /ai/generations", () => {
     expect(seen.req.input.brief).toBe("Psalm 121");
   });
 
+  it("U-AG-V1: a narration request's chosen `voiceId` survives validation, top-level", async () => {
+    // The api-side half of the narrator-voice wire pin.
+    //
+    // The reported bug was diagnosed as "`voiceId` has never reached a single generation",
+    // with a live `AiGeneration` query as evidence. That diagnosis was WRONG — the rows
+    // were fixtures plus user rows created before the picker shipped — but the hop was
+    // genuinely UNPINNED, which is exactly why the wrong diagnosis was plausible. Nothing
+    // here or in any other repo asserted that the value survives this boundary.
+    //
+    // It survives because `GenerateNarrationInputSchema` is `NarrationSpecSchema
+    // .passthrough()` and the key is TOP-LEVEL. A key nested inside `voice` would be
+    // stripped by `VoiceDescriptorSchema`, a plain `z.object` — so this test must drive
+    // the real HANDLER (the schema doing the stripping is the one under test) and must
+    // assert BOTH placements, since only one of them is guaranteed.
+    let seen: any;
+    app = await buildTestApp(
+      makeService({
+        createGeneration: async (_userId: string, req: unknown) => {
+          seen = req;
+          return { generationId: "gen-1" };
+        },
+      }),
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: "/ai/generations",
+      headers: BEARER,
+      payload: {
+        kind: "narration",
+        provider: "openrouter",
+        model: "hexgrad/kokoro-82m",
+        projectId: "proj-1",
+        input: {
+          voice: { description: "warm baritone", voiceId: "am_adam" },
+          voiceId: "am_adam",
+          scenes: [{ sceneId: "s1", scriptText: "I lift up my eyes" }],
+        },
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(seen.input.voiceId).toBe("am_adam");
+  });
+
   it("maps KindProviderIncompatibleError → 422 kind_provider_incompatible", async () => {
     app = await buildTestApp(
       makeService({

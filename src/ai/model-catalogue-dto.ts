@@ -38,6 +38,22 @@ export const AiModelInfoSchema = z.object({
    *  create AND a workflow can execute. */
   kinds: z.array(AiGenerationKindSchema),
   pricing: AiModelPricingSchema.nullable(),
+  /**
+   * The provider's own `supported_voices` for a speech model; `null` for every other
+   * model and for a speech model that publishes no vocabulary.
+   *
+   * **This line is the strip point.** Fastify serializes the response THROUGH this schema
+   * and Zod drops unknown keys, so adding `voices` to the mapper and the service without
+   * adding it here yields exactly nothing on the wire — silently, with every
+   * service-level test still green. It is the boundary the four-mirror rule does not name.
+   * Held by `U-MC12`, which asserts against the RAW body: re-parsing with the schema that
+   * does the stripping is agreement, not proof.
+   *
+   * `.nullable()` and not `.optional()`, matching `pricing`: the mappers are its only
+   * writers, so a missed one is a compile error rather than an absent key the browser has
+   * to guess about.
+   */
+  voices: z.array(z.string()).nullable(),
 });
 export type AiModelInfoDto = z.infer<typeof AiModelInfoSchema>;
 
