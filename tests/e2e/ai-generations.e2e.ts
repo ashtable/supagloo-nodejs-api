@@ -19,6 +19,7 @@ import {
 } from "../../src/auth/youversion";
 import { SESSION_TTL_MS } from "../../src/auth/tokens";
 import { ProjectsService } from "../../src/projects/projects-service";
+import { ConnectionsService } from "../../src/connections/connections-service";
 import { AiGenerationsService } from "../../src/ai/ai-generations-service";
 import { makeDbosEnqueuer } from "../../src/jobs/enqueuer";
 import {
@@ -249,6 +250,12 @@ beforeAll(async () => {
     prisma,
     enqueue: enqueuer.enqueue,
     cancel: enqueuer.cancel,
+    // The REAL ConnectionsService, deliberately — NOT a stub. `ConnectionLookup` is a
+    // structural type, so `{ isConnected: async () => true }` would typecheck and the
+    // lane would go green with the 409 gate invisible to it (and the gate's own case
+    // below untestable). Wiring the real reader is what makes `seedUser`'s connection
+    // rows load-bearing and the `provider_not_connected` case a real end-to-end proof.
+    connections: new ConnectionsService({ prisma }),
   });
 
   app = buildApp({
@@ -272,7 +279,54 @@ afterAll(async () => {
   await prisma.$disconnect().catch(() => {});
 });
 
-async function seedUser(tag: string): Promise<{ token: string; userId: string }> {
+/**
+ * Give `userId` the OpenRouter + Gloo connection rows the pre-row 409 gate reads
+ * (`ConnectionsService.isConnected`, R5/R7 2026-07-31).
+ *
+ * DIRECT ROW INSERTS, deliberately. The gate is PURE ROW PRESENCE — nothing in this
+ * spec's path decrypts `apiKeyCiphertext` / `clientSecretCiphertext`, so the stored
+ * values are opaque placeholders and are labelled as such. The alternative,
+ * `src/testing/seed-connections.ts`, seeds through the real connect routes against
+ * LIVE OpenRouter/Gloo and needs three real secrets — that is right for
+ * `connections.e2e.ts` (whose subject IS the ciphertext) and wrong here: it would add
+ * provider egress and three setup secrets to a spec that makes no provider call at all.
+ * `POST /v1/test/seed` cannot do this — it upserts Users + Sessions only
+ * (`src/auth/auth-service.ts` `seed`).
+ */
+async function connectProviders(userId: string): Promise<void> {
+  await prisma.openRouterConnection.create({
+    data: {
+      userId,
+      // Never decrypted on this path — see the note above.
+      apiKeyCiphertext: "e2e-placeholder-not-a-ciphertext",
+      keyLast4: "0000",
+      status: "connected",
+    },
+  });
+  await prisma.glooConnection.create({
+    data: {
+      userId,
+      clientId: `e2e-${userId}`,
+      // Never decrypted on this path — see the note above.
+      clientSecretCiphertext: "e2e-placeholder-not-a-ciphertext",
+      status: "connected",
+    },
+  });
+}
+
+/**
+ * Seed a user + session, and — BY DEFAULT — its provider connection rows.
+ *
+ * D4 (2026-07-31): connected is the DEFAULT and the absence is the opt-in. Every other
+ * call site in this file wants a user who can actually create a generation, so
+ * defaulting to connected leaves all of them untouched; the one spec that needs the
+ * refusal says `{ connections: false }` at its own call site, where the reader can see
+ * that the missing rows are the point rather than an oversight.
+ */
+async function seedUser(
+  tag: string,
+  opts: { connections?: boolean } = {},
+): Promise<{ token: string; userId: string }> {
   const s = stamp();
   const token = `ai-e2e-${tag}-${s}`;
   const res = await fetch(`${baseUrl}/v1/test/seed`, {
@@ -291,7 +345,9 @@ async function seedUser(tag: string): Promise<{ token: string; userId: string }>
     }),
   });
   const body = await res.json();
-  return { token, userId: body.users[0].user.id };
+  const userId = body.users[0].user.id as string;
+  if (opts.connections !== false) await connectProviders(userId);
+  return { token, userId };
 }
 
 async function seedProject(userId: string, tag: string): Promise<string> {
@@ -548,6 +604,36 @@ describe("e2e: POST validation gates (before any row is created)", () => {
     expect(after).toBe(before);
   });
 
+  // The pre-row `provider_not_connected` 409, end-to-end (R5/R7, 2026-07-31). The
+  // matrix-valid pair `storyboard`+`openrouter` is chosen on purpose: it passes gates 1
+  // and 2 and its workflow IS registered, so the ONLY thing that can refuse it is the
+  // connection gate. `{ connections: false }` is this file's single opt-out (D4).
+  it("409s a POST from a user who has not connected the provider, and creates no row", async () => {
+    disarmGates();
+    const owner = await seedUser("unconnected", { connections: false });
+    const before = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
+    const res = await api("/ai/generations", owner.token, {
+      method: "POST",
+      body: storyboardBody(),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("provider_not_connected");
+    // The gate's whole point: refused BEFORE the row write, so nothing is left behind
+    // for the user's generations list and nothing was enqueued.
+    const after = await prisma.aiGeneration.count({ where: { userId: owner.userId } });
+    expect(after).toBe(before);
+    expect(after).toBe(0);
+
+    // Control — the SAME body from a connected user is accepted, so the 409 above is the
+    // connection gate answering and not a body/matrix/workflow refusal in disguise.
+    const connected = await seedUser("unconnected-control");
+    const ok = await api("/ai/generations", connected.token, {
+      method: "POST",
+      body: storyboardBody(),
+    });
+    expect(ok.status).toBe(201);
+  }, 60_000);
+
   it("400s a malformed body (storyboard input missing brief)", async () => {
     disarmGates();
     const owner = await seedUser("badbody");
@@ -724,8 +810,17 @@ describe("e2e: ownership scoping + auth", () => {
       method: "POST",
       body: storyboardBody(),
     });
+    // These two lines are load-bearing, not decoration. Before the connection gate was
+    // wired into this lane the POST 500'd, `generationId` was `undefined`, and the
+    // assertion below passed because `/ai/generations/undefined` 404s for EVERYONE — a
+    // green ownership test that had never once exercised ownership. Asserting the 201
+    // and a real id first is what makes the 404 below mean "not yours".
+    expect(created.status).toBe(201);
     const { generationId } = await created.json();
+    expect(generationId).toBeTruthy();
     expect((await api(`/ai/generations/${generationId}`, other.token)).status).toBe(404);
+    // …and it IS reachable by its owner, so the 404 is scoping rather than absence.
+    expect((await api(`/ai/generations/${generationId}`, owner.token)).status).toBe(200);
     expect((await api(`/ai/generations/does-not-exist`, owner.token)).status).toBe(404);
   });
 

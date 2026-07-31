@@ -1,13 +1,23 @@
 /**
  * E2E connection-seeding helper (design-delta §10.3).
  *
- * The api e2e seeds provider connections by calling the app's OWN real connect
- * routes — `POST /v1/connections/openrouter` and `PUT /v1/connections/gloo` — which
- * ARE the surface under test. Seeding through them (rather than fabricating DB rows)
- * guarantees every stored ciphertext is LIVE-VALID: the OpenRouter key decrypts to a
- * real key the credits proxy can use, and the Gloo credentials pass a real
- * verify-then-store mint on every run. There are no fabricated ciphertexts or dummy
- * keys anywhere in the api e2e as a result.
+ * The CONNECTIONS e2e (`tests/e2e/connections.e2e.ts`) seeds provider connections by
+ * calling the app's OWN real connect routes — `POST /v1/connections/openrouter` and
+ * `PUT /v1/connections/gloo` — which ARE the surface under test. Seeding through them
+ * (rather than fabricating DB rows) guarantees every stored ciphertext is LIVE-VALID:
+ * the OpenRouter key decrypts to a real key the credits proxy can use, and the Gloo
+ * credentials pass a real verify-then-store mint on every run. **Within that spec**
+ * there are no fabricated ciphertexts or dummy keys.
+ *
+ * That claim is deliberately scoped to the connections e2e and does NOT hold for the
+ * api e2e as a whole. `tests/e2e/ai-generations.e2e.ts` inserts placeholder
+ * OpenRouter/Gloo rows DIRECTLY with Prisma, because the only thing it needs from a
+ * connection is the pre-row `provider_not_connected` gate's answer, and that gate is
+ * pure ROW PRESENCE (`ConnectionsService.isConnected`) — nothing on its path decrypts
+ * anything. Routing it through here would add live provider egress and three required
+ * secrets to a spec that otherwise makes no provider call. The rule is per-spec: seed
+ * through the real routes when the CIPHERTEXT is part of what you are proving, and
+ * insert rows directly when only their EXISTENCE is.
  *
  * This module is TEST-ONLY infrastructure (imported by
  * `tests/e2e/connections.e2e.ts`) and is excluded from the shipped `dist/` build. Its
