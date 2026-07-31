@@ -211,6 +211,10 @@ async function main(): Promise<void> {
     prisma,
     enqueue: jobEnqueuer.enqueue,
     cancel: jobEnqueuer.cancel,
+    // R5/R7 (2026-07-31): the pre-row `provider_not_connected` 409. The ALREADY-BUILT
+    // connections service is reused rather than re-querying the three tables here — one
+    // row-presence rule, one module, applied at this boundary too.
+    connections: connectionsService,
   });
 
   // Renders (design-delta §2.7/§6c/§8): create + enqueue on the `render` queue, poll,

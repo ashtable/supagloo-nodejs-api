@@ -10,6 +10,7 @@ import {
   AiGenerationNotFoundError,
   GenerationNotCancelableError,
   KindProviderIncompatibleError,
+  ProviderNotConnectedError,
   UnsupportedGenerationKindError,
 } from "../ai/errors";
 import { ProjectNotFoundError } from "../projects/errors";
@@ -191,6 +192,43 @@ describe("POST /ai/generations", () => {
     });
     expect(res.statusCode).toBe(422);
     expect(res.json().error).toBe("kind_provider_incompatible");
+  });
+
+  it("U-PNC8: maps ProviderNotConnectedError → 409 provider_not_connected", async () => {
+    // A DISTINCT wire code, not folded into the 422. The two refusals need different words
+    // in the UI: 422 means "this pair can never work" (Gloo has no speech models — nothing
+    // the user can do), 409 means "connect this account and try again". Mapping them
+    // together would leave the client unable to tell an impossibility from an errand.
+    //
+    // 409 rather than 403 follows the codebase's existing precedent for exactly this
+    // condition: `GithubNotConnectedError` and `OpenRouterNotConnectedError` are both 409.
+    app = await buildTestApp(
+      makeService({
+        createGeneration: async () => {
+          throw new ProviderNotConnectedError(
+            'provider "openrouter" is not connected for this user',
+          );
+        },
+      }),
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: "/ai/generations",
+      headers: BEARER,
+      payload: {
+        ...CREATE_BODY,
+        kind: "narration",
+        provider: "openrouter",
+        input: {
+          voice: { description: "warm, unhurried" },
+          scenes: [{ sceneId: "s1", scriptText: "I lift up my eyes" }],
+        },
+      },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe("provider_not_connected");
+    // The provider name has to survive the mapping — it is the whole actionable content.
+    expect(res.json().message).toMatch(/openrouter/i);
   });
 
   it("maps UnsupportedGenerationKindError → 501 generation_kind_unsupported", async () => {

@@ -14,6 +14,7 @@ import {
   AiGenerationNotFoundError,
   GenerationNotCancelableError,
   KindProviderIncompatibleError,
+  ProviderNotConnectedError,
   UnsupportedGenerationKindError,
 } from "../ai/errors";
 import { ProjectNotFoundError } from "../projects/errors";
@@ -63,6 +64,11 @@ export function registerAiGenerationRoutes(
           400: errorResponseSchema,
           401: errorResponseSchema,
           404: errorResponseSchema,
+          // R5/R7 (2026-07-31): the create path gains a SECOND refusal class. 409 is
+          // "connect this provider and retry"; the 422 below stays "this pair can never
+          // work". Declaring it here is what lets the reply serialize — an undeclared
+          // status is a 500 in disguise.
+          409: errorResponseSchema,
           422: errorResponseSchema,
           501: errorResponseSchema,
         },
@@ -80,6 +86,11 @@ export function registerAiGenerationRoutes(
           return reply
             .code(422)
             .send({ error: "kind_provider_incompatible", message: err.message });
+        }
+        if (err instanceof ProviderNotConnectedError) {
+          return reply
+            .code(409)
+            .send({ error: "provider_not_connected", message: err.message });
         }
         if (err instanceof UnsupportedGenerationKindError) {
           return reply
